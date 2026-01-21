@@ -28,9 +28,12 @@ The pretrained checkpoints and LoRA weight will be automatically loaded.
 ## Checkpoints
 We provide both the pre-trained and instruction-tuned checkpoints in the [Huggingface repository](https://huggingface.co/WFRaain/GOFA/tree/main). Specifically:
 
-`mistral_qamag03_best_ckpt.pth`: The pre-trained checkpoint.
+`best_ckpt_3.pth`: The pre-trained checkpoint.
 
-`nb_instruct.pth`: The instruction fine-tuned checkpoint, which can be used to replicate the results of GOFA-T in the paper.
+`instruct_1_ckpt.pth`: The instruction fine-tuned checkpoint, which can be used to replicate the results of GOFA-T in the paper.
+
+`instruct_2_ckpt.pth`: The instruction fine-tuned checkpoint, which can be used to replicate the results of GOFA-T in the paper.
+
 
 
 ## Overview
