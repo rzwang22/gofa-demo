@@ -1,0 +1,74 @@
+{
+  "id": "sample_graph",
+  "name": "GOFA replay demo graph",
+  "description": "A tiny graph used to demonstrate the GOFA inference path without loading a checkpoint.",
+  "task_types": [
+    "QA",
+    "Completion"
+  ],
+  "nodes": [
+    {
+      "id": "paper",
+      "label": "GOFA Paper",
+      "type": "document",
+      "text": "GOFA frames graph tasks as graph-conditioned generation."
+    },
+    {
+      "id": "method",
+      "label": "Graph-to-text Prompt",
+      "type": "method",
+      "text": "The graph is validated and converted into a textual/model input representation."
+    },
+    {
+      "id": "question",
+      "label": "Question Node",
+      "type": "question",
+      "role": "question",
+      "text": "What does the demo show about GOFA inference?"
+    },
+    {
+      "id": "evidence",
+      "label": "Evidence Node",
+      "type": "evidence",
+      "text": "The replay path follows load, validate, convert, model, generate, and decode stages."
+    },
+    {
+      "id": "complete",
+      "label": "Complete Node",
+      "type": "complete",
+      "role": "complete",
+      "text": "GOFA can produce a graph-grounded answer or complete missing graph-conditioned text."
+    }
+  ],
+  "edges": [
+    {
+      "source": "paper",
+      "target": "method",
+      "label": "uses"
+    },
+    {
+      "source": "method",
+      "target": "question",
+      "label": "builds"
+    },
+    {
+      "source": "paper",
+      "target": "evidence",
+      "label": "supports"
+    },
+    {
+      "source": "evidence",
+      "target": "complete",
+      "label": "grounds"
+    },
+    {
+      "source": "question",
+      "target": "complete",
+      "label": "answered_by"
+    }
+  ],
+  "metadata": {
+    "question_node_id": "question",
+    "complete_node_id": "complete"
+  }
+}

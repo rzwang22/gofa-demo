@@ -1,0 +1,32 @@
+{
+  "id": "sample_result",
+  "source_graph": "sample_graph.json",
+  "mode": "replay",
+  "model": {
+    "name": "GOFA replay stub",
+    "checkpoint_loaded": false,
+    "gpu_required": false
+  },
+  "outputs": {
+    "QA": {
+      "task_type": "QA",
+      "generated_text": "The demo shows GOFA's full inference chain on a graph input: load and validate the graph, convert it to model input, run generation, and decode a graph-grounded answer.",
+      "question_node_id": "question",
+      "complete_node_id": "complete"
+    },
+    "Completion": {
+      "task_type": "Completion",
+      "generated_text": "Completed graph output: the complete node is filled with a graph-grounded response produced after the same load, validate, convert, generate, and decode pipeline.",
+      "question_node_id": "question",
+      "complete_node_id": "complete"
+    }
+  },
+  "pipeline": [
+    "load graph",
+    "validate graph",
+    "convert input",
+    "load model",
+    "generate",
+    "decode output"
+  ]
+}
