@@ -21,6 +21,8 @@ eval_sample_size: -1
 task_names:              # Name of the dataset trained
   - arxiv
 base_llm: "mistral7b"
+model_name_or_path: "mistralai/Mistral-7B-Instruct-v0.2"  # base Mistral model path or Hugging Face repo id
+checkpoint_dir: "./cache_data/model/"  # directory for ICAE/GOFA checkpoint files
 llm_max_length: 128
 val_interval:      # validate per {val_interval} training steps.
 mode: "decode"

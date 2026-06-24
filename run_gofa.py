@@ -48,6 +48,10 @@ def main(params):
     model_args, training_args, gofa_args = ModelArguments(), TrainingArguments(), gofa_config(
         num_layers=params.num_layers, gnn_type=params.gnn_type, fuse_type=params.fuse_type)
     model_args.dec_lora = params.dec_lora
+    if getattr(params, "model_name_or_path", None):
+        model_args.model_name_or_path = params.model_name_or_path
+    if getattr(params, "checkpoint_dir", None):
+        model_args.checkpoint_dir = params.checkpoint_dir
     training_args.model_max_length = params.llm_max_length
     if params.training_precision == "bf16-mixed":
         training_args.bf16 = True
