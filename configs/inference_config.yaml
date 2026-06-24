@@ -1,31 +1,37 @@
 run_mode: "inf"
 num_epochs: 0
 mode: generate
-load_dir: "your_save_model_path"
+load_dir: /home/rzwang/data/GOFA/cache_data/model/nb_instruct.pth
 load_model: True
 batch_size: 1
 
+num_layers: 6
+gnn_type: "index"
+fuse_type: interleave
+dec_lora: True
+
 sample_size_per_task: 100    # control the train sample size per task
-llm_max_length: 1024
+llm_max_length: 256
 train_task_names:
-  - cora_node
+  - cora_link
 hops: 3              # number of hops when sampling subgraphs
 train_max_nodes_per_hops: 5        # number of neighbor nodes per hop.
-ways: 40             # number of sampled classes for classification
+ways: 2             # number of sampled classes for classification
 instructs: True        # include instruction example text in the prompt
 selections: True        # include class candidate name in the prompt
 
 
 # same set of parameters but for inference.
 eval_task_names:
-  - cora_node
-inf_sample_size_per_task: 1.0
+  - cora_link
+inf_sample_size_per_task: 
+  - 1
 inf_hops:
   - 3
 inf_max_nodes_per_hops:
   - 10
 inf_ways:
-  - -1
+  - 2
 inf_instructs:
   - True
 inf_selections:

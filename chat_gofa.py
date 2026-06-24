@@ -8,6 +8,7 @@ import json
 
 graph_type = "pyg"
 device = torch.device("cuda")
+
 if graph_type == "json":
     with open("sample_graph.json", "r") as f:
         graph = json.load(f)
@@ -17,10 +18,15 @@ elif graph_type == "pyg":
     gofa_input_graph = prepare_gofa_graph_input_from_pyg(graph, device=device)
 else:
     raise ValueError("Unknown graph type")
+
 model_args, training_args, gofa_args = ModelArguments(), TrainingArguments(), GOFAMistralConfig()
-model_args.dec_lora = True
+
+model_args.model_name_or_path = "/mnt/sevenT/wrz_data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2"
+model_args.checkpoint_dir = "/mnt/sevenT/wrz_data/GOFA/cache_data/model"
+model_args.dec_lora = False
+
 gofa = GOFAMistral((model_args, training_args, gofa_args))
-# use gofa.load_pretrained() to automatically download pretrained checkpoint into the cache directory. Or specify the checkpoint path to load.
-gofa.load_pretrained()
+gofa.load_pretrained("/mnt/sevenT/wrz_data/GOFA/cache_data/model/mistral_qamag03_best_ckpt.pth")
+
 gofa.to(device)
 print(gofa.generate(gofa_input_graph))
