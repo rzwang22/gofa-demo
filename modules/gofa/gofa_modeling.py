@@ -140,8 +140,9 @@ class GOFAMistralModel(MistralModel):
                     hidden_states = torch.cat(
                         [hidden_states[:cur_node_size][graph.node_map], hidden_states[cur_node_size:]], dim=0)
                     mem_mask = torch.cat([mem_mask[:cur_node_size][graph.node_map], mem_mask[cur_node_size:]], dim=0)
-                    causal_mask = torch.cat(
-                        [causal_mask[:cur_node_size][graph.node_map], causal_mask[cur_node_size:]], dim=0)
+                    if causal_mask is not None:
+                        causal_mask = torch.cat(
+                            [causal_mask[:cur_node_size][graph.node_map], causal_mask[cur_node_size:]], dim=0)
                     cur_node_size = len(graph.node_map)
                 mem_repr = hidden_states[mem_mask].view(hidden_states.size()[0], self.gofa_config.mem_token, -1)
                 gnn_input = mem_repr[:cur_node_size]
@@ -325,8 +326,9 @@ class GOFAMistralParallelModel(MistralModel):
                 hidden_states = torch.cat(
                     [hidden_states[:cur_node_size][graph.node_map], hidden_states[cur_node_size:]], dim=0)
                 mem_mask = torch.cat([mem_mask[:cur_node_size][graph.node_map], mem_mask[cur_node_size:]], dim=0)
-                causal_mask = torch.cat(
-                    [causal_mask[:cur_node_size][graph.node_map], causal_mask[cur_node_size:]], dim=0)
+                if causal_mask is not None:
+                    causal_mask = torch.cat(
+                        [causal_mask[:cur_node_size][graph.node_map], causal_mask[cur_node_size:]], dim=0)
                 cur_node_size = len(graph.node_map)
             if g_layer_idx >= 0 and graph is not None:
                 mem_repr = hidden_states[mem_mask].view(hidden_states.size()[0], self.gofa_config.mem_token, -1)

@@ -23,7 +23,8 @@ class MistralICAE(torch.nn.Module):
         self.icae = GOFAMistralForCausalLM.from_pretrained(self.model_name, gofa_config,
                                                             torch_dtype=torch.float16 if training_args.bf16 is False
                                                             else torch.bfloat16,
-                                                            use_flash_attention_2=False, resume_download=False)
+                                                            attn_implementation=model_args.attn_implementation,
+                                                            resume_download=False)
         if gofa_config.fuse_type == "parallel":
             self.icae.model.align_weight()
 

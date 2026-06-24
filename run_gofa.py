@@ -50,6 +50,8 @@ def main(params):
     model_args.dec_lora = params.dec_lora
     if getattr(params, "model_name_or_path", None):
         model_args.model_name_or_path = params.model_name_or_path
+    if getattr(params, "attn_implementation", None):
+        model_args.attn_implementation = params.attn_implementation
     if getattr(params, "checkpoint_dir", None):
         model_args.checkpoint_dir = params.checkpoint_dir
     training_args.model_max_length = params.llm_max_length

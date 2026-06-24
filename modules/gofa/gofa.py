@@ -42,6 +42,7 @@ class GOFAMistralConfig(MistralConfig):
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(default="mistralai/Mistral-7B-Instruct-v0.2")
+    attn_implementation: str = field(default="eager", metadata={"help": "Mistral attention implementation"})
     lora_r: int = field(default=512, metadata={"help": "lora rank"})
     lora_dropout: float = field(default=0.05, metadata={"help": "lora dropout"})
     mem_size: int = field(default=128, metadata={"help": "Memory size"}, )
@@ -336,5 +337,4 @@ class GOFAMistral(torch.nn.Module):
         generated_text = self.model.tokenizer.batch_decode(generate_text)
 
         return generated_text
-
 
