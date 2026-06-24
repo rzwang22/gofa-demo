@@ -125,6 +125,7 @@ def lightning_test(
     prog_bar=True,
     accelerator="auto",
     detect_anomaly=False,
+    run_validation=True,
 ):
     callbacks = []
     if prog_bar:
@@ -147,20 +148,23 @@ def lightning_test(
         model.load_state_dict(state_dict)
 
 
-    val_col = []
-    for i in range(test_rep):
-        val_col.append(
-            trainer.validate(model, datamodule=data_module, verbose=False)[0]
-        )
+    target_val_mean = None
+    target_val_std = None
+    if run_validation:
+        val_col = []
+        for i in range(test_rep):
+            val_col.append(
+                trainer.validate(model, datamodule=data_module, verbose=False)[0]
+            )
 
-    val_res = dict_res_summary(val_col)
-    for met in val_res:
-        val_mean = np.mean(val_res[met])
-        val_std = np.std(val_res[met])
-        print("{}:{:f}±{:f}".format(met, val_mean, val_std))
+        val_res = dict_res_summary(val_col)
+        for met in val_res:
+            val_mean = np.mean(val_res[met])
+            val_std = np.std(val_res[met])
+            print("{}:{:f}±{:f}".format(met, val_mean, val_std))
 
-    target_val_mean = np.mean(val_res[metrics.val_metric])
-    target_val_std = np.std(val_res[metrics.val_metric])
+        target_val_mean = np.mean(val_res[metrics.val_metric])
+        target_val_std = np.std(val_res[metrics.val_metric])
 
     test_col = []
     for i in range(test_rep):

@@ -18,6 +18,7 @@ log_project: "GOFA"
 exp_name: "gofa"
 train_sample_size: -1
 eval_sample_size: -1
+skip_validation: False
 task_names:              # Name of the dataset trained
   - arxiv
 base_llm: "mistral7b"
