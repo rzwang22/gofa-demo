@@ -157,6 +157,10 @@ class GOFAMistral(torch.nn.Module):
             print("Decoder LoRA keys in checkpoint:", len(raw_lora_keys))
             print("Decoder LoRA keys after prefix normalization:", len(loadable_lora_keys))
             print("Decoder LoRA keys still missing after load:", len(missing_lora))
+            if not loadable_lora_keys:
+                raise RuntimeError("dec_lora=True, but no loadable decoder LoRA keys were found in the checkpoint.")
+            if missing_lora:
+                raise RuntimeError("dec_lora=True, but decoder LoRA keys were not fully loaded.")
         if unexpected_keys:
             print("Full GOFA module skipped unexpected keys:", len(unexpected_keys))
 
