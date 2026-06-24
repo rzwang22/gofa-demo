@@ -131,9 +131,34 @@ class GOFAMistral(torch.nn.Module):
         Load the GNN and lora weight (if available).
         """
         state_dict = torch.load(load_dir, map_location="cpu")
-        missing_keys, _ = self.model.icae.get_base_model().model.g_layers.load_state_dict(state_dict, strict=False)
+        normalized_state_dict = OrderedDict()
+        for key, value in state_dict.items():
+            normalized_state_dict[key] = value
+            if key.startswith("llm_model."):
+                normalized_state_dict[key[len("llm_model."):]] = value
+
+        raw_lora_keys = [key for key in state_dict if "default" in key and "lora" in key.lower()]
+        loadable_lora_keys = [
+            key for key in normalized_state_dict
+            if not key.startswith("llm_model.") and "default" in key and "lora" in key.lower()
+        ]
+        print(
+            "Loaded partial checkpoint keys: "
+            f"total={len(state_dict)}, normalized={len(normalized_state_dict)}, "
+            f"raw_decoder_lora={len(raw_lora_keys)}, loadable_decoder_lora={len(loadable_lora_keys)}"
+        )
+        missing_keys, unexpected_keys = self.model.icae.get_base_model().model.g_layers.load_state_dict(state_dict, strict=False)
         print("GNN module is missing the following keys:", missing_keys)
-        missing_keys, _ = self.load_state_dict(state_dict, strict=False)
+        if unexpected_keys:
+            print("GNN module skipped non-GNN keys:", len(unexpected_keys))
+        missing_keys, unexpected_keys = self.load_state_dict(normalized_state_dict, strict=False)
+        if self.dec_lora:
+            missing_lora = [key for key in missing_keys if "default" in key and "lora" in key.lower()]
+            print("Decoder LoRA keys in checkpoint:", len(raw_lora_keys))
+            print("Decoder LoRA keys after prefix normalization:", len(loadable_lora_keys))
+            print("Decoder LoRA keys still missing after load:", len(missing_lora))
+        if unexpected_keys:
+            print("Full GOFA module skipped unexpected keys:", len(unexpected_keys))
 
     def forward(self, g):
         """
@@ -337,4 +362,3 @@ class GOFAMistral(torch.nn.Module):
         generated_text = self.model.tokenizer.batch_decode(generate_text)
 
         return generated_text
-
