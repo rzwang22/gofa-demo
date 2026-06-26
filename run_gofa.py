@@ -60,6 +60,8 @@ def main(params):
         model_args.encoder_cache_dir = params.encoder_cache_dir
     if getattr(params, "encoder_cache_tag", None):
         model_args.encoder_cache_tag = params.encoder_cache_tag
+    if hasattr(params, "encoder_cache_skip_nog"):
+        model_args.encoder_cache_skip_nog = params.encoder_cache_skip_nog
     training_args.model_max_length = params.llm_max_length
     if params.training_precision == "bf16-mixed":
         training_args.bf16 = True
