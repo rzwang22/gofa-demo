@@ -37,6 +37,7 @@ encoder_cache_verify_p99_tolerance: 0.25  # practical verification threshold for
 encoder_cache_verify_relative_l2_tolerance: 0.08  # practical verification threshold for relative L2 drift
 encoder_cache_verify_max_tolerance: 1.5  # practical guardrail for rare BF16 outliers
 encoder_cache_verify_log_interval: 1
+encoder_cache_verify_quantile_sample_size: 1000000  # deterministic sample cap for p95/p99 and above-threshold ratio
 profile_stage_times: False  # synchronize CUDA and print encoder/decoder stage timing percentages
 profile_stage_log_interval: 50
 llm_max_length: 128

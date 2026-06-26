@@ -78,6 +78,8 @@ def main(params):
         model_args.encoder_cache_verify_max_tolerance = params.encoder_cache_verify_max_tolerance
     if hasattr(params, "encoder_cache_verify_log_interval"):
         model_args.encoder_cache_verify_log_interval = params.encoder_cache_verify_log_interval
+    if hasattr(params, "encoder_cache_verify_quantile_sample_size"):
+        model_args.encoder_cache_verify_quantile_sample_size = params.encoder_cache_verify_quantile_sample_size
     if hasattr(params, "profile_stage_times"):
         model_args.profile_stage_times = params.profile_stage_times
     if hasattr(params, "profile_stage_log_interval"):

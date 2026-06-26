@@ -64,6 +64,7 @@ class ModelArguments:
     encoder_cache_verify_relative_l2_tolerance: float = field(default=8e-2)
     encoder_cache_verify_max_tolerance: float = field(default=1.5)
     encoder_cache_verify_log_interval: int = field(default=1)
+    encoder_cache_verify_quantile_sample_size: int = field(default=1_000_000)
     profile_stage_times: bool = field(default=False, metadata={"help": "Synchronize and profile encoder/decoder stages"})
     profile_stage_log_interval: int = field(default=50, metadata={"help": "Log stage timing every N decoder calls"})
 
@@ -123,6 +124,7 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_cache_verify_relative_l2_tolerance = model_args.encoder_cache_verify_relative_l2_tolerance
         self.encoder_cache_verify_max_tolerance = model_args.encoder_cache_verify_max_tolerance
         self.encoder_cache_verify_log_interval = model_args.encoder_cache_verify_log_interval
+        self.encoder_cache_verify_quantile_sample_size = model_args.encoder_cache_verify_quantile_sample_size
         self.encoder_cache_verify_calls = 0
         self.encoder_cache_verify_exact_failures = 0
         self.encoder_cache_verify_practical_failures = 0
@@ -189,7 +191,8 @@ class GOFAMistral(torch.nn.Module):
                             f"p99_tol={self.encoder_cache_verify_p99_tolerance}, "
                             f"rel_l2_tol={self.encoder_cache_verify_relative_l2_tolerance}, "
                             f"max_tol={self.encoder_cache_verify_max_tolerance}, "
-                            f"log_interval={self.encoder_cache_verify_log_interval}"
+                            f"log_interval={self.encoder_cache_verify_log_interval}, "
+                            f"quantile_sample_size={self.encoder_cache_verify_quantile_sample_size}"
                         )
         if self.profile_stage_times:
             print(
@@ -491,6 +494,23 @@ class GOFAMistral(torch.nn.Module):
             f"cum_suffix={timing['suffix_compute_s']:.4f}s"
         )
 
+    def _encoder_cache_verify_sample(self, flat_values):
+        sample_size = int(self.encoder_cache_verify_quantile_sample_size)
+        if sample_size <= 0 or flat_values.numel() <= sample_size:
+            return flat_values.contiguous()
+        stride = max(int(np.ceil(flat_values.numel() / sample_size)), 1)
+        sampled = flat_values[::stride]
+        if sampled.numel() > sample_size:
+            sampled = sampled[:sample_size]
+        return sampled.contiguous()
+
+    def _encoder_cache_verify_quantile(self, sampled_values, quantile):
+        if sampled_values.numel() == 0:
+            return 0.0
+        kth = int(np.ceil(quantile * sampled_values.numel()))
+        kth = max(1, min(kth, sampled_values.numel()))
+        return torch.kthvalue(sampled_values, kth).values.item()
+
     def _encoder_cache_skip_indices(self, graph):
         if not self.model_args.encoder_cache_skip_nog or graph is None:
             return []
@@ -783,20 +803,17 @@ class GOFAMistral(torch.nn.Module):
             reference = reference_hidden_states[mapped_mem_mask].float()
             if diff_abs.numel():
                 flat_diff = diff_abs.flatten()
-                quantiles = torch.quantile(
-                    flat_diff,
-                    torch.tensor([0.95, 0.99], device=flat_diff.device, dtype=flat_diff.dtype),
-                )
+                sampled_diff = self._encoder_cache_verify_sample(flat_diff)
                 max_abs = flat_diff.max().item()
                 mean_abs = flat_diff.mean().item()
-                p95_abs = quantiles[0].item()
-                p99_abs = quantiles[1].item()
+                p95_abs = self._encoder_cache_verify_quantile(sampled_diff, 0.95)
+                p99_abs = self._encoder_cache_verify_quantile(sampled_diff, 0.99)
                 relative_l2 = (
                     torch.linalg.vector_norm(flat_diff) /
                     torch.clamp(torch.linalg.vector_norm(reference), min=1e-12)
                 ).item()
                 above_strict_ratio = (
-                    flat_diff > self.encoder_cache_verify_tolerance
+                    sampled_diff > self.encoder_cache_verify_tolerance
                 ).float().mean().item()
             else:
                 max_abs = 0.0
