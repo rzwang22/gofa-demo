@@ -54,6 +54,12 @@ def main(params):
         model_args.attn_implementation = params.attn_implementation
     if getattr(params, "checkpoint_dir", None):
         model_args.checkpoint_dir = params.checkpoint_dir
+    if hasattr(params, "use_encoder_cache"):
+        model_args.use_encoder_cache = params.use_encoder_cache
+    if getattr(params, "encoder_cache_dir", None):
+        model_args.encoder_cache_dir = params.encoder_cache_dir
+    if getattr(params, "encoder_cache_tag", None):
+        model_args.encoder_cache_tag = params.encoder_cache_tag
     training_args.model_max_length = params.llm_max_length
     if params.training_precision == "bf16-mixed":
         training_args.bf16 = True

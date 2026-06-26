@@ -1,6 +1,9 @@
 # example code for running inference with fine-tuned checkpoint
 from typing import Optional
 
+import hashlib
+import json
+import os
 import numpy as np
 import torch
 from dataclasses import dataclass, field
@@ -48,6 +51,9 @@ class ModelArguments:
     mem_size: int = field(default=128, metadata={"help": "Memory size"}, )
     dec_lora: bool = field(default=False, metadata={"help": "Whether using lora in the decoder LLM"})
     checkpoint_dir: str = field(default="./cache_data/model/")
+    use_encoder_cache: bool = field(default=False, metadata={"help": "Cache graph-independent encoder prefix states"})
+    encoder_cache_dir: str = field(default="./cache_data/encoder_cache")
+    encoder_cache_tag: str = field(default="")
 
 
 @dataclass
@@ -90,6 +96,12 @@ class GOFAMistral(torch.nn.Module):
         self.mem_tokens = list(range(model.vocab_size, model.vocab_size + model_args.mem_size))
         self.mem_size = model_args.mem_size
         self.model = model
+        self.encoder_cache_enabled = bool(model_args.use_encoder_cache)
+        self.encoder_cache_dir = model_args.encoder_cache_dir
+        self.encoder_cache_calls = 0
+        self.encoder_cache_hits = 0
+        self.encoder_cache_misses = 0
+        self.encoder_cache_namespace = self._build_encoder_cache_namespace(dir, model_args, training_args, gofa_args)
         self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
         self.model.left_tokenizer.pad_token = self.model.left_tokenizer.bos_token
         for param in self.model.icae.parameters():
@@ -100,6 +112,17 @@ class GOFAMistral(torch.nn.Module):
             for name, param in self.model.icae.named_parameters():
                 if "default" in name:
                     param.requires_grad = True
+        if self.encoder_cache_enabled:
+            if gofa_args.fuse_type != "interleave":
+                print("GOFA encoder cache is only implemented for fuse_type=interleave; disabling cache.")
+                self.encoder_cache_enabled = False
+            else:
+                os.makedirs(self._encoder_cache_root(), exist_ok=True)
+                print(
+                    "GOFA encoder cache enabled: "
+                    f"dir={self._encoder_cache_root()}, boundary_layer="
+                    f"{self.model.icae.get_base_model().model.gnn_start_layer}"
+                )
 
     def get_tokenizer(self):
         return self.model.tokenizer
@@ -164,6 +187,146 @@ class GOFAMistral(torch.nn.Module):
         if unexpected_keys:
             print("Full GOFA module skipped unexpected keys:", len(unexpected_keys))
 
+    def _build_encoder_cache_namespace(self, icae_path, model_args, training_args, gofa_args):
+        stat = os.stat(icae_path)
+        base_config = self.model.icae.get_base_model().config
+        metadata = {
+            "format": 1,
+            "model_name_or_path": model_args.model_name_or_path,
+            "model_max_length": training_args.model_max_length,
+            "mem_size": model_args.mem_size,
+            "vocab_size": self.model.vocab_size,
+            "hidden_size": self.model.dim,
+            "num_hidden_layers": base_config.num_hidden_layers,
+            "num_gnn_layers": gofa_args.num_layers,
+            "fuse_type": gofa_args.fuse_type,
+            "attn_implementation": model_args.attn_implementation,
+            "bf16": training_args.bf16,
+            "icae_path": os.path.abspath(icae_path),
+            "icae_size": stat.st_size,
+            "icae_mtime_ns": stat.st_mtime_ns,
+            "base_model_fingerprint": self._local_model_fingerprint(model_args.model_name_or_path),
+            "tag": model_args.encoder_cache_tag,
+        }
+        payload = json.dumps(metadata, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+    def _local_model_fingerprint(self, model_path):
+        if not os.path.exists(model_path):
+            return None
+        if os.path.isfile(model_path):
+            stat = os.stat(model_path)
+            return [{"path": os.path.basename(model_path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}]
+
+        fingerprint = []
+        for name in sorted(os.listdir(model_path)):
+            if not (name.endswith(".json") or name.endswith(".safetensors") or name.endswith(".bin")):
+                continue
+            path = os.path.join(model_path, name)
+            if not os.path.isfile(path):
+                continue
+            stat = os.stat(path)
+            fingerprint.append({"path": name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+        return fingerprint
+
+    def _encoder_cache_root(self):
+        return os.path.join(self.encoder_cache_dir, self.encoder_cache_namespace)
+
+    def _encoder_cache_key(self, token_ids):
+        token_bytes = np.asarray(token_ids, dtype=np.int32).tobytes()
+        return hashlib.sha256(token_bytes).hexdigest()
+
+    def _encoder_cache_path(self, cache_key):
+        return os.path.join(self._encoder_cache_root(), cache_key[:2], cache_key + ".pt")
+
+    def _load_encoder_cache_item(self, token_ids):
+        cache_key = self._encoder_cache_key(token_ids)
+        cache_path = self._encoder_cache_path(cache_key)
+        if not os.path.exists(cache_path):
+            return None, cache_key
+        payload = torch.load(cache_path, map_location="cpu")
+        if payload.get("cache_key") != cache_key or payload.get("seq_len") != len(token_ids):
+            return None, cache_key
+        return payload["hidden_state"], cache_key
+
+    def _save_encoder_cache_item(self, cache_key, token_ids, hidden_state):
+        cache_path = self._encoder_cache_path(cache_key)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        payload = {
+            "cache_key": cache_key,
+            "seq_len": len(token_ids),
+            "dtype": str(hidden_state.dtype),
+            "hidden_state": hidden_state.detach().cpu(),
+        }
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, cache_path)
+
+    def _encode_with_encoder_cache(self, token_ids, padded_token_ids, mem_mask, graph=None, partial_grad=None):
+        if self.training:
+            return None
+        base_model = self.model.icae.get_base_model().model
+        if not hasattr(base_model, "forward_llm_prefix") or not hasattr(base_model, "forward_from_gnn_boundary"):
+            return None
+
+        cached_states = [None] * len(token_ids)
+        missing = []
+        missing_keys = []
+        for i, ids in enumerate(token_ids):
+            cached_state, cache_key = self._load_encoder_cache_item(ids)
+            if cached_state is None:
+                missing.append(i)
+                missing_keys.append(cache_key)
+            else:
+                cached_states[i] = cached_state
+
+        if missing:
+            missing_token_ids = [token_ids[i] for i in missing]
+            missing_padded = self.model.tokenizer.pad(
+                {"input_ids": missing_token_ids}, padding=True, return_tensors="pt"
+            )["input_ids"].to(padded_token_ids.device)
+            missing_embeddings = self.model.tokens_to_embeddings(missing_padded)
+            prefix_output = base_model.forward_llm_prefix(
+                inputs_embeds=missing_embeddings,
+                partial_grad=partial_grad,
+                return_dict=True,
+            ).last_hidden_state
+            for batch_idx, original_idx in enumerate(missing):
+                seq_len = len(token_ids[original_idx])
+                cached_state = prefix_output[batch_idx, :seq_len].detach().cpu()
+                cached_states[original_idx] = cached_state
+                self._save_encoder_cache_item(missing_keys[batch_idx], token_ids[original_idx], cached_state)
+
+        hidden_dtype = cached_states[0].dtype
+        boundary_hidden_states = torch.zeros(
+            (len(cached_states), padded_token_ids.size(1), cached_states[0].size(-1)),
+            dtype=hidden_dtype,
+            device=padded_token_ids.device,
+        )
+        for i, cached_state in enumerate(cached_states):
+            seq_len = cached_state.size(0)
+            boundary_hidden_states[i, :seq_len] = cached_state.to(padded_token_ids.device)
+
+        self.encoder_cache_calls += 1
+        self.encoder_cache_hits += len(token_ids) - len(missing)
+        self.encoder_cache_misses += len(missing)
+        if self.encoder_cache_calls <= 3 or self.encoder_cache_calls % 50 == 0:
+            print(
+                "GOFA encoder cache: "
+                f"call={self.encoder_cache_calls}, hits={len(token_ids) - len(missing)}, "
+                f"misses={len(missing)}, total_hits={self.encoder_cache_hits}, "
+                f"total_misses={self.encoder_cache_misses}"
+            )
+
+        return base_model.forward_from_gnn_boundary(
+            boundary_hidden_states=boundary_hidden_states,
+            graph=graph,
+            mem_mask=mem_mask,
+            partial_grad=partial_grad,
+            map_node=True,
+            return_dict=True,
+        ).last_hidden_state
+
     def forward(self, g):
         """
         Encode the graph and generate logits for answer tokens.
@@ -214,13 +377,12 @@ class GOFAMistral(torch.nn.Module):
                              return_attention_mask=False)["input_ids"]
 
         text_output = [t + self.mem_tokens for t in text_output]
-        text_output = {"input_ids": text_output}
-        text_output = self.model.tokenizer.pad(text_output, padding=True, return_tensors="pt")["input_ids"].to(
+        padded_text_output = {"input_ids": text_output}
+        padded_text_output = self.model.tokenizer.pad(padded_text_output, padding=True, return_tensors="pt")["input_ids"].to(
             cur_device)
-        mem_mask = text_output >= self.model.vocab_size
+        mem_mask = padded_text_output >= self.model.vocab_size
 
         mem_mask = mem_mask.to(cur_device)
-        autoencoder_input_embedding = self.model.tokens_to_embeddings(text_output)
 
         # Use ICAE lora only in the encoder.
         self.model.icae.set_adapter("encadapt")
@@ -228,10 +390,17 @@ class GOFAMistral(torch.nn.Module):
         for name, param in self.model.icae.named_parameters():
             if "encadapt" in name:
                 param.requires_grad = False
-        compress_outputs = self.model.icae(inputs_embeds=autoencoder_input_embedding, output_hidden_states=True,
-                                           graph=graph, mem_mask=mem_mask, partial_grad=partial_grad, map_node=True)
+        compress_outputs = None
+        if self.encoder_cache_enabled and graph is not None:
+            compress_outputs = self._encode_with_encoder_cache(
+                text_output, padded_text_output, mem_mask, graph=graph, partial_grad=partial_grad
+            )
+        if compress_outputs is None:
+            autoencoder_input_embedding = self.model.tokens_to_embeddings(padded_text_output)
+            compress_outputs = self.model.icae(inputs_embeds=autoencoder_input_embedding, output_hidden_states=True,
+                                               graph=graph, mem_mask=mem_mask, partial_grad=partial_grad, map_node=True)
+            compress_outputs = compress_outputs.hidden_states[-1]
         self.model.icae.disable_adapter_layers()
-        compress_outputs = compress_outputs.hidden_states[-1]
 
         if graph is not None:
             node_emb = compress_outputs[:len(graph.node_map)]

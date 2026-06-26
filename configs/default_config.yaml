@@ -25,6 +25,9 @@ base_llm: "mistral7b"
 model_name_or_path: "mistralai/Mistral-7B-Instruct-v0.2"  # base Mistral model path or Hugging Face repo id
 attn_implementation: "eager"  # force an explicit causal mask for GOFA graph reordering
 checkpoint_dir: "./cache_data/model/"  # directory for ICAE/GOFA checkpoint files
+use_encoder_cache: False  # cache graph-independent encoder prefix states before the first GNN layer
+encoder_cache_dir: "./cache_data/encoder_cache"
+encoder_cache_tag: ""
 llm_max_length: 128
 val_interval:      # validate per {val_interval} training steps.
 mode: "decode"

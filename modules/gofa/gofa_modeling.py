@@ -57,6 +57,127 @@ class GOFAMistralModel(MistralModel):
 
         self.g_layers.load_state_dict(partial_state_dict, strict=False)
 
+    @property
+    def gnn_start_layer(self):
+        return self.config.num_hidden_layers - self.gofa_config.num_layers
+
+    def forward_llm_prefix(
+        self,
+        inputs_embeds: torch.FloatTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        partial_grad: Optional[bool] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, None, output_attentions
+        )
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers[:self.gnn_start_layer]:
+            if partial_grad:
+                with torch.no_grad():
+                    layer_outputs = self.llm_forward(
+                        decoder_layer, hidden_states, causal_mask, position_ids, None, output_attentions,
+                        False, cache_position, position_embeddings, flash_attn_kwargs
+                    )
+            else:
+                layer_outputs = self.llm_forward(
+                    decoder_layer, hidden_states, causal_mask, position_ids, None, output_attentions,
+                    False, cache_position, position_embeddings, flash_attn_kwargs
+                )
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        output = BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=all_self_attns,
+        )
+        return output if return_dict else output.to_tuple()
+
+    def forward_from_gnn_boundary(
+        self,
+        boundary_hidden_states: torch.FloatTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        graph=None,
+        mem_mask=None,
+        partial_grad=None,
+        map_node=None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        cache_position = torch.arange(0, boundary_hidden_states.shape[1], device=boundary_hidden_states.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = self._update_causal_mask(
+            attention_mask, boundary_hidden_states, cache_position, None, output_attentions
+        )
+        hidden_states = boundary_hidden_states
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        all_self_attns = () if output_attentions else None
+        cur_node_size = graph.num_node_feat if graph is not None else 0
+
+        for i, decoder_layer in enumerate(self.layers[self.gnn_start_layer:self.config.num_hidden_layers],
+                                          start=self.gnn_start_layer):
+            g_layer_idx = i - self.gnn_start_layer
+            if graph is not None:
+                if g_layer_idx == 0 and map_node:
+                    hidden_states = torch.cat(
+                        [hidden_states[:cur_node_size][graph.node_map], hidden_states[cur_node_size:]], dim=0)
+                    mem_mask = torch.cat([mem_mask[:cur_node_size][graph.node_map], mem_mask[cur_node_size:]], dim=0)
+                    if causal_mask is not None:
+                        causal_mask = torch.cat(
+                            [causal_mask[:cur_node_size][graph.node_map], causal_mask[cur_node_size:]], dim=0)
+                    cur_node_size = len(graph.node_map)
+                mem_repr = hidden_states[mem_mask].view(hidden_states.size()[0], self.gofa_config.mem_token, -1)
+                gnn_input = mem_repr[:cur_node_size]
+                gnn_edge_input = mem_repr[cur_node_size:][graph.edge_map]
+
+                output = self.g_layers[g_layer_idx](gnn_input, graph.edge_index, gnn_edge_input)
+                output = torch.cat([output, mem_repr[cur_node_size:]], dim=0)
+                gnn_output = torch.zeros_like(hidden_states, dtype=output.dtype)
+                gnn_output[mem_mask] = output.view(-1, output.size()[-1])
+                hidden_states = hidden_states * torch.logical_not(mem_mask).unsqueeze(2) + gnn_output
+                hidden_states = hidden_states.to(self.gofa_config.llama_dtype)
+
+            layer_outputs = self.llm_forward(
+                decoder_layer, hidden_states, causal_mask, position_ids, None, output_attentions,
+                False, cache_position, position_embeddings, flash_attn_kwargs
+            )
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        output = BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=all_self_attns,
+        )
+        return output if return_dict else output.to_tuple()
+
 
     def forward(
         self,
