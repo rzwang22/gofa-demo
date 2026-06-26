@@ -56,6 +56,9 @@ class ModelArguments:
     encoder_cache_dir: str = field(default="./cache_data/encoder_cache")
     encoder_cache_tag: str = field(default="")
     encoder_cache_skip_nog: bool = field(default=False, metadata={"help": "Do not cache NOG/prompt node states"})
+    encoder_cache_mode: str = field(default="boundary", metadata={"help": "Encoder cache mode: boundary or memory_kv"})
+    encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
+    encoder_cache_verify_tolerance: float = field(default=1e-3)
     profile_stage_times: bool = field(default=False, metadata={"help": "Synchronize and profile encoder/decoder stages"})
     profile_stage_log_interval: int = field(default=50, metadata={"help": "Log stage timing every N decoder calls"})
 
@@ -107,6 +110,9 @@ class GOFAMistral(torch.nn.Module):
         self.decoder_stage_time_s = 0.0
         self.encoder_cache_enabled = bool(model_args.use_encoder_cache)
         self.encoder_cache_dir = model_args.encoder_cache_dir
+        self.encoder_cache_mode = model_args.encoder_cache_mode
+        self.encoder_cache_verify = bool(model_args.encoder_cache_verify)
+        self.encoder_cache_verify_tolerance = model_args.encoder_cache_verify_tolerance
         self.encoder_cache_calls = 0
         self.encoder_cache_hits = 0
         self.encoder_cache_misses = 0
@@ -137,6 +143,8 @@ class GOFAMistral(torch.nn.Module):
                 if "default" in name:
                     param.requires_grad = True
         if self.encoder_cache_enabled:
+            if self.encoder_cache_mode not in {"boundary", "memory_kv"}:
+                raise ValueError("encoder_cache_mode must be either 'boundary' or 'memory_kv'.")
             if gofa_args.fuse_type != "interleave":
                 print("GOFA encoder cache is only implemented for fuse_type=interleave; disabling cache.")
                 self.encoder_cache_enabled = False
@@ -146,8 +154,19 @@ class GOFAMistral(torch.nn.Module):
                     "GOFA encoder cache enabled: "
                     f"dir={self._encoder_cache_root()}, boundary_layer="
                     f"{self.model.icae.get_base_model().model.gnn_start_layer}, "
-                    f"skip_nog={model_args.encoder_cache_skip_nog}"
+                    f"skip_nog={model_args.encoder_cache_skip_nog}, "
+                    f"mode={self.encoder_cache_mode}"
                 )
+                if self.encoder_cache_mode == "memory_kv":
+                    print(
+                        "GOFA encoder memory/text-KV cache enabled: "
+                        "stores layer-26 memory tokens plus text-side KV for the last GNN/LLM layers"
+                    )
+                    if self.encoder_cache_verify:
+                        print(
+                            "GOFA encoder memory/text-KV cache verification enabled: "
+                            f"tolerance={self.encoder_cache_verify_tolerance}"
+                        )
         if self.profile_stage_times:
             print(
                 "GOFA stage profiler enabled: "
@@ -231,6 +250,7 @@ class GOFAMistral(torch.nn.Module):
             "num_hidden_layers": base_config.num_hidden_layers,
             "num_gnn_layers": gofa_args.num_layers,
             "fuse_type": gofa_args.fuse_type,
+            "encoder_cache_mode": model_args.encoder_cache_mode,
             "attn_implementation": model_args.attn_implementation,
             "bf16": training_args.bf16,
             "icae_path": os.path.abspath(icae_path),
@@ -289,6 +309,47 @@ class GOFAMistral(torch.nn.Module):
             "seq_len": len(token_ids),
             "dtype": str(hidden_state.dtype),
             "hidden_state": hidden_state.detach().cpu(),
+        }
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, cache_path)
+
+    def _load_encoder_memory_kv_cache_item(self, token_ids):
+        cache_key = self._encoder_cache_key(token_ids)
+        cache_path = self._encoder_cache_path(cache_key)
+        if not os.path.exists(cache_path):
+            return None, cache_key
+        payload = torch.load(cache_path, map_location="cpu")
+        if payload.get("cache_format") != "memory_text_kv_v1":
+            return None, cache_key
+        if payload.get("cache_key") != cache_key or payload.get("seq_len") != len(token_ids):
+            return None, cache_key
+        if payload.get("mem_size") != self.mem_size:
+            return None, cache_key
+        text_len = payload.get("text_len")
+        if text_len is None or text_len + self.mem_size != len(token_ids):
+            return None, cache_key
+        text_kv = payload.get("text_kv")
+        base_model = self.model.icae.get_base_model().model
+        if not isinstance(text_kv, list) or len(text_kv) != base_model.gofa_config.num_layers:
+            return None, cache_key
+        return {
+            "text_len": text_len,
+            "memory_state": payload["memory_state"],
+            "text_kv": text_kv,
+        }, cache_key
+
+    def _save_encoder_memory_kv_cache_item(self, cache_key, token_ids, cache_item):
+        cache_path = self._encoder_cache_path(cache_key)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        payload = {
+            "cache_format": "memory_text_kv_v1",
+            "cache_key": cache_key,
+            "seq_len": len(token_ids),
+            "text_len": cache_item["text_len"],
+            "mem_size": self.mem_size,
+            "memory_state": cache_item["memory_state"],
+            "text_kv": cache_item["text_kv"],
         }
         torch.save(payload, tmp_path)
         os.replace(tmp_path, cache_path)
@@ -543,6 +604,183 @@ class GOFAMistral(torch.nn.Module):
 
         return final_hidden_states
 
+    def _memory_kv_mapped_mem_mask(self, mapped_items, max_seq_len, device):
+        mem_mask = torch.zeros((len(mapped_items), max_seq_len), dtype=torch.bool, device=device)
+        for i, item in enumerate(mapped_items):
+            start = item["text_len"]
+            end = start + self.mem_size
+            mem_mask[i, start:end] = True
+        return mem_mask
+
+    def _encode_with_memory_kv_cache(
+            self,
+            token_ids,
+            padded_token_ids,
+            mem_mask,
+            graph=None,
+            partial_grad=None,
+            skip_cache_indices=None):
+        if self.training:
+            return None
+        base_model = self.model.icae.get_base_model().model
+        required_methods = ("forward_llm_prefix", "build_memory_text_kv_cache_item", "forward_memory_with_text_kv")
+        if not all(hasattr(base_model, method) for method in required_methods):
+            return None
+
+        device = padded_token_ids.device
+        self._sync_encoder_cache_timer(device)
+        total_start = time.perf_counter()
+        current_timing = {
+            "load_s": 0.0,
+            "miss_compute_s": 0.0,
+            "save_s": 0.0,
+            "assemble_s": 0.0,
+            "suffix_compute_s": 0.0,
+            "total_s": 0.0,
+        }
+
+        skip_cache_indices = set(skip_cache_indices or [])
+        cache_items = [None] * len(token_ids)
+        missing = []
+        missing_keys = []
+        skipped = []
+        load_start = time.perf_counter()
+        for i, ids in enumerate(token_ids):
+            if i in skip_cache_indices:
+                missing.append(i)
+                missing_keys.append(None)
+                skipped.append(i)
+                continue
+            cache_item, cache_key = self._load_encoder_memory_kv_cache_item(ids)
+            if cache_item is None:
+                missing.append(i)
+                missing_keys.append(cache_key)
+            else:
+                cache_items[i] = cache_item
+        current_timing["load_s"] = time.perf_counter() - load_start
+
+        if missing:
+            self._sync_encoder_cache_timer(device)
+            miss_compute_start = time.perf_counter()
+            missing_token_ids = [token_ids[i] for i in missing]
+            missing_padded = self.model.tokenizer.pad(
+                {"input_ids": missing_token_ids}, padding=True, return_tensors="pt"
+            )["input_ids"].to(padded_token_ids.device)
+            missing_embeddings = self.model.tokens_to_embeddings(missing_padded)
+            prefix_output = base_model.forward_llm_prefix(
+                inputs_embeds=missing_embeddings,
+                partial_grad=partial_grad,
+                return_dict=True,
+            ).last_hidden_state
+
+            built_items = []
+            for batch_idx, original_idx in enumerate(missing):
+                seq_len = len(token_ids[original_idx])
+                text_len = seq_len - self.mem_size
+                cache_item = base_model.build_memory_text_kv_cache_item(
+                    prefix_output[batch_idx, :seq_len],
+                    text_len=text_len,
+                    partial_grad=partial_grad,
+                )
+                built_items.append(cache_item)
+                cache_items[original_idx] = cache_item
+            self._sync_encoder_cache_timer(device)
+            current_timing["miss_compute_s"] = time.perf_counter() - miss_compute_start
+
+            save_start = time.perf_counter()
+            for batch_idx, original_idx in enumerate(missing):
+                if missing_keys[batch_idx] is not None:
+                    self._save_encoder_memory_kv_cache_item(
+                        missing_keys[batch_idx],
+                        token_ids[original_idx],
+                        built_items[batch_idx],
+                    )
+            current_timing["save_s"] = time.perf_counter() - save_start
+
+        self._sync_encoder_cache_timer(device)
+        assemble_start = time.perf_counter()
+        hidden_dtype = cache_items[0]["memory_state"].dtype
+        memory_states = torch.zeros(
+            (len(cache_items), self.mem_size, cache_items[0]["memory_state"].size(-1)),
+            dtype=hidden_dtype,
+            device=padded_token_ids.device,
+        )
+        for i, cache_item in enumerate(cache_items):
+            memory_states[i] = cache_item["memory_state"].to(padded_token_ids.device)
+        self._sync_encoder_cache_timer(device)
+        current_timing["assemble_s"] = time.perf_counter() - assemble_start
+
+        self.encoder_cache_calls += 1
+        current_skips = len(skipped)
+        current_misses = len(missing) - current_skips
+        current_hits = len(token_ids) - len(missing)
+        self.encoder_cache_hits += current_hits
+        self.encoder_cache_misses += current_misses
+        self.encoder_cache_skips += current_skips
+
+        self._sync_encoder_cache_timer(device)
+        suffix_start = time.perf_counter()
+        final_memory_states, mapped_items = base_model.forward_memory_with_text_kv(
+            memory_states=memory_states,
+            text_kv_items=cache_items,
+            graph=graph,
+            map_node=True,
+        )
+        final_hidden_states = torch.zeros(
+            (len(mapped_items), padded_token_ids.size(1), final_memory_states.size(-1)),
+            dtype=final_memory_states.dtype,
+            device=padded_token_ids.device,
+        )
+        mapped_mem_mask = self._memory_kv_mapped_mem_mask(mapped_items, padded_token_ids.size(1), padded_token_ids.device)
+        final_hidden_states[mapped_mem_mask] = final_memory_states.reshape(-1, final_memory_states.size(-1))
+        self._sync_encoder_cache_timer(device)
+        current_timing["suffix_compute_s"] = time.perf_counter() - suffix_start
+
+        if self.encoder_cache_verify:
+            previous_profile_state = getattr(base_model, "profile_stage_times", False)
+            base_model.profile_stage_times = False
+            try:
+                with torch.no_grad():
+                    reference_embeddings = self.model.tokens_to_embeddings(padded_token_ids)
+                    reference_hidden_states = self.model.icae(
+                        inputs_embeds=reference_embeddings,
+                        output_hidden_states=True,
+                        graph=graph,
+                        mem_mask=mem_mask,
+                        partial_grad=partial_grad,
+                        map_node=True,
+                    ).hidden_states[-1]
+            finally:
+                base_model.profile_stage_times = previous_profile_state
+            diff = (
+                final_hidden_states[mapped_mem_mask].float()
+                - reference_hidden_states[mapped_mem_mask].float()
+            ).abs()
+            max_abs = diff.max().item() if diff.numel() else 0.0
+            mean_abs = diff.mean().item() if diff.numel() else 0.0
+            passed = max_abs <= self.encoder_cache_verify_tolerance
+            print(
+                "GOFA memory/text-KV cache verification: "
+                f"call={self.encoder_cache_calls}, max_abs={max_abs:.6g}, "
+                f"mean_abs={mean_abs:.6g}, passed={passed}"
+            )
+
+        current_timing["total_s"] = time.perf_counter() - total_start
+        for key, value in current_timing.items():
+            self.encoder_cache_timing[key] += value
+
+        if self.encoder_cache_calls <= 3 or self.encoder_cache_calls % 50 == 0:
+            print(
+                "GOFA encoder memory/text-KV cache: "
+                f"call={self.encoder_cache_calls}, hits={current_hits}, "
+                f"misses={current_misses}, skips={current_skips}, "
+                f"total_hits={self.encoder_cache_hits}, total_misses={self.encoder_cache_misses}, "
+                f"total_skips={self.encoder_cache_skips}"
+            )
+            self._encoder_cache_log_timing(current_timing)
+
+        return final_hidden_states
+
     def forward(self, g):
         """
         Encode the graph and generate logits for answer tokens.
@@ -608,14 +846,24 @@ class GOFAMistral(torch.nn.Module):
                 param.requires_grad = False
         compress_outputs = None
         if self.encoder_cache_enabled and graph is not None:
-            compress_outputs = self._encode_with_encoder_cache(
-                text_output,
-                padded_text_output,
-                mem_mask,
-                graph=graph,
-                partial_grad=partial_grad,
-                skip_cache_indices=self._encoder_cache_skip_indices(graph),
-            )
+            if self.encoder_cache_mode == "memory_kv":
+                compress_outputs = self._encode_with_memory_kv_cache(
+                    text_output,
+                    padded_text_output,
+                    mem_mask,
+                    graph=graph,
+                    partial_grad=partial_grad,
+                    skip_cache_indices=self._encoder_cache_skip_indices(graph),
+                )
+            else:
+                compress_outputs = self._encode_with_encoder_cache(
+                    text_output,
+                    padded_text_output,
+                    mem_mask,
+                    graph=graph,
+                    partial_grad=partial_grad,
+                    skip_cache_indices=self._encoder_cache_skip_indices(graph),
+                )
         if compress_outputs is None:
             self._sync_encoder_cache_timer(cur_device)
             full_start = time.perf_counter()

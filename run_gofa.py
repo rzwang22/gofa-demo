@@ -62,6 +62,12 @@ def main(params):
         model_args.encoder_cache_tag = params.encoder_cache_tag
     if hasattr(params, "encoder_cache_skip_nog"):
         model_args.encoder_cache_skip_nog = params.encoder_cache_skip_nog
+    if getattr(params, "encoder_cache_mode", None):
+        model_args.encoder_cache_mode = params.encoder_cache_mode
+    if hasattr(params, "encoder_cache_verify"):
+        model_args.encoder_cache_verify = params.encoder_cache_verify
+    if hasattr(params, "encoder_cache_verify_tolerance"):
+        model_args.encoder_cache_verify_tolerance = params.encoder_cache_verify_tolerance
     if hasattr(params, "profile_stage_times"):
         model_args.profile_stage_times = params.profile_stage_times
     if hasattr(params, "profile_stage_log_interval"):

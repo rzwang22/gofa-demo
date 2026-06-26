@@ -24,6 +24,44 @@ logger = logging.get_logger(__name__)
 _CHECKPOINT_FOR_DOC = "mistralai/Mistral-7B-v0.1"
 _CONFIG_FOR_DOC = "MistralConfig"
 
+
+class _SingleLayerKVCache:
+    """
+    Minimal cache for one Mistral decoder layer.
+
+    It is used only by the encoder memory/text-KV cache path, where each item is
+    run independently and the cached prefix is the item's text-side K/V.
+    """
+    def __init__(self, key_states=None, value_states=None):
+        self.key_states = key_states
+        self.value_states = value_states
+        self.key_cache = [] if key_states is None else [key_states]
+        self.value_cache = [] if value_states is None else [value_states]
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0):
+        if self.key_states is None:
+            return 0
+        return self.key_states.shape[-2]
+
+    def get_usable_length(self, seq_len, layer_idx: Optional[int] = 0):
+        return self.get_seq_length(layer_idx)
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, cache_kwargs=None):
+        if self.key_states is None:
+            updated_key_states = key_states
+            updated_value_states = value_states
+        else:
+            cached_keys = self.key_states.to(device=key_states.device, dtype=key_states.dtype)
+            cached_values = self.value_states.to(device=value_states.device, dtype=value_states.dtype)
+            updated_key_states = torch.cat([cached_keys, key_states], dim=-2)
+            updated_value_states = torch.cat([cached_values, value_states], dim=-2)
+        self.key_states = updated_key_states
+        self.value_states = updated_value_states
+        self.key_cache = [updated_key_states]
+        self.value_cache = [updated_value_states]
+        return updated_key_states, updated_value_states
+
+
 class GOFAMistralModel(MistralModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MistralDecoderLayer`]
@@ -102,6 +140,183 @@ class GOFAMistralModel(MistralModel):
     def _stage_profile_increment(self, key):
         if self._stage_profile_enabled():
             self.stage_profile[key] += 1
+
+    def _make_block_causal_mask(self, query_len, key_len, past_len, dtype, device):
+        mask = torch.zeros((query_len, key_len), dtype=dtype, device=device)
+        query_positions = torch.arange(query_len, device=device).unsqueeze(1) + past_len
+        key_positions = torch.arange(key_len, device=device).unsqueeze(0)
+        blocked = key_positions > query_positions
+        if blocked.any():
+            mask = mask.masked_fill(blocked, torch.finfo(dtype).min)
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def build_memory_text_kv_cache_item(
+        self,
+        boundary_hidden_states: torch.FloatTensor,
+        text_len: int,
+        output_attentions: Optional[bool] = None,
+        partial_grad: Optional[bool] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        memory_state = boundary_hidden_states[text_len:text_len + self.gofa_config.mem_token]
+        if text_len == 0:
+            text_kv = []
+            for decoder_layer in self.layers[self.gnn_start_layer:self.config.num_hidden_layers]:
+                attention = decoder_layer.self_attn
+                num_kv_heads = attention.num_key_value_heads
+                head_dim = getattr(attention, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+                text_kv.append(
+                    {
+                        "key": torch.empty(
+                            (num_kv_heads, 0, head_dim),
+                            dtype=boundary_hidden_states.dtype,
+                            device="cpu",
+                        ),
+                        "value": torch.empty(
+                            (num_kv_heads, 0, head_dim),
+                            dtype=boundary_hidden_states.dtype,
+                            device="cpu",
+                        ),
+                    }
+                )
+            return {
+                "text_len": text_len,
+                "memory_state": memory_state.detach().cpu(),
+                "text_kv": text_kv,
+            }
+        text_hidden_states = boundary_hidden_states[:text_len].unsqueeze(0).contiguous()
+        text_kv = []
+
+        for decoder_layer in self.layers[self.gnn_start_layer:self.config.num_hidden_layers]:
+            cache_position = torch.arange(0, text_len, device=text_hidden_states.device)
+            position_ids = cache_position.unsqueeze(0)
+            causal_mask = self._make_block_causal_mask(
+                text_len,
+                text_len,
+                0,
+                text_hidden_states.dtype,
+                text_hidden_states.device,
+            )
+            position_embeddings = self.rotary_emb(text_hidden_states, position_ids)
+            layer_cache = _SingleLayerKVCache()
+            if partial_grad:
+                with torch.no_grad():
+                    layer_outputs = self.llm_forward(
+                        decoder_layer,
+                        text_hidden_states,
+                        causal_mask,
+                        position_ids,
+                        layer_cache,
+                        output_attentions,
+                        True,
+                        cache_position,
+                        position_embeddings,
+                        flash_attn_kwargs,
+                    )
+            else:
+                layer_outputs = self.llm_forward(
+                    decoder_layer,
+                    text_hidden_states,
+                    causal_mask,
+                    position_ids,
+                    layer_cache,
+                    output_attentions,
+                    True,
+                    cache_position,
+                    position_embeddings,
+                    flash_attn_kwargs,
+                )
+            text_kv.append(
+                {
+                    "key": layer_cache.key_states.squeeze(0).detach().cpu(),
+                    "value": layer_cache.value_states.squeeze(0).detach().cpu(),
+                }
+            )
+            text_hidden_states = layer_outputs[0]
+
+        return {
+            "text_len": text_len,
+            "memory_state": memory_state.detach().cpu(),
+            "text_kv": text_kv,
+        }
+
+    def forward_memory_with_text_kv(
+        self,
+        memory_states: torch.FloatTensor,
+        text_kv_items,
+        graph=None,
+        map_node=None,
+        output_attentions: Optional[bool] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        cur_node_size = graph.num_node_feat if graph is not None else 0
+        mapped_items = list(text_kv_items)
+
+        if graph is not None and map_node:
+            item_order = graph.node_map.detach().cpu().tolist() + list(range(cur_node_size, len(mapped_items)))
+            memory_states = memory_states[item_order]
+            mapped_items = [mapped_items[i] for i in item_order]
+            cur_node_size = len(graph.node_map)
+
+        self._stage_profile_increment("encoder_suffix_calls")
+        for i, decoder_layer in enumerate(self.layers[self.gnn_start_layer:self.config.num_hidden_layers],
+                                          start=self.gnn_start_layer):
+            g_layer_idx = i - self.gnn_start_layer
+            if graph is not None:
+                gnn_start = self._stage_profile_start(memory_states)
+                gnn_input = memory_states[:cur_node_size]
+                gnn_edge_input = memory_states[cur_node_size:][graph.edge_map]
+                output = self.g_layers[g_layer_idx](gnn_input, graph.edge_index, gnn_edge_input)
+                memory_states = torch.cat([output, memory_states[cur_node_size:]], dim=0)
+                memory_states = memory_states.to(self.gofa_config.llama_dtype)
+                self._stage_profile_add("encoder_gnn_layer_s", gnn_start, memory_states, g_layer_idx)
+
+            llm_start = self._stage_profile_start(memory_states)
+            next_memory_states = []
+            for item_idx, item in enumerate(mapped_items):
+                text_len = item["text_len"]
+                mem_hidden_states = memory_states[item_idx:item_idx + 1]
+                cache_position = torch.arange(
+                    text_len,
+                    text_len + self.gofa_config.mem_token,
+                    device=mem_hidden_states.device,
+                )
+                position_ids = cache_position.unsqueeze(0)
+                causal_mask = self._make_block_causal_mask(
+                    self.gofa_config.mem_token,
+                    text_len + self.gofa_config.mem_token,
+                    text_len,
+                    mem_hidden_states.dtype,
+                    mem_hidden_states.device,
+                )
+                kv = item["text_kv"][g_layer_idx]
+                text_cache = _SingleLayerKVCache(
+                    kv["key"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
+                    kv["value"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
+                )
+                position_embeddings = self.rotary_emb(mem_hidden_states, position_ids)
+                layer_outputs = self.llm_forward(
+                    decoder_layer,
+                    mem_hidden_states,
+                    causal_mask,
+                    position_ids,
+                    text_cache,
+                    output_attentions,
+                    True,
+                    cache_position,
+                    position_embeddings,
+                    flash_attn_kwargs,
+                )
+                next_memory_states.append(layer_outputs[0])
+            memory_states = torch.cat(next_memory_states, dim=0)
+            self._stage_profile_add("encoder_suffix_transformer_layer_s", llm_start, memory_states, g_layer_idx)
+
+        norm_start = self._stage_profile_start(memory_states)
+        memory_states = self.norm(memory_states)
+        self._stage_profile_add("encoder_norm_s", norm_start, memory_states)
+        return memory_states, mapped_items
 
     def forward_llm_prefix(
         self,

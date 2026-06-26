@@ -29,6 +29,9 @@ use_encoder_cache: False  # cache graph-independent encoder prefix states before
 encoder_cache_dir: "./cache_data/encoder_cache"
 encoder_cache_tag: ""
 encoder_cache_skip_nog: False  # when True, NOG/prompt nodes are recomputed and not stored in encoder cache
+encoder_cache_mode: "boundary"  # boundary caches the layer-26 full hidden state; memory_kv caches memory + text-side KV
+encoder_cache_verify: False  # when using memory_kv, compare final memory slots against the full encoder path
+encoder_cache_verify_tolerance: 0.001
 profile_stage_times: False  # synchronize CUDA and print encoder/decoder stage timing percentages
 profile_stage_log_interval: 50
 llm_max_length: 128
