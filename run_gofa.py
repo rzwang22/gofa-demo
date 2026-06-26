@@ -62,6 +62,10 @@ def main(params):
         model_args.encoder_cache_tag = params.encoder_cache_tag
     if hasattr(params, "encoder_cache_skip_nog"):
         model_args.encoder_cache_skip_nog = params.encoder_cache_skip_nog
+    if hasattr(params, "profile_stage_times"):
+        model_args.profile_stage_times = params.profile_stage_times
+    if hasattr(params, "profile_stage_log_interval"):
+        model_args.profile_stage_log_interval = params.profile_stage_log_interval
     training_args.model_max_length = params.llm_max_length
     if params.training_precision == "bf16-mixed":
         training_args.bf16 = True

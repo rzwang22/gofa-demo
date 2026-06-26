@@ -29,6 +29,8 @@ use_encoder_cache: False  # cache graph-independent encoder prefix states before
 encoder_cache_dir: "./cache_data/encoder_cache"
 encoder_cache_tag: ""
 encoder_cache_skip_nog: False  # when True, NOG/prompt nodes are recomputed and not stored in encoder cache
+profile_stage_times: False  # synchronize CUDA and print encoder/decoder stage timing percentages
+profile_stage_log_interval: 50
 llm_max_length: 128
 val_interval:      # validate per {val_interval} training steps.
 mode: "decode"

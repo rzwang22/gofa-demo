@@ -1,6 +1,7 @@
 from collections import OrderedDict
 
 from typing import List, Optional, Tuple, Union
+import time
 
 import torch
 import torch.utils.checkpoint
@@ -34,6 +35,8 @@ class GOFAMistralModel(MistralModel):
     def __init__(self, config: MistralConfig, gofa_config):
         super().__init__(config)
         self.gofa_config = gofa_config
+        self.profile_stage_times = False
+        self.reset_stage_profile()
 
         # self.g_layers = nn.ModuleList([GOFAGatedDecoderLayer(gofa_config, layer_idx=i) for i in range(gofa_config.num_layers)])
         self.g_layers = nn.ModuleList(
@@ -61,6 +64,45 @@ class GOFAMistralModel(MistralModel):
     def gnn_start_layer(self):
         return self.config.num_hidden_layers - self.gofa_config.num_layers
 
+    def reset_stage_profile(self):
+        num_gnn_layers = self.gofa_config.num_layers
+        self.stage_profile = {
+            "encoder_full_calls": 0,
+            "encoder_prefix_calls": 0,
+            "encoder_suffix_calls": 0,
+            "encoder_prefix_transformer_s": 0.0,
+            "encoder_gnn_layer_s": [0.0 for _ in range(num_gnn_layers)],
+            "encoder_suffix_transformer_layer_s": [0.0 for _ in range(num_gnn_layers)],
+            "encoder_norm_s": 0.0,
+        }
+
+    def _stage_profile_enabled(self):
+        return bool(getattr(self, "profile_stage_times", False))
+
+    def _stage_profile_sync(self, ref_tensor):
+        if ref_tensor is not None and ref_tensor.device.type == "cuda":
+            torch.cuda.synchronize(ref_tensor.device)
+
+    def _stage_profile_start(self, ref_tensor):
+        if not self._stage_profile_enabled():
+            return None
+        self._stage_profile_sync(ref_tensor)
+        return time.perf_counter()
+
+    def _stage_profile_add(self, key, start_time, ref_tensor, index=None):
+        if start_time is None:
+            return
+        self._stage_profile_sync(ref_tensor)
+        elapsed = time.perf_counter() - start_time
+        if index is None:
+            self.stage_profile[key] += elapsed
+        else:
+            self.stage_profile[key][index] += elapsed
+
+    def _stage_profile_increment(self, key):
+        if self._stage_profile_enabled():
+            self.stage_profile[key] += 1
+
     def forward_llm_prefix(
         self,
         inputs_embeds: torch.FloatTensor,
@@ -85,6 +127,8 @@ class GOFAMistralModel(MistralModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         all_self_attns = () if output_attentions else None
 
+        self._stage_profile_increment("encoder_prefix_calls")
+        prefix_start = self._stage_profile_start(hidden_states)
         for decoder_layer in self.layers[:self.gnn_start_layer]:
             if partial_grad:
                 with torch.no_grad():
@@ -100,6 +144,7 @@ class GOFAMistralModel(MistralModel):
             hidden_states = layer_outputs[0]
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+        self._stage_profile_add("encoder_prefix_transformer_s", prefix_start, hidden_states)
 
         output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -137,10 +182,12 @@ class GOFAMistralModel(MistralModel):
         all_self_attns = () if output_attentions else None
         cur_node_size = graph.num_node_feat if graph is not None else 0
 
+        self._stage_profile_increment("encoder_suffix_calls")
         for i, decoder_layer in enumerate(self.layers[self.gnn_start_layer:self.config.num_hidden_layers],
                                           start=self.gnn_start_layer):
             g_layer_idx = i - self.gnn_start_layer
             if graph is not None:
+                gnn_start = self._stage_profile_start(hidden_states)
                 if g_layer_idx == 0 and map_node:
                     hidden_states = torch.cat(
                         [hidden_states[:cur_node_size][graph.node_map], hidden_states[cur_node_size:]], dim=0)
@@ -159,16 +206,21 @@ class GOFAMistralModel(MistralModel):
                 gnn_output[mem_mask] = output.view(-1, output.size()[-1])
                 hidden_states = hidden_states * torch.logical_not(mem_mask).unsqueeze(2) + gnn_output
                 hidden_states = hidden_states.to(self.gofa_config.llama_dtype)
+                self._stage_profile_add("encoder_gnn_layer_s", gnn_start, hidden_states, g_layer_idx)
 
+            llm_start = self._stage_profile_start(hidden_states)
             layer_outputs = self.llm_forward(
                 decoder_layer, hidden_states, causal_mask, position_ids, None, output_attentions,
                 False, cache_position, position_embeddings, flash_attn_kwargs
             )
             hidden_states = layer_outputs[0]
+            self._stage_profile_add("encoder_suffix_transformer_layer_s", llm_start, hidden_states, g_layer_idx)
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        norm_start = self._stage_profile_start(hidden_states)
         hidden_states = self.norm(hidden_states)
+        self._stage_profile_add("encoder_norm_s", norm_start, hidden_states)
 
         output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -252,11 +304,18 @@ class GOFAMistralModel(MistralModel):
 
         cur_node_size = graph.num_node_feat if graph is not None else 0
 
+        if graph is not None:
+            self._stage_profile_increment("encoder_full_calls")
+        prefix_start = self._stage_profile_start(hidden_states) if graph is not None else None
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             g_layer_idx = i - (self.config.num_hidden_layers - self.gofa_config.num_layers)
             if g_layer_idx >= 0 and graph is not None:
+                if g_layer_idx == 0:
+                    self._stage_profile_add("encoder_prefix_transformer_s", prefix_start, hidden_states)
+                    prefix_start = None
+                gnn_start = self._stage_profile_start(hidden_states)
                 if g_layer_idx == 0 and map_node:
                     hidden_states = torch.cat(
                         [hidden_states[:cur_node_size][graph.node_map], hidden_states[cur_node_size:]], dim=0)
@@ -275,6 +334,8 @@ class GOFAMistralModel(MistralModel):
                 gnn_output[mem_mask] = output.view(-1, output.size()[-1])
                 hidden_states = hidden_states * torch.logical_not(mem_mask).unsqueeze(2) + gnn_output
                 hidden_states = hidden_states.to(self.gofa_config.llama_dtype)
+                self._stage_profile_add("encoder_gnn_layer_s", gnn_start, hidden_states, g_layer_idx)
+            llm_start = self._stage_profile_start(hidden_states) if g_layer_idx >= 0 and graph is not None else None
             if g_layer_idx < 0 and partial_grad:
                 with torch.no_grad():
                     layer_outputs = self.llm_forward(decoder_layer, hidden_states, causal_mask, position_ids, past_key_values, output_attentions, use_cache, cache_position, position_embeddings, flash_attn_kwargs)
@@ -284,11 +345,15 @@ class GOFAMistralModel(MistralModel):
                                                  position_embeddings, flash_attn_kwargs)
 
             hidden_states = layer_outputs[0]
+            if g_layer_idx >= 0 and graph is not None:
+                self._stage_profile_add("encoder_suffix_transformer_layer_s", llm_start, hidden_states, g_layer_idx)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        norm_start = self._stage_profile_start(hidden_states) if graph is not None else None
         hidden_states = self.norm(hidden_states)
+        self._stage_profile_add("encoder_norm_s", norm_start, hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

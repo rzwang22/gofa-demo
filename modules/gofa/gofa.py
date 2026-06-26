@@ -56,6 +56,8 @@ class ModelArguments:
     encoder_cache_dir: str = field(default="./cache_data/encoder_cache")
     encoder_cache_tag: str = field(default="")
     encoder_cache_skip_nog: bool = field(default=False, metadata={"help": "Do not cache NOG/prompt node states"})
+    profile_stage_times: bool = field(default=False, metadata={"help": "Synchronize and profile encoder/decoder stages"})
+    profile_stage_log_interval: int = field(default=50, metadata={"help": "Log stage timing every N decoder calls"})
 
 
 @dataclass
@@ -98,6 +100,11 @@ class GOFAMistral(torch.nn.Module):
         self.mem_tokens = list(range(model.vocab_size, model.vocab_size + model_args.mem_size))
         self.mem_size = model_args.mem_size
         self.model = model
+        self.profile_stage_times = bool(model_args.profile_stage_times)
+        self.profile_stage_log_interval = model_args.profile_stage_log_interval
+        self.stage_profile_reports = 0
+        self.decoder_stage_calls = 0
+        self.decoder_stage_time_s = 0.0
         self.encoder_cache_enabled = bool(model_args.use_encoder_cache)
         self.encoder_cache_dir = model_args.encoder_cache_dir
         self.encoder_cache_calls = 0
@@ -115,6 +122,10 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_full_calls = 0
         self.encoder_full_time_s = 0.0
         self.encoder_cache_namespace = self._build_encoder_cache_namespace(dir, model_args, training_args, gofa_args)
+        base_model = self.model.icae.get_base_model().model
+        if hasattr(base_model, "profile_stage_times"):
+            base_model.profile_stage_times = self.profile_stage_times
+            base_model.reset_stage_profile()
         self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
         self.model.left_tokenizer.pad_token = self.model.left_tokenizer.bos_token
         for param in self.model.icae.parameters():
@@ -137,6 +148,12 @@ class GOFAMistral(torch.nn.Module):
                     f"{self.model.icae.get_base_model().model.gnn_start_layer}, "
                     f"skip_nog={model_args.encoder_cache_skip_nog}"
                 )
+        if self.profile_stage_times:
+            print(
+                "GOFA stage profiler enabled: "
+                f"log_interval={self.profile_stage_log_interval}, "
+                "timings include cuda synchronization overhead"
+            )
 
     def get_tokenizer(self):
         return self.model.tokenizer
@@ -279,6 +296,91 @@ class GOFAMistral(torch.nn.Module):
     def _sync_encoder_cache_timer(self, device):
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize(device)
+
+    def _stage_timer_start(self, device):
+        if not self.profile_stage_times:
+            return None
+        self._sync_encoder_cache_timer(device)
+        return time.perf_counter()
+
+    def _stage_timer_add_decoder(self, start_time, device):
+        if start_time is None:
+            return
+        self._sync_encoder_cache_timer(device)
+        self.decoder_stage_calls += 1
+        self.decoder_stage_time_s += time.perf_counter() - start_time
+
+    def _stage_timing_percent(self, value, total):
+        return 100.0 * value / total if total > 0 else 0.0
+
+    def _maybe_log_stage_profile(self):
+        if not self.profile_stage_times:
+            return
+        self.stage_profile_reports += 1
+        interval = max(int(self.profile_stage_log_interval), 1)
+        if not (self.stage_profile_reports <= 3 or self.stage_profile_reports % interval == 0):
+            return
+
+        base_model = self.model.icae.get_base_model().model
+        profile = getattr(base_model, "stage_profile", None)
+        if profile is None:
+            return
+
+        prefix = profile["encoder_prefix_transformer_s"]
+        gnn_layers = profile["encoder_gnn_layer_s"]
+        suffix_layers = profile["encoder_suffix_transformer_layer_s"]
+        norm = profile["encoder_norm_s"]
+        decoder = self.decoder_stage_time_s
+        gnn_total = sum(gnn_layers)
+        suffix_total = sum(suffix_layers)
+        model_total = prefix + gnn_total + suffix_total + norm + decoder
+        if model_total <= 0:
+            return
+
+        print(
+            "GOFA stage timing summary: "
+            f"report={self.stage_profile_reports}, model_total={model_total:.4f}s, "
+            f"encoder_full_calls={profile['encoder_full_calls']}, "
+            f"prefix_calls={profile['encoder_prefix_calls']}, "
+            f"suffix_calls={profile['encoder_suffix_calls']}, "
+            f"decoder_calls={self.decoder_stage_calls}"
+        )
+        print(
+            "  encoder_prefix_transformer: "
+            f"{prefix:.4f}s ({self._stage_timing_percent(prefix, model_total):.2f}%)"
+        )
+        for i, value in enumerate(gnn_layers):
+            print(
+                f"  encoder_gnn_layer_{i}: "
+                f"{value:.4f}s ({self._stage_timing_percent(value, model_total):.2f}%)"
+            )
+        for i, value in enumerate(suffix_layers):
+            print(
+                f"  encoder_transformer_layer_{base_model.gnn_start_layer + i}: "
+                f"{value:.4f}s ({self._stage_timing_percent(value, model_total):.2f}%)"
+            )
+        print(
+            "  encoder_norm: "
+            f"{norm:.4f}s ({self._stage_timing_percent(norm, model_total):.2f}%)"
+        )
+        print(
+            "  decoder: "
+            f"{decoder:.4f}s ({self._stage_timing_percent(decoder, model_total):.2f}%)"
+        )
+
+        cache_overhead = (
+            self.encoder_cache_timing["load_s"]
+            + self.encoder_cache_timing["save_s"]
+            + self.encoder_cache_timing["assemble_s"]
+        )
+        if cache_overhead > 0:
+            print(
+                "  cache_overhead_load_save_assemble: "
+                f"{cache_overhead:.4f}s "
+                f"(load={self.encoder_cache_timing['load_s']:.4f}s, "
+                f"save={self.encoder_cache_timing['save_s']:.4f}s, "
+                f"assemble={self.encoder_cache_timing['assemble_s']:.4f}s)"
+            )
 
     def _encoder_cache_log_timing(self, current):
         total_cacheable_items = self.encoder_cache_hits + self.encoder_cache_misses
@@ -587,7 +689,10 @@ class GOFAMistral(torch.nn.Module):
             self.model.icae.enable_adapter_layers()
         else:
             self.model.icae.disable_adapter_layers()
+        decoder_start = self._stage_timer_start(mem_embs.device)
         output_emb = self.model.icae(inputs_embeds=prompt_answer_embs).logits
+        self._stage_timer_add_decoder(decoder_start, mem_embs.device)
+        self._maybe_log_stage_profile()
 
         return output_emb, answer_prompt, target_mask
 
@@ -636,6 +741,7 @@ class GOFAMistral(torch.nn.Module):
             self.model.icae.enable_adapter_layers()
         else:
             self.model.icae.disable_adapter_layers()
+        decoder_start = self._stage_timer_start(mem_embs.device)
         for i in range(max_length):
             out = self.model.icae(inputs_embeds=output, attention_mask=att_mask, past_key_values=past_key_values,
                                  use_cache=True)
@@ -660,6 +766,8 @@ class GOFAMistral(torch.nn.Module):
 
             if torch.all(eos_reached):
                 break
+        self._stage_timer_add_decoder(decoder_start, mem_embs.device)
+        self._maybe_log_stage_profile()
 
         generate_text = torch.cat(generate_text, dim=-1)
         generate_text[generate_text >= 32000] = 1
