@@ -68,6 +68,16 @@ def main(params):
         model_args.encoder_cache_verify = params.encoder_cache_verify
     if hasattr(params, "encoder_cache_verify_tolerance"):
         model_args.encoder_cache_verify_tolerance = params.encoder_cache_verify_tolerance
+    if hasattr(params, "encoder_cache_verify_mean_tolerance"):
+        model_args.encoder_cache_verify_mean_tolerance = params.encoder_cache_verify_mean_tolerance
+    if hasattr(params, "encoder_cache_verify_p99_tolerance"):
+        model_args.encoder_cache_verify_p99_tolerance = params.encoder_cache_verify_p99_tolerance
+    if hasattr(params, "encoder_cache_verify_relative_l2_tolerance"):
+        model_args.encoder_cache_verify_relative_l2_tolerance = params.encoder_cache_verify_relative_l2_tolerance
+    if hasattr(params, "encoder_cache_verify_max_tolerance"):
+        model_args.encoder_cache_verify_max_tolerance = params.encoder_cache_verify_max_tolerance
+    if hasattr(params, "encoder_cache_verify_log_interval"):
+        model_args.encoder_cache_verify_log_interval = params.encoder_cache_verify_log_interval
     if hasattr(params, "profile_stage_times"):
         model_args.profile_stage_times = params.profile_stage_times
     if hasattr(params, "profile_stage_log_interval"):

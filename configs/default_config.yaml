@@ -31,7 +31,12 @@ encoder_cache_tag: ""
 encoder_cache_skip_nog: False  # when True, NOG/prompt nodes are recomputed and not stored in encoder cache
 encoder_cache_mode: "boundary"  # boundary caches the layer-26 full hidden state; memory_kv caches memory + text-side KV
 encoder_cache_verify: False  # when using memory_kv, compare final memory slots against the full encoder path
-encoder_cache_verify_tolerance: 0.001
+encoder_cache_verify_tolerance: 0.001  # strict max-absolute threshold; reported as exact_passed
+encoder_cache_verify_mean_tolerance: 0.03  # practical verification threshold for mean absolute drift
+encoder_cache_verify_p99_tolerance: 0.25  # practical verification threshold for p99 absolute drift
+encoder_cache_verify_relative_l2_tolerance: 0.08  # practical verification threshold for relative L2 drift
+encoder_cache_verify_max_tolerance: 1.5  # practical guardrail for rare BF16 outliers
+encoder_cache_verify_log_interval: 1
 profile_stage_times: False  # synchronize CUDA and print encoder/decoder stage timing percentages
 profile_stage_log_interval: 50
 llm_max_length: 128

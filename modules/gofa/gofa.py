@@ -58,7 +58,12 @@ class ModelArguments:
     encoder_cache_skip_nog: bool = field(default=False, metadata={"help": "Do not cache NOG/prompt node states"})
     encoder_cache_mode: str = field(default="boundary", metadata={"help": "Encoder cache mode: boundary or memory_kv"})
     encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
-    encoder_cache_verify_tolerance: float = field(default=1e-3)
+    encoder_cache_verify_tolerance: float = field(default=1e-3, metadata={"help": "Strict max-absolute tolerance for exact verification reporting"})
+    encoder_cache_verify_mean_tolerance: float = field(default=3e-2)
+    encoder_cache_verify_p99_tolerance: float = field(default=2.5e-1)
+    encoder_cache_verify_relative_l2_tolerance: float = field(default=8e-2)
+    encoder_cache_verify_max_tolerance: float = field(default=1.5)
+    encoder_cache_verify_log_interval: int = field(default=1)
     profile_stage_times: bool = field(default=False, metadata={"help": "Synchronize and profile encoder/decoder stages"})
     profile_stage_log_interval: int = field(default=50, metadata={"help": "Log stage timing every N decoder calls"})
 
@@ -113,6 +118,20 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_cache_mode = model_args.encoder_cache_mode
         self.encoder_cache_verify = bool(model_args.encoder_cache_verify)
         self.encoder_cache_verify_tolerance = model_args.encoder_cache_verify_tolerance
+        self.encoder_cache_verify_mean_tolerance = model_args.encoder_cache_verify_mean_tolerance
+        self.encoder_cache_verify_p99_tolerance = model_args.encoder_cache_verify_p99_tolerance
+        self.encoder_cache_verify_relative_l2_tolerance = model_args.encoder_cache_verify_relative_l2_tolerance
+        self.encoder_cache_verify_max_tolerance = model_args.encoder_cache_verify_max_tolerance
+        self.encoder_cache_verify_log_interval = model_args.encoder_cache_verify_log_interval
+        self.encoder_cache_verify_calls = 0
+        self.encoder_cache_verify_exact_failures = 0
+        self.encoder_cache_verify_practical_failures = 0
+        self.encoder_cache_verify_running = {
+            "mean_abs_sum": 0.0,
+            "p99_abs_sum": 0.0,
+            "relative_l2_sum": 0.0,
+            "max_abs_worst": 0.0,
+        }
         self.encoder_cache_calls = 0
         self.encoder_cache_hits = 0
         self.encoder_cache_misses = 0
@@ -165,7 +184,12 @@ class GOFAMistral(torch.nn.Module):
                     if self.encoder_cache_verify:
                         print(
                             "GOFA encoder memory/text-KV cache verification enabled: "
-                            f"tolerance={self.encoder_cache_verify_tolerance}"
+                            f"strict_max_tol={self.encoder_cache_verify_tolerance}, "
+                            f"mean_tol={self.encoder_cache_verify_mean_tolerance}, "
+                            f"p99_tol={self.encoder_cache_verify_p99_tolerance}, "
+                            f"rel_l2_tol={self.encoder_cache_verify_relative_l2_tolerance}, "
+                            f"max_tol={self.encoder_cache_verify_max_tolerance}, "
+                            f"log_interval={self.encoder_cache_verify_log_interval}"
                         )
         if self.profile_stage_times:
             print(
@@ -752,18 +776,78 @@ class GOFAMistral(torch.nn.Module):
                     ).hidden_states[-1]
             finally:
                 base_model.profile_stage_times = previous_profile_state
-            diff = (
+            diff_abs = (
                 final_hidden_states[mapped_mem_mask].float()
                 - reference_hidden_states[mapped_mem_mask].float()
             ).abs()
-            max_abs = diff.max().item() if diff.numel() else 0.0
-            mean_abs = diff.mean().item() if diff.numel() else 0.0
-            passed = max_abs <= self.encoder_cache_verify_tolerance
-            print(
-                "GOFA memory/text-KV cache verification: "
-                f"call={self.encoder_cache_calls}, max_abs={max_abs:.6g}, "
-                f"mean_abs={mean_abs:.6g}, passed={passed}"
+            reference = reference_hidden_states[mapped_mem_mask].float()
+            if diff_abs.numel():
+                flat_diff = diff_abs.flatten()
+                quantiles = torch.quantile(
+                    flat_diff,
+                    torch.tensor([0.95, 0.99], device=flat_diff.device, dtype=flat_diff.dtype),
+                )
+                max_abs = flat_diff.max().item()
+                mean_abs = flat_diff.mean().item()
+                p95_abs = quantiles[0].item()
+                p99_abs = quantiles[1].item()
+                relative_l2 = (
+                    torch.linalg.vector_norm(flat_diff) /
+                    torch.clamp(torch.linalg.vector_norm(reference), min=1e-12)
+                ).item()
+                above_strict_ratio = (
+                    flat_diff > self.encoder_cache_verify_tolerance
+                ).float().mean().item()
+            else:
+                max_abs = 0.0
+                mean_abs = 0.0
+                p95_abs = 0.0
+                p99_abs = 0.0
+                relative_l2 = 0.0
+                above_strict_ratio = 0.0
+
+            exact_passed = max_abs <= self.encoder_cache_verify_tolerance
+            practical_passed = (
+                mean_abs <= self.encoder_cache_verify_mean_tolerance and
+                p99_abs <= self.encoder_cache_verify_p99_tolerance and
+                relative_l2 <= self.encoder_cache_verify_relative_l2_tolerance and
+                max_abs <= self.encoder_cache_verify_max_tolerance
             )
+            self.encoder_cache_verify_calls += 1
+            if not exact_passed:
+                self.encoder_cache_verify_exact_failures += 1
+            if not practical_passed:
+                self.encoder_cache_verify_practical_failures += 1
+            self.encoder_cache_verify_running["mean_abs_sum"] += mean_abs
+            self.encoder_cache_verify_running["p99_abs_sum"] += p99_abs
+            self.encoder_cache_verify_running["relative_l2_sum"] += relative_l2
+            self.encoder_cache_verify_running["max_abs_worst"] = max(
+                self.encoder_cache_verify_running["max_abs_worst"], max_abs
+            )
+
+            verify_interval = max(int(self.encoder_cache_verify_log_interval), 1)
+            should_log_verify = (
+                self.encoder_cache_verify_calls <= 3 or
+                self.encoder_cache_verify_calls % verify_interval == 0 or
+                not practical_passed
+            )
+            if should_log_verify:
+                calls = self.encoder_cache_verify_calls
+                practical_pass_rate = 1.0 - self.encoder_cache_verify_practical_failures / calls
+                print(
+                    "GOFA memory/text-KV cache verification: "
+                    f"call={self.encoder_cache_calls}, "
+                    f"exact_passed={exact_passed}, practical_passed={practical_passed}, "
+                    f"max_abs={max_abs:.6g}, mean_abs={mean_abs:.6g}, "
+                    f"p95_abs={p95_abs:.6g}, p99_abs={p99_abs:.6g}, "
+                    f"relative_l2={relative_l2:.6g}, "
+                    f"above_strict_ratio={above_strict_ratio:.4%}, "
+                    f"practical_pass_rate={practical_pass_rate:.2%}, "
+                    f"running_mean_abs={self.encoder_cache_verify_running['mean_abs_sum'] / calls:.6g}, "
+                    f"running_p99_abs={self.encoder_cache_verify_running['p99_abs_sum'] / calls:.6g}, "
+                    f"running_relative_l2={self.encoder_cache_verify_running['relative_l2_sum'] / calls:.6g}, "
+                    f"worst_max_abs={self.encoder_cache_verify_running['max_abs_worst']:.6g}"
+                )
 
         current_timing["total_s"] = time.perf_counter() - total_start
         for key, value in current_timing.items():
