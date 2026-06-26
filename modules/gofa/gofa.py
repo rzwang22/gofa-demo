@@ -4,6 +4,7 @@ from typing import Optional
 import hashlib
 import json
 import os
+import time
 import numpy as np
 import torch
 from dataclasses import dataclass, field
@@ -101,6 +102,16 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_cache_calls = 0
         self.encoder_cache_hits = 0
         self.encoder_cache_misses = 0
+        self.encoder_cache_timing = {
+            "load_s": 0.0,
+            "miss_compute_s": 0.0,
+            "save_s": 0.0,
+            "assemble_s": 0.0,
+            "suffix_compute_s": 0.0,
+            "total_s": 0.0,
+        }
+        self.encoder_full_calls = 0
+        self.encoder_full_time_s = 0.0
         self.encoder_cache_namespace = self._build_encoder_cache_namespace(dir, model_args, training_args, gofa_args)
         self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
         self.model.left_tokenizer.pad_token = self.model.left_tokenizer.bos_token
@@ -262,6 +273,31 @@ class GOFAMistral(torch.nn.Module):
         torch.save(payload, tmp_path)
         os.replace(tmp_path, cache_path)
 
+    def _sync_encoder_cache_timer(self, device):
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def _encoder_cache_log_timing(self, current):
+        total_items = self.encoder_cache_hits + self.encoder_cache_misses
+        hit_rate = self.encoder_cache_hits / total_items if total_items else 0.0
+        timing = self.encoder_cache_timing
+        print(
+            "GOFA encoder cache timing: "
+            f"call_total={self.encoder_cache_calls}, hit_rate={hit_rate:.2%}, "
+            f"current_total={current['total_s']:.4f}s, "
+            f"current_load={current['load_s']:.4f}s, "
+            f"current_miss_compute={current['miss_compute_s']:.4f}s, "
+            f"current_save={current['save_s']:.4f}s, "
+            f"current_assemble={current['assemble_s']:.4f}s, "
+            f"current_suffix={current['suffix_compute_s']:.4f}s, "
+            f"cum_total={timing['total_s']:.4f}s, "
+            f"cum_load={timing['load_s']:.4f}s, "
+            f"cum_miss_compute={timing['miss_compute_s']:.4f}s, "
+            f"cum_save={timing['save_s']:.4f}s, "
+            f"cum_assemble={timing['assemble_s']:.4f}s, "
+            f"cum_suffix={timing['suffix_compute_s']:.4f}s"
+        )
+
     def _encode_with_encoder_cache(self, token_ids, padded_token_ids, mem_mask, graph=None, partial_grad=None):
         if self.training:
             return None
@@ -269,9 +305,22 @@ class GOFAMistral(torch.nn.Module):
         if not hasattr(base_model, "forward_llm_prefix") or not hasattr(base_model, "forward_from_gnn_boundary"):
             return None
 
+        device = padded_token_ids.device
+        self._sync_encoder_cache_timer(device)
+        total_start = time.perf_counter()
+        current_timing = {
+            "load_s": 0.0,
+            "miss_compute_s": 0.0,
+            "save_s": 0.0,
+            "assemble_s": 0.0,
+            "suffix_compute_s": 0.0,
+            "total_s": 0.0,
+        }
+
         cached_states = [None] * len(token_ids)
         missing = []
         missing_keys = []
+        load_start = time.perf_counter()
         for i, ids in enumerate(token_ids):
             cached_state, cache_key = self._load_encoder_cache_item(ids)
             if cached_state is None:
@@ -279,8 +328,11 @@ class GOFAMistral(torch.nn.Module):
                 missing_keys.append(cache_key)
             else:
                 cached_states[i] = cached_state
+        current_timing["load_s"] = time.perf_counter() - load_start
 
         if missing:
+            self._sync_encoder_cache_timer(device)
+            miss_compute_start = time.perf_counter()
             missing_token_ids = [token_ids[i] for i in missing]
             missing_padded = self.model.tokenizer.pad(
                 {"input_ids": missing_token_ids}, padding=True, return_tensors="pt"
@@ -291,12 +343,19 @@ class GOFAMistral(torch.nn.Module):
                 partial_grad=partial_grad,
                 return_dict=True,
             ).last_hidden_state
+            self._sync_encoder_cache_timer(device)
+            current_timing["miss_compute_s"] = time.perf_counter() - miss_compute_start
+
+            save_start = time.perf_counter()
             for batch_idx, original_idx in enumerate(missing):
                 seq_len = len(token_ids[original_idx])
                 cached_state = prefix_output[batch_idx, :seq_len].detach().cpu()
                 cached_states[original_idx] = cached_state
                 self._save_encoder_cache_item(missing_keys[batch_idx], token_ids[original_idx], cached_state)
+            current_timing["save_s"] = time.perf_counter() - save_start
 
+        self._sync_encoder_cache_timer(device)
+        assemble_start = time.perf_counter()
         hidden_dtype = cached_states[0].dtype
         boundary_hidden_states = torch.zeros(
             (len(cached_states), padded_token_ids.size(1), cached_states[0].size(-1)),
@@ -306,19 +365,16 @@ class GOFAMistral(torch.nn.Module):
         for i, cached_state in enumerate(cached_states):
             seq_len = cached_state.size(0)
             boundary_hidden_states[i, :seq_len] = cached_state.to(padded_token_ids.device)
+        self._sync_encoder_cache_timer(device)
+        current_timing["assemble_s"] = time.perf_counter() - assemble_start
 
         self.encoder_cache_calls += 1
         self.encoder_cache_hits += len(token_ids) - len(missing)
         self.encoder_cache_misses += len(missing)
-        if self.encoder_cache_calls <= 3 or self.encoder_cache_calls % 50 == 0:
-            print(
-                "GOFA encoder cache: "
-                f"call={self.encoder_cache_calls}, hits={len(token_ids) - len(missing)}, "
-                f"misses={len(missing)}, total_hits={self.encoder_cache_hits}, "
-                f"total_misses={self.encoder_cache_misses}"
-            )
 
-        return base_model.forward_from_gnn_boundary(
+        self._sync_encoder_cache_timer(device)
+        suffix_start = time.perf_counter()
+        final_hidden_states = base_model.forward_from_gnn_boundary(
             boundary_hidden_states=boundary_hidden_states,
             graph=graph,
             mem_mask=mem_mask,
@@ -326,6 +382,23 @@ class GOFAMistral(torch.nn.Module):
             map_node=True,
             return_dict=True,
         ).last_hidden_state
+        self._sync_encoder_cache_timer(device)
+        current_timing["suffix_compute_s"] = time.perf_counter() - suffix_start
+        current_timing["total_s"] = time.perf_counter() - total_start
+
+        for key, value in current_timing.items():
+            self.encoder_cache_timing[key] += value
+
+        if self.encoder_cache_calls <= 3 or self.encoder_cache_calls % 50 == 0:
+            print(
+                "GOFA encoder cache: "
+                f"call={self.encoder_cache_calls}, hits={len(token_ids) - len(missing)}, "
+                f"misses={len(missing)}, total_hits={self.encoder_cache_hits}, "
+                f"total_misses={self.encoder_cache_misses}"
+            )
+            self._encoder_cache_log_timing(current_timing)
+
+        return final_hidden_states
 
     def forward(self, g):
         """
@@ -396,10 +469,23 @@ class GOFAMistral(torch.nn.Module):
                 text_output, padded_text_output, mem_mask, graph=graph, partial_grad=partial_grad
             )
         if compress_outputs is None:
+            self._sync_encoder_cache_timer(cur_device)
+            full_start = time.perf_counter()
             autoencoder_input_embedding = self.model.tokens_to_embeddings(padded_text_output)
             compress_outputs = self.model.icae(inputs_embeds=autoencoder_input_embedding, output_hidden_states=True,
                                                graph=graph, mem_mask=mem_mask, partial_grad=partial_grad, map_node=True)
             compress_outputs = compress_outputs.hidden_states[-1]
+            self._sync_encoder_cache_timer(cur_device)
+            full_elapsed = time.perf_counter() - full_start
+            self.encoder_full_calls += 1
+            self.encoder_full_time_s += full_elapsed
+            if self.encoder_full_calls <= 3 or self.encoder_full_calls % 50 == 0:
+                print(
+                    "GOFA encoder full path timing: "
+                    f"call={self.encoder_full_calls}, "
+                    f"current={full_elapsed:.4f}s, "
+                    f"cum_total={self.encoder_full_time_s:.4f}s"
+                )
         self.model.icae.disable_adapter_layers()
 
         if graph is not None:
