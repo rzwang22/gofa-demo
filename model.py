@@ -51,11 +51,19 @@ def identity(x):
 
 
 class GOFA(torch.nn.Module):
-    def __init__(self, transformer_args, mode="autoencoder", base_llm="mistral7b", save_dir=""):
+    def __init__(
+            self,
+            transformer_args,
+            mode="autoencoder",
+            base_llm="mistral7b",
+            save_dir="",
+            print_generation_samples=0):
         super().__init__()
 
         self.mode = mode
         self.save_dir = save_dir
+        self.print_generation_samples = print_generation_samples
+        self.num_generation_samples_printed = 0
 
         if base_llm == 'mistral7b':
             self.llm_model = GOFAMistral(transformer_args)
@@ -85,10 +93,13 @@ class GOFA(torch.nn.Module):
         prompt_texts = g.question[g.question_map.cpu().numpy()].tolist()
         generated_text = self.llm_model.generate(g)
         for i, txt in enumerate(generated_text):
+            if self.print_generation_samples >= 0 and self.num_generation_samples_printed >= self.print_generation_samples:
+                break
             print_fixed_length("question: " + prompt_texts[i])
             print("-"*120)
             print_text_side_by_side("target: "+answer_texts[i], "gen: "+generated_text[i])
             print("="*120)
+            self.num_generation_samples_printed += 1
         GNNLMOutput = namedtuple("GNNLMOutput", ["logits", "answer_id", "pred_text", "answer"])
         return GNNLMOutput(logits=torch.randn([1, 32132]), pred_text=generated_text, answer_id=torch.tensor([1]),
                            answer=answer_texts)
@@ -116,4 +127,3 @@ class GOFA(torch.nn.Module):
             sample_text = tokenizer.batch_decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
             decoded_texts.extend(sample_text)
         return decoded_texts
-

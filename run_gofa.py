@@ -182,8 +182,13 @@ def main(params):
     #                    Setup model and optimizer                   #
     ##################################################################
 
-    model = GOFA(transformer_args=[model_args, training_args, gofa_args], mode=params.mode, base_llm=params.base_llm,
-                 save_dir=params.exp_dir)
+    model = GOFA(
+        transformer_args=[model_args, training_args, gofa_args],
+        mode=params.mode,
+        base_llm=params.base_llm,
+        save_dir=params.exp_dir,
+        print_generation_samples=getattr(params, "print_generation_samples", 0),
+    )
     train_params = list(model.llm_model.model.icae.get_base_model().model.g_layers.parameters())
     if model_args.dec_lora:
         for name, param in model.llm_model.model.icae.named_parameters():

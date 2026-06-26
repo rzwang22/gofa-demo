@@ -31,6 +31,7 @@ encoder_cache_tag: ""
 llm_max_length: 128
 val_interval:      # validate per {val_interval} training steps.
 mode: "decode"
+print_generation_samples: 0  # set -1 to print every generated sample, or N to print the first N samples
 max_nodes_per_hop: 5
 grad_acc_step: 8
 save_model:
