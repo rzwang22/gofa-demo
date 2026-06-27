@@ -69,7 +69,7 @@ class ModelArguments:
     profile_stage_log_interval: int = field(default=50, metadata={"help": "Log stage timing every N decoder calls"})
     profile_memory_kv_transformer_breakdown: bool = field(
         default=False,
-        metadata={"help": "Break down memory_kv suffix transformer time into KV transfer, attention, and MLP parts"},
+        metadata={"help": "Break down cached suffix transformer time into attention and MLP parts"},
     )
 
 
@@ -208,7 +208,7 @@ class GOFAMistral(torch.nn.Module):
             )
             if self.profile_memory_kv_transformer_breakdown:
                 print(
-                    "GOFA memory/text-KV transformer breakdown enabled: "
+                    "GOFA suffix transformer breakdown enabled: "
                     "diagnostic mode with extra synchronization overhead"
                 )
 
@@ -458,6 +458,34 @@ class GOFAMistral(torch.nn.Module):
                 f"  encoder_transformer_layer_{base_model.gnn_start_layer + i}: "
                 f"{value:.4f}s ({self._stage_timing_percent(value, model_total):.2f}%)"
             )
+        boundary_breakdown = [
+            ("boundary_input_norm_s", "input_norm"),
+            ("boundary_qkv_proj_s", "qkv_proj"),
+            ("boundary_rope_repeat_s", "rope_repeat"),
+            ("boundary_attn_scores_s", "attn_score_softmax_value"),
+            ("boundary_o_proj_s", "o_proj"),
+            ("boundary_post_attn_norm_s", "post_attn_norm"),
+            ("boundary_mlp_s", "mlp"),
+        ]
+        if any(sum(profile.get(key, [])) > 0 for key, _ in boundary_breakdown):
+            aggregate_parts = []
+            for key, label in boundary_breakdown:
+                value = sum(profile.get(key, []))
+                if value > 0:
+                    aggregate_parts.append(f"{label}={value:.4f}s")
+            print("  boundary_transformer_breakdown_total: " + ", ".join(aggregate_parts))
+            if self.profile_memory_kv_transformer_breakdown:
+                for layer_idx in range(len(suffix_layers)):
+                    layer_parts = []
+                    for key, label in boundary_breakdown:
+                        values = profile.get(key, [])
+                        value = values[layer_idx] if layer_idx < len(values) else 0.0
+                        if value > 0:
+                            layer_parts.append(f"{label}={value:.4f}s")
+                    print(
+                        f"  boundary_transformer_layer_{base_model.gnn_start_layer + layer_idx}_breakdown: "
+                        + ", ".join(layer_parts)
+                    )
         memory_kv_breakdown = [
             ("memory_kv_text_kv_to_device_s", "kv_to_device"),
             ("memory_kv_input_norm_s", "input_norm"),

@@ -40,7 +40,7 @@ encoder_cache_verify_log_interval: 1
 encoder_cache_verify_quantile_sample_size: 1000000  # deterministic sample cap for p95/p99 and above-threshold ratio
 profile_stage_times: False  # synchronize CUDA and print encoder/decoder stage timing percentages
 profile_stage_log_interval: 50
-profile_memory_kv_transformer_breakdown: False  # diagnostic-only detailed breakdown for memory_kv suffix transformer
+profile_memory_kv_transformer_breakdown: False  # diagnostic-only detailed breakdown for cached suffix transformer
 llm_max_length: 128
 val_interval:      # validate per {val_interval} training steps.
 mode: "decode"
