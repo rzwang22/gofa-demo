@@ -84,6 +84,8 @@ def main(params):
         model_args.profile_stage_times = params.profile_stage_times
     if hasattr(params, "profile_stage_log_interval"):
         model_args.profile_stage_log_interval = params.profile_stage_log_interval
+    if hasattr(params, "profile_memory_kv_transformer_breakdown"):
+        model_args.profile_memory_kv_transformer_breakdown = params.profile_memory_kv_transformer_breakdown
     training_args.model_max_length = params.llm_max_length
     if params.training_precision == "bf16-mixed":
         training_args.bf16 = True

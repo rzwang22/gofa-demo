@@ -67,6 +67,10 @@ class ModelArguments:
     encoder_cache_verify_quantile_sample_size: int = field(default=1_000_000)
     profile_stage_times: bool = field(default=False, metadata={"help": "Synchronize and profile encoder/decoder stages"})
     profile_stage_log_interval: int = field(default=50, metadata={"help": "Log stage timing every N decoder calls"})
+    profile_memory_kv_transformer_breakdown: bool = field(
+        default=False,
+        metadata={"help": "Break down memory_kv suffix transformer time into KV transfer, attention, and MLP parts"},
+    )
 
 
 @dataclass
@@ -111,6 +115,7 @@ class GOFAMistral(torch.nn.Module):
         self.model = model
         self.profile_stage_times = bool(model_args.profile_stage_times)
         self.profile_stage_log_interval = model_args.profile_stage_log_interval
+        self.profile_memory_kv_transformer_breakdown = bool(model_args.profile_memory_kv_transformer_breakdown)
         self.stage_profile_reports = 0
         self.decoder_stage_calls = 0
         self.decoder_stage_time_s = 0.0
@@ -152,6 +157,7 @@ class GOFAMistral(torch.nn.Module):
         base_model = self.model.icae.get_base_model().model
         if hasattr(base_model, "profile_stage_times"):
             base_model.profile_stage_times = self.profile_stage_times
+            base_model.profile_memory_kv_transformer_breakdown = self.profile_memory_kv_transformer_breakdown
             base_model.reset_stage_profile()
         self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
         self.model.left_tokenizer.pad_token = self.model.left_tokenizer.bos_token
@@ -200,6 +206,11 @@ class GOFAMistral(torch.nn.Module):
                 f"log_interval={self.profile_stage_log_interval}, "
                 "timings include cuda synchronization overhead"
             )
+            if self.profile_memory_kv_transformer_breakdown:
+                print(
+                    "GOFA memory/text-KV transformer breakdown enabled: "
+                    "diagnostic mode with extra synchronization overhead"
+                )
 
     def get_tokenizer(self):
         return self.model.tokenizer
@@ -447,6 +458,35 @@ class GOFAMistral(torch.nn.Module):
                 f"  encoder_transformer_layer_{base_model.gnn_start_layer + i}: "
                 f"{value:.4f}s ({self._stage_timing_percent(value, model_total):.2f}%)"
             )
+        memory_kv_breakdown = [
+            ("memory_kv_text_kv_to_device_s", "kv_to_device"),
+            ("memory_kv_input_norm_s", "input_norm"),
+            ("memory_kv_qkv_proj_s", "qkv_proj"),
+            ("memory_kv_rope_cache_s", "rope_cache_repeat"),
+            ("memory_kv_attn_scores_s", "attn_score_softmax_value"),
+            ("memory_kv_o_proj_s", "o_proj"),
+            ("memory_kv_post_attn_norm_s", "post_attn_norm"),
+            ("memory_kv_mlp_s", "mlp"),
+        ]
+        if any(sum(profile.get(key, [])) > 0 for key, _ in memory_kv_breakdown):
+            aggregate_parts = []
+            for key, label in memory_kv_breakdown:
+                value = sum(profile.get(key, []))
+                if value > 0:
+                    aggregate_parts.append(f"{label}={value:.4f}s")
+            print("  memory_kv_transformer_breakdown_total: " + ", ".join(aggregate_parts))
+            if self.profile_memory_kv_transformer_breakdown:
+                for layer_idx in range(len(suffix_layers)):
+                    layer_parts = []
+                    for key, label in memory_kv_breakdown:
+                        values = profile.get(key, [])
+                        value = values[layer_idx] if layer_idx < len(values) else 0.0
+                        if value > 0:
+                            layer_parts.append(f"{label}={value:.4f}s")
+                    print(
+                        f"  memory_kv_transformer_layer_{base_model.gnn_start_layer + layer_idx}_breakdown: "
+                        + ", ".join(layer_parts)
+                    )
         print(
             "  encoder_norm: "
             f"{norm:.4f}s ({self._stage_timing_percent(norm, model_total):.2f}%)"

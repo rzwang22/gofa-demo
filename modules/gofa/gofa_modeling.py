@@ -1,6 +1,7 @@
 from collections import OrderedDict
 
 from typing import List, Optional, Tuple, Union
+import math
 import time
 
 import torch
@@ -9,7 +10,13 @@ from torch import nn
 
 from .gnn import GOFADecoderLayer, GOFAGatedDecoderLayer, GOFAGNNConv
 from transformers import MistralConfig, GenerationMixin
-from transformers.models.mistral.modeling_mistral import MistralPreTrainedModel, MistralRMSNorm, MistralModel
+from transformers.models.mistral.modeling_mistral import (
+    MistralPreTrainedModel,
+    MistralRMSNorm,
+    MistralModel,
+    apply_rotary_pos_emb,
+    repeat_kv,
+)
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils import (
     LossKwargs, logging, )
@@ -74,6 +81,7 @@ class GOFAMistralModel(MistralModel):
         super().__init__(config)
         self.gofa_config = gofa_config
         self.profile_stage_times = False
+        self.profile_memory_kv_transformer_breakdown = False
         self.reset_stage_profile()
 
         # self.g_layers = nn.ModuleList([GOFAGatedDecoderLayer(gofa_config, layer_idx=i) for i in range(gofa_config.num_layers)])
@@ -112,6 +120,14 @@ class GOFAMistralModel(MistralModel):
             "encoder_gnn_layer_s": [0.0 for _ in range(num_gnn_layers)],
             "encoder_suffix_transformer_layer_s": [0.0 for _ in range(num_gnn_layers)],
             "encoder_norm_s": 0.0,
+            "memory_kv_text_kv_to_device_s": [0.0 for _ in range(num_gnn_layers)],
+            "memory_kv_input_norm_s": [0.0 for _ in range(num_gnn_layers)],
+            "memory_kv_qkv_proj_s": [0.0 for _ in range(num_gnn_layers)],
+            "memory_kv_rope_cache_s": [0.0 for _ in range(num_gnn_layers)],
+            "memory_kv_attn_scores_s": [0.0 for _ in range(num_gnn_layers)],
+            "memory_kv_o_proj_s": [0.0 for _ in range(num_gnn_layers)],
+            "memory_kv_post_attn_norm_s": [0.0 for _ in range(num_gnn_layers)],
+            "memory_kv_mlp_s": [0.0 for _ in range(num_gnn_layers)],
         }
 
     def _stage_profile_enabled(self):
@@ -149,6 +165,109 @@ class GOFAMistralModel(MistralModel):
         if blocked.any():
             mask = mask.masked_fill(blocked, torch.finfo(dtype).min)
         return mask.unsqueeze(0).unsqueeze(0)
+
+    def _memory_kv_attention_breakdown(
+        self,
+        attention,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        text_kv,
+        output_attentions,
+        cache_position,
+        position_embeddings,
+        g_layer_idx,
+    ):
+        bsz, q_len, _ = hidden_states.size()
+        head_dim = getattr(attention, "head_dim", attention.hidden_size // attention.num_heads)
+
+        qkv_start = self._stage_profile_start(hidden_states)
+        query_states = attention.q_proj(hidden_states)
+        key_states = attention.k_proj(hidden_states)
+        value_states = attention.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, attention.num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, attention.num_key_value_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, attention.num_key_value_heads, head_dim).transpose(1, 2)
+        self._stage_profile_add("memory_kv_qkv_proj_s", qkv_start, query_states, g_layer_idx)
+
+        rope_start = self._stage_profile_start(query_states)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = text_kv.update(
+            key_states, value_states, getattr(attention, "layer_idx", g_layer_idx), cache_kwargs
+        )
+        key_states = repeat_kv(key_states, attention.num_key_value_groups)
+        value_states = repeat_kv(value_states, attention.num_key_value_groups)
+        self._stage_profile_add("memory_kv_rope_cache_s", rope_start, key_states, g_layer_idx)
+
+        attn_start = self._stage_profile_start(query_states)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+        self._stage_profile_add("memory_kv_attn_scores_s", attn_start, attn_output, g_layer_idx)
+
+        o_proj_start = self._stage_profile_start(attn_output)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = attention.o_proj(attn_output)
+        self._stage_profile_add("memory_kv_o_proj_s", o_proj_start, attn_output, g_layer_idx)
+
+        if not output_attentions:
+            attn_weights = None
+        return attn_output, attn_weights, text_kv
+
+    def _memory_kv_decoder_layer_breakdown(
+        self,
+        decoder_layer,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        text_kv,
+        output_attentions,
+        cache_position,
+        position_embeddings,
+        g_layer_idx,
+    ):
+        residual = hidden_states
+
+        norm_start = self._stage_profile_start(hidden_states)
+        hidden_states = decoder_layer.input_layernorm(hidden_states)
+        self._stage_profile_add("memory_kv_input_norm_s", norm_start, hidden_states, g_layer_idx)
+
+        attn_output, self_attn_weights, present_key_value = self._memory_kv_attention_breakdown(
+            decoder_layer.self_attn,
+            hidden_states,
+            attention_mask,
+            position_ids,
+            text_kv,
+            output_attentions,
+            cache_position,
+            position_embeddings,
+            g_layer_idx,
+        )
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        post_norm_start = self._stage_profile_start(hidden_states)
+        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+        self._stage_profile_add("memory_kv_post_attn_norm_s", post_norm_start, hidden_states, g_layer_idx)
+
+        mlp_start = self._stage_profile_start(hidden_states)
+        hidden_states = decoder_layer.mlp(hidden_states)
+        self._stage_profile_add("memory_kv_mlp_s", mlp_start, hidden_states, g_layer_idx)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        outputs += (present_key_value,)
+        return outputs
 
     def build_memory_text_kv_cache_item(
         self,
@@ -292,23 +411,40 @@ class GOFAMistralModel(MistralModel):
                     mem_hidden_states.device,
                 )
                 kv = item["text_kv"][g_layer_idx]
+                kv_to_device_start = self._stage_profile_start(mem_hidden_states)
                 text_cache = _SingleLayerKVCache(
                     kv["key"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
                     kv["value"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
                 )
-                position_embeddings = self.rotary_emb(mem_hidden_states, position_ids)
-                layer_outputs = self.llm_forward(
-                    decoder_layer,
-                    mem_hidden_states,
-                    causal_mask,
-                    position_ids,
-                    text_cache,
-                    output_attentions,
-                    True,
-                    cache_position,
-                    position_embeddings,
-                    flash_attn_kwargs,
+                self._stage_profile_add(
+                    "memory_kv_text_kv_to_device_s", kv_to_device_start, text_cache.key_states, g_layer_idx
                 )
+                position_embeddings = self.rotary_emb(mem_hidden_states, position_ids)
+                if self._stage_profile_enabled() and getattr(self, "profile_memory_kv_transformer_breakdown", False):
+                    layer_outputs = self._memory_kv_decoder_layer_breakdown(
+                        decoder_layer,
+                        mem_hidden_states,
+                        causal_mask,
+                        position_ids,
+                        text_cache,
+                        output_attentions,
+                        cache_position,
+                        position_embeddings,
+                        g_layer_idx,
+                    )
+                else:
+                    layer_outputs = self.llm_forward(
+                        decoder_layer,
+                        mem_hidden_states,
+                        causal_mask,
+                        position_ids,
+                        text_cache,
+                        output_attentions,
+                        True,
+                        cache_position,
+                        position_embeddings,
+                        flash_attn_kwargs,
+                    )
                 next_memory_states.append(layer_outputs[0])
             memory_states = torch.cat(next_memory_states, dim=0)
             self._stage_profile_add("encoder_suffix_transformer_layer_s", llm_start, memory_states, g_layer_idx)
