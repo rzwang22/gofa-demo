@@ -179,7 +179,11 @@ class GOFAMistralModel(MistralModel):
         g_layer_idx,
     ):
         bsz, q_len, _ = hidden_states.size()
-        head_dim = getattr(attention, "head_dim", attention.hidden_size // attention.num_heads)
+        head_dim = getattr(attention, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(attention, "hidden_size", self.config.hidden_size)
+            num_heads = getattr(attention, "num_heads", self.config.num_attention_heads)
+            head_dim = hidden_size // num_heads
 
         qkv_start = self._stage_profile_start(hidden_states)
         query_states = attention.q_proj(hidden_states)
