@@ -179,20 +179,22 @@ class GOFAMistralModel(MistralModel):
         g_layer_idx,
     ):
         bsz, q_len, _ = hidden_states.size()
+        attention_config = attention.config
+        num_heads = getattr(attention, "num_heads", attention_config.num_attention_heads)
+        num_key_value_heads = getattr(attention, "num_key_value_heads", attention_config.num_key_value_heads)
+        num_key_value_groups = getattr(attention, "num_key_value_groups", num_heads // num_key_value_heads)
         head_dim = getattr(attention, "head_dim", None)
         if head_dim is None:
-            hidden_size = getattr(attention, "hidden_size", self.config.hidden_size)
-            num_heads = getattr(attention, "num_heads", self.config.num_attention_heads)
-            head_dim = hidden_size // num_heads
+            head_dim = attention_config.hidden_size // num_heads
 
         qkv_start = self._stage_profile_start(hidden_states)
         query_states = attention.q_proj(hidden_states)
         key_states = attention.k_proj(hidden_states)
         value_states = attention.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, attention.num_heads, head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, attention.num_key_value_heads, head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, attention.num_key_value_heads, head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         self._stage_profile_add("memory_kv_qkv_proj_s", qkv_start, query_states, g_layer_idx)
 
         rope_start = self._stage_profile_start(query_states)
@@ -202,8 +204,8 @@ class GOFAMistralModel(MistralModel):
         key_states, value_states = text_kv.update(
             key_states, value_states, getattr(attention, "layer_idx", g_layer_idx), cache_kwargs
         )
-        key_states = repeat_kv(key_states, attention.num_key_value_groups)
-        value_states = repeat_kv(value_states, attention.num_key_value_groups)
+        key_states = repeat_kv(key_states, num_key_value_groups)
+        value_states = repeat_kv(value_states, num_key_value_groups)
         self._stage_profile_add("memory_kv_rope_cache_s", rope_start, key_states, g_layer_idx)
 
         attn_start = self._stage_profile_start(query_states)
