@@ -41,6 +41,15 @@ encoder_cache_verify_quantile_sample_size: 1000000  # deterministic sample cap f
 profile_stage_times: False  # synchronize CUDA and print encoder/decoder stage timing percentages
 profile_stage_log_interval: 50
 profile_memory_kv_transformer_breakdown: False  # diagnostic-only detailed breakdown for cached suffix transformer
+scheme_b_quant:
+  enabled: False
+  base_bits: 8
+  delta_bits: 4
+  static_high_ratio: 0.1
+  static_mid_ratio: 0.4
+  target_aware_delta: True
+  cache_dir: ""  # optional quantized cache root; defaults to full scheme-B cache root plus _scheme_b_quant_b{base}_d{delta}
+  fake_quant: True  # set False, or base_bits=16, for identity/debug cache conversion
 llm_max_length: 128
 val_interval:      # validate per {val_interval} training steps.
 mode: "decode"

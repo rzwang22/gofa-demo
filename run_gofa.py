@@ -86,6 +86,20 @@ def main(params):
         model_args.profile_stage_log_interval = params.profile_stage_log_interval
     if hasattr(params, "profile_memory_kv_transformer_breakdown"):
         model_args.profile_memory_kv_transformer_breakdown = params.profile_memory_kv_transformer_breakdown
+    if hasattr(params, "scheme_b_quant"):
+        model_args.scheme_b_quant = params.scheme_b_quant
+    for field_name in (
+        "scheme_b_quant_enabled",
+        "scheme_b_quant_base_bits",
+        "scheme_b_quant_delta_bits",
+        "scheme_b_quant_static_high_ratio",
+        "scheme_b_quant_static_mid_ratio",
+        "scheme_b_quant_target_aware_delta",
+        "scheme_b_quant_cache_dir",
+        "scheme_b_quant_fake_quant",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     training_args.model_max_length = params.llm_max_length
     if params.training_precision == "bf16-mixed":
         training_args.bf16 = True

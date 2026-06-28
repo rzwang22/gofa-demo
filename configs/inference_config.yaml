@@ -6,6 +6,17 @@ checkpoint_dir: /home/rzwang/data/GOFA/cache_data/model
 load_dir: /home/rzwang/data/GOFA/cache_data/model/nb_instruct.pth
 load_model: True
 batch_size: 1
+use_encoder_cache: False
+encoder_cache_mode: "memory_kv"
+scheme_b_quant:
+  enabled: False
+  base_bits: 8
+  delta_bits: 4
+  static_high_ratio: 0.1
+  static_mid_ratio: 0.4
+  target_aware_delta: True
+  cache_dir: ""
+  fake_quant: True
 
 num_layers: 6
 gnn_type: "index"
