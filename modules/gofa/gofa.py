@@ -86,6 +86,14 @@ class ModelArguments:
     scheme_b_quant_target_aware_delta: Optional[bool] = field(default=None)
     scheme_b_quant_cache_dir: Optional[str] = field(default=None)
     scheme_b_quant_fake_quant: Optional[bool] = field(default=None)
+    scheme_b_ablation: Optional[Dict[str, Any]] = field(default_factory=dict)
+    scheme_b_ablation_enabled: Optional[bool] = field(default=None)
+    scheme_b_ablation_mode: Optional[str] = field(default=None)
+    scheme_b_ablation_zero_memory_state: Optional[bool] = field(default=None)
+    scheme_b_ablation_zero_text_kv: Optional[bool] = field(default=None)
+    scheme_b_ablation_zero_edge_cache: Optional[bool] = field(default=None)
+    scheme_b_ablation_keep_target_edges: Optional[bool] = field(default=None)
+    scheme_b_ablation_log_interval: Optional[int] = field(default=None)
 
 
 @dataclass
@@ -139,6 +147,9 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_cache_mode = model_args.encoder_cache_mode
         self.scheme_b_quant = self._normalize_scheme_b_quant_config(model_args)
         self.scheme_b_quant_enabled = bool(self.scheme_b_quant["enabled"])
+        self.scheme_b_ablation = self._normalize_scheme_b_ablation_config(model_args)
+        self.scheme_b_ablation_enabled = bool(self.scheme_b_ablation["enabled"])
+        self.scheme_b_ablation_calls = 0
         self.encoder_cache_verify = bool(model_args.encoder_cache_verify)
         self.encoder_cache_verify_tolerance = model_args.encoder_cache_verify_tolerance
         self.encoder_cache_verify_mean_tolerance = model_args.encoder_cache_verify_mean_tolerance
@@ -196,6 +207,9 @@ class GOFAMistral(torch.nn.Module):
             if self.scheme_b_quant_enabled and self.encoder_cache_mode != "memory_kv":
                 print("GOFA scheme-B quant cache is only valid for encoder_cache_mode=memory_kv; disabling quant cache.")
                 self.scheme_b_quant_enabled = False
+            if self.scheme_b_ablation_enabled and self.encoder_cache_mode != "memory_kv":
+                print("GOFA scheme-B ablation is only valid for encoder_cache_mode=memory_kv; disabling ablation.")
+                self.scheme_b_ablation_enabled = False
             if gofa_args.fuse_type != "interleave":
                 print("GOFA encoder cache is only implemented for fuse_type=interleave; disabling cache.")
                 self.encoder_cache_enabled = False
@@ -232,6 +246,16 @@ class GOFAMistral(torch.nn.Module):
                         f"delta_bits={self.scheme_b_quant['delta_bits']}, "
                         f"target_aware_delta={self.scheme_b_quant['target_aware_delta']}, "
                         f"fake_quant={self.scheme_b_quant['fake_quant']}"
+                    )
+                if self.scheme_b_ablation_enabled:
+                    print(
+                        "GOFA scheme-B cache ablation enabled: "
+                        f"mode={self.scheme_b_ablation['mode']}, "
+                        f"zero_memory_state={self.scheme_b_ablation['zero_memory_state']}, "
+                        f"zero_text_kv={self.scheme_b_ablation['zero_text_kv']}, "
+                        f"zero_edge_cache={self.scheme_b_ablation['zero_edge_cache']}, "
+                        f"keep_target_edges={self.scheme_b_ablation['keep_target_edges']}, "
+                        f"log_interval={self.scheme_b_ablation['log_interval']}"
                     )
         if self.profile_stage_times:
             print(
@@ -344,6 +368,43 @@ class GOFAMistral(torch.nn.Module):
         cfg["target_aware_delta"] = bool(cfg["target_aware_delta"])
         cfg["cache_dir"] = str(cfg["cache_dir"] or "")
         cfg["fake_quant"] = bool(cfg["fake_quant"])
+        return cfg
+
+    def _normalize_scheme_b_ablation_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "mode": "none",
+            "zero_memory_state": True,
+            "zero_text_kv": True,
+            "zero_edge_cache": True,
+            "keep_target_edges": False,
+            "log_interval": 20,
+        }
+        nested = getattr(model_args, "scheme_b_ablation", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "scheme_b_ablation_enabled",
+            "mode": "scheme_b_ablation_mode",
+            "zero_memory_state": "scheme_b_ablation_zero_memory_state",
+            "zero_text_kv": "scheme_b_ablation_zero_text_kv",
+            "zero_edge_cache": "scheme_b_ablation_zero_edge_cache",
+            "keep_target_edges": "scheme_b_ablation_keep_target_edges",
+            "log_interval": "scheme_b_ablation_log_interval",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["mode"] = str(cfg["mode"] or "none")
+        if cfg["mode"] not in {"none", "target_only_zero_others"}:
+            raise ValueError("scheme_b_ablation.mode must be 'none' or 'target_only_zero_others'.")
+        cfg["zero_memory_state"] = bool(cfg["zero_memory_state"])
+        cfg["zero_text_kv"] = bool(cfg["zero_text_kv"])
+        cfg["zero_edge_cache"] = bool(cfg["zero_edge_cache"])
+        cfg["keep_target_edges"] = bool(cfg["keep_target_edges"])
+        cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
         return cfg
 
     def _build_encoder_cache_namespace(self, icae_path, model_args, training_args, gofa_args):
@@ -855,6 +916,145 @@ class GOFAMistral(torch.nn.Module):
             mem_mask[i, start:end] = True
         return mem_mask
 
+    def _scheme_b_ablation_active(self):
+        return (
+            self.scheme_b_ablation_enabled and
+            self.scheme_b_ablation["mode"] == "target_only_zero_others"
+        )
+
+    def _scheme_b_int_list(self, value):
+        if value is None:
+            return []
+        if isinstance(value, torch.Tensor):
+            return [int(v) for v in value.detach().cpu().reshape(-1).tolist()]
+        if isinstance(value, np.ndarray):
+            return [int(v) for v in value.reshape(-1).tolist()]
+        if isinstance(value, (list, tuple, set)):
+            result = []
+            for item in value:
+                result.extend(self._scheme_b_int_list(item))
+            return result
+        return [int(value)]
+
+    def _scheme_b_target_local_indices(self, graph):
+        if graph is None or not hasattr(graph, "target_index"):
+            return []
+        num_node_feat = int(getattr(graph, "num_node_feat", 0))
+        target_indices = []
+        for idx in self._scheme_b_int_list(graph.target_index):
+            if 0 <= idx < num_node_feat:
+                target_indices.append(idx)
+        return sorted(set(target_indices))
+
+    def _scheme_b_target_edge_item_indices(self, graph, target_local_indices, num_items):
+        if graph is None or not target_local_indices:
+            return set()
+        edge_index = getattr(graph, "edge_index", None)
+        if not isinstance(edge_index, torch.Tensor) or edge_index.numel() == 0:
+            return set()
+        num_node_feat = int(getattr(graph, "num_node_feat", 0))
+        if num_node_feat >= num_items:
+            return set()
+        target_set = set(int(idx) for idx in target_local_indices)
+        edge_index_cpu = edge_index.detach().cpu()
+        edge_map = getattr(graph, "edge_map", None)
+        edge_map_cpu = edge_map.detach().cpu() if isinstance(edge_map, torch.Tensor) else None
+        kept_edges = set()
+        for edge_pos, (src, dst) in enumerate(edge_index_cpu.t().tolist()):
+            if int(src) not in target_set and int(dst) not in target_set:
+                continue
+            if edge_map_cpu is not None and edge_pos < edge_map_cpu.numel():
+                edge_item_offset = int(edge_map_cpu[edge_pos].item())
+            else:
+                edge_item_offset = edge_pos
+            item_idx = num_node_feat + edge_item_offset
+            if num_node_feat <= item_idx < num_items:
+                kept_edges.add(item_idx)
+        return kept_edges
+
+    def _zero_scheme_b_cache_item(self, cache_item, zero_memory_state=True, zero_text_kv=True):
+        if zero_memory_state and cache_item.get("memory_state") is not None:
+            cache_item["memory_state"].zero_()
+        if zero_text_kv:
+            for layer_kv in cache_item.get("text_kv", []):
+                if layer_kv.get("key") is not None:
+                    layer_kv["key"].zero_()
+                if layer_kv.get("value") is not None:
+                    layer_kv["value"].zero_()
+
+    def _apply_scheme_b_ablation(self, cache_items, graph, skip_cache_indices=None):
+        if not self._scheme_b_ablation_active():
+            return
+        self.scheme_b_ablation_calls += 1
+        cfg = self.scheme_b_ablation
+        num_items = len(cache_items)
+        num_node_feat = int(getattr(graph, "num_node_feat", num_items)) if graph is not None else num_items
+        num_node_feat = min(num_node_feat, num_items)
+        skip_cache_indices = set(int(idx) for idx in (skip_cache_indices or []))
+        target_local_indices = self._scheme_b_target_local_indices(graph)
+        kept_node_items = {idx for idx in target_local_indices if 0 <= idx < num_node_feat}
+        skipped_node_items = {idx for idx in skip_cache_indices if 0 <= idx < num_node_feat}
+
+        keep_edge_items = set()
+        if cfg["keep_target_edges"]:
+            keep_edge_items = self._scheme_b_target_edge_item_indices(graph, target_local_indices, num_items)
+
+        zeroed_node_items = 0
+        zeroed_edge_items = 0
+        for item_idx, cache_item in enumerate(cache_items):
+            if cache_item is None:
+                continue
+            if item_idx in skip_cache_indices:
+                continue
+            if item_idx < num_node_feat:
+                if item_idx in kept_node_items:
+                    continue
+                if cfg["zero_memory_state"] or cfg["zero_text_kv"]:
+                    self._zero_scheme_b_cache_item(
+                        cache_item,
+                        zero_memory_state=cfg["zero_memory_state"],
+                        zero_text_kv=cfg["zero_text_kv"],
+                    )
+                    zeroed_node_items += 1
+            elif cfg["zero_edge_cache"] and item_idx not in keep_edge_items:
+                self._zero_scheme_b_cache_item(cache_item, zero_memory_state=True, zero_text_kv=True)
+                zeroed_edge_items += 1
+
+        if not target_local_indices:
+            print(
+                "GOFA scheme-B ablation warning: "
+                "target_index is missing or contains no valid local node index for this sampled subgraph."
+            )
+        elif not kept_node_items:
+            print(
+                "GOFA scheme-B ablation warning: "
+                f"target_index={target_local_indices} did not map to cache node item range [0, {num_node_feat})."
+            )
+
+        log_interval = cfg["log_interval"]
+        should_log = self.scheme_b_ablation_calls <= 3 or self.scheme_b_ablation_calls % log_interval == 0
+        if should_log:
+            edge_items = max(num_items - num_node_feat, 0)
+            print(
+                "GOFA scheme-B ablation: "
+                f"call={self.scheme_b_ablation_calls}, "
+                f"mode={cfg['mode']}, "
+                f"kept_target_node_cache_items={len(kept_node_items)}, "
+                f"zeroed_node_cache_items={zeroed_node_items}, "
+                f"zeroed_edge_cache_items={zeroed_edge_items}, "
+                f"target_index={target_local_indices}, "
+                f"zero_memory_state={cfg['zero_memory_state']}, "
+                f"zero_text_kv={cfg['zero_text_kv']}, "
+                f"zero_edge_cache={cfg['zero_edge_cache']}, "
+                f"keep_target_edges={cfg['keep_target_edges']}, "
+                f"target_cache_item_indices={sorted(kept_node_items)}, "
+                f"node_item_range=[0,{num_node_feat}), "
+                f"edge_item_range=[{num_node_feat},{num_items}), "
+                f"edge_items={edge_items}, "
+                "local_node_to_cache_item=identity, "
+                f"skipped_online_node_items={sorted(skipped_node_items)}"
+            )
+
     def _encode_with_memory_kv_cache(
             self,
             token_ids,
@@ -989,6 +1189,8 @@ class GOFAMistral(torch.nn.Module):
                         built_items[batch_idx],
                     )
             current_timing["save_s"] = time.perf_counter() - save_start
+
+        self._apply_scheme_b_ablation(cache_items, graph, skip_cache_indices=skip_cache_indices)
 
         self._sync_encoder_cache_timer(device)
         assemble_start = time.perf_counter()

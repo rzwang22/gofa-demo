@@ -50,6 +50,14 @@ scheme_b_quant:
   target_aware_delta: True
   cache_dir: ""  # optional quantized cache root; defaults to full scheme-B cache root plus _scheme_b_quant_b{base}_d{delta}
   fake_quant: True  # set False, or base_bits=16, for identity/debug cache conversion
+scheme_b_ablation:
+  enabled: False
+  mode: "none"  # options: none, target_only_zero_others
+  zero_memory_state: True
+  zero_text_kv: True
+  zero_edge_cache: True
+  keep_target_edges: False
+  log_interval: 20
 llm_max_length: 128
 val_interval:      # validate per {val_interval} training steps.
 mode: "decode"

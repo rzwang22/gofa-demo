@@ -100,6 +100,19 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "scheme_b_ablation"):
+        model_args.scheme_b_ablation = params.scheme_b_ablation
+    for field_name in (
+        "scheme_b_ablation_enabled",
+        "scheme_b_ablation_mode",
+        "scheme_b_ablation_zero_memory_state",
+        "scheme_b_ablation_zero_text_kv",
+        "scheme_b_ablation_zero_edge_cache",
+        "scheme_b_ablation_keep_target_edges",
+        "scheme_b_ablation_log_interval",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     training_args.model_max_length = params.llm_max_length
     if params.training_precision == "bf16-mixed":
         training_args.bf16 = True
