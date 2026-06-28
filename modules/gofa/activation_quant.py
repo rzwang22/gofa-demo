@@ -16,7 +16,7 @@ from modules.gofa.weight_quant import (
 )
 
 
-SUPPORTED_ACTIVATION_BITS = {8}
+SUPPORTED_ACTIVATION_BITS = {4, 8}
 
 
 @dataclass
@@ -30,26 +30,44 @@ class ActivationQuantizedModule:
 def _normalize_bits(bits: int) -> int:
     bits = int(bits)
     if bits not in SUPPORTED_ACTIVATION_BITS:
-        raise ValueError("scheme_b_activation_quant.bits currently supports only 8.")
+        raise ValueError("scheme_b_activation_quant.bits must be 4 or 8.")
     return bits
+
+
+def _normalize_clip_ratio(clip_ratio: float) -> float:
+    clip_ratio = float(clip_ratio)
+    if clip_ratio <= 0.0 or clip_ratio > 1.0:
+        raise ValueError("scheme_b_activation_quant.clip_ratio must be in (0, 1].")
+    return clip_ratio
 
 
 def fake_quant_activation_symmetric(
         activation: torch.Tensor,
         bits: int = 8,
         per_token: bool = True,
+        clip_ratio: float = 1.0,
         eps: float = 1e-12) -> torch.Tensor:
     bits = _normalize_bits(bits)
+    clip_ratio = _normalize_clip_ratio(clip_ratio)
     if not torch.is_floating_point(activation):
         return activation
     original_dtype = activation.dtype
     activation_f = activation.to(torch.float32)
     qmax = (1 << (bits - 1)) - 1
     qmin = -qmax
+    abs_activation = activation_f.abs()
     if per_token:
-        max_abs = activation_f.abs().amax(dim=-1, keepdim=True)
+        if clip_ratio < 1.0:
+            max_abs = torch.quantile(abs_activation, clip_ratio, dim=-1, keepdim=True)
+        else:
+            max_abs = abs_activation.amax(dim=-1, keepdim=True)
     else:
-        max_abs = activation_f.abs().amax().reshape([1] * activation_f.dim())
+        if clip_ratio < 1.0:
+            max_abs = torch.quantile(abs_activation.flatten(), clip_ratio).reshape([1] * activation_f.dim())
+        else:
+            max_abs = abs_activation.amax().reshape([1] * activation_f.dim())
+    if clip_ratio < 1.0:
+        activation_f = activation_f.clamp(-max_abs, max_abs)
     scale = (max_abs / float(qmax)).clamp(min=eps)
     q = torch.round(activation_f / scale).clamp(qmin, qmax)
     return (q * scale).to(original_dtype)
@@ -74,6 +92,7 @@ class SuffixTransformerActivationQuantizer:
             quantize_attn_output: bool = False,
             quantize_mlp_output: bool = False,
             per_token: bool = True,
+            clip_ratio: float = 1.0,
             log_quantized_modules: bool = True,
             logger=print):
         self.base_model = base_model
@@ -85,6 +104,7 @@ class SuffixTransformerActivationQuantizer:
         self.quantize_attn_output = bool(quantize_attn_output)
         self.quantize_mlp_output = bool(quantize_mlp_output)
         self.per_token = bool(per_token)
+        self.clip_ratio = _normalize_clip_ratio(clip_ratio)
         self.log_quantized_modules = bool(log_quantized_modules)
         self.logger = logger
         self.active_depth = 0
@@ -97,6 +117,7 @@ class SuffixTransformerActivationQuantizer:
             "activation_quant_numel": 0,
             "activation_quant_time_s": 0.0,
             "activation_effective_bits": self.bits,
+            "clip_ratio": self.clip_ratio,
         }
         if not self.fake_quant:
             raise NotImplementedError(
@@ -163,6 +184,7 @@ class SuffixTransformerActivationQuantizer:
             first_input,
             bits=self.bits,
             per_token=self.per_token,
+            clip_ratio=self.clip_ratio,
         )
         elapsed = time.perf_counter() - start_time
         self.stats["activation_quant_call_count"] += 1
@@ -185,13 +207,14 @@ class SuffixTransformerActivationQuantizer:
                 self.logger(
                     "GOFA suffix activation quantized module: "
                     f"layer_index={item.layer_idx}, module={item.name}, "
-                    f"weight_shape={item.weight_shape}, activation_bits={self.bits}, per_token={self.per_token}"
+                    f"weight_shape={item.weight_shape}, activation_bits={self.bits}, "
+                    f"per_token={self.per_token}, clip_ratio={self.clip_ratio}"
                 )
         self.logger(
             "GOFA suffix activation quantization stats: "
             f"activation_quantized_module_count={self.stats['activation_quantized_module_count']}, "
             f"activation_effective_bits={self.stats['activation_effective_bits']}, "
-            f"per_token={self.per_token}, target=suffix_transformer"
+            f"per_token={self.per_token}, clip_ratio={self.clip_ratio}, target=suffix_transformer"
         )
 
 
@@ -214,6 +237,7 @@ def maybe_create_suffix_transformer_activation_quantizer(
         quantize_attn_output=bool(cfg.get("quantize_attn_output", False)),
         quantize_mlp_output=bool(cfg.get("quantize_mlp_output", False)),
         per_token=bool(cfg.get("per_token", True)),
+        clip_ratio=float(cfg.get("clip_ratio", 1.0)),
         log_quantized_modules=bool(cfg.get("log_quantized_modules", True)),
         logger=logger,
     )

@@ -77,6 +77,7 @@ scheme_b_activation_quant:
   quantize_attn_output: False
   quantize_mlp_output: False
   per_token: True
+  clip_ratio: 1.0
   log_quantized_modules: True
 scheme_b_ablation:
   enabled: False

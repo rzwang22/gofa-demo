@@ -123,6 +123,7 @@ class ModelArguments:
     scheme_b_activation_quant_quantize_attn_output: Optional[bool] = field(default=None)
     scheme_b_activation_quant_quantize_mlp_output: Optional[bool] = field(default=None)
     scheme_b_activation_quant_per_token: Optional[bool] = field(default=None)
+    scheme_b_activation_quant_clip_ratio: Optional[float] = field(default=None)
     scheme_b_activation_quant_log_quantized_modules: Optional[bool] = field(default=None)
     scheme_b_ablation: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_ablation_enabled: Optional[bool] = field(default=None)
@@ -281,7 +282,8 @@ class GOFAMistral(torch.nn.Module):
                 f"quantize_qkv_outputs={self.scheme_b_activation_quant['quantize_qkv_outputs']}, "
                 f"quantize_attn_output={self.scheme_b_activation_quant['quantize_attn_output']}, "
                 f"quantize_mlp_output={self.scheme_b_activation_quant['quantize_mlp_output']}, "
-                f"per_token={self.scheme_b_activation_quant['per_token']}"
+                f"per_token={self.scheme_b_activation_quant['per_token']}, "
+                f"clip_ratio={self.scheme_b_activation_quant['clip_ratio']}"
             )
             self.scheme_b_activation_quantizer = maybe_create_suffix_transformer_activation_quantizer(
                 base_model,
@@ -584,6 +586,7 @@ class GOFAMistral(torch.nn.Module):
             "quantize_attn_output": False,
             "quantize_mlp_output": False,
             "per_token": True,
+            "clip_ratio": 1.0,
             "log_quantized_modules": True,
         }
         nested = getattr(model_args, "scheme_b_activation_quant", None)
@@ -600,6 +603,7 @@ class GOFAMistral(torch.nn.Module):
             "quantize_attn_output": "scheme_b_activation_quant_quantize_attn_output",
             "quantize_mlp_output": "scheme_b_activation_quant_quantize_mlp_output",
             "per_token": "scheme_b_activation_quant_per_token",
+            "clip_ratio": "scheme_b_activation_quant_clip_ratio",
             "log_quantized_modules": "scheme_b_activation_quant_log_quantized_modules",
         }
         for cfg_key, field_name in direct_fields.items():
@@ -608,8 +612,8 @@ class GOFAMistral(torch.nn.Module):
                 cfg[cfg_key] = value
         cfg["enabled"] = bool(cfg["enabled"])
         cfg["bits"] = int(cfg["bits"])
-        if cfg["bits"] != 8:
-            raise ValueError("scheme_b_activation_quant.bits currently supports only 8.")
+        if cfg["bits"] not in {4, 8}:
+            raise ValueError("scheme_b_activation_quant.bits must be 4 or 8.")
         cfg["target"] = str(cfg["target"] or "suffix_transformer")
         if cfg["target"] != "suffix_transformer":
             raise ValueError("scheme_b_activation_quant.target currently supports only 'suffix_transformer'.")
@@ -620,6 +624,9 @@ class GOFAMistral(torch.nn.Module):
         cfg["quantize_attn_output"] = bool(cfg["quantize_attn_output"])
         cfg["quantize_mlp_output"] = bool(cfg["quantize_mlp_output"])
         cfg["per_token"] = bool(cfg["per_token"])
+        cfg["clip_ratio"] = float(cfg["clip_ratio"])
+        if cfg["clip_ratio"] <= 0.0 or cfg["clip_ratio"] > 1.0:
+            raise ValueError("scheme_b_activation_quant.clip_ratio must be in (0, 1].")
         cfg["log_quantized_modules"] = bool(cfg["log_quantized_modules"])
         return cfg
 
@@ -680,7 +687,9 @@ class GOFAMistral(torch.nn.Module):
             f"activation_quant_tensor_count={stats.get('activation_quant_tensor_count', 0)}, "
             f"activation_quant_numel={stats.get('activation_quant_numel', 0)}, "
             f"activation_quant_time_s={stats.get('activation_quant_time_s', 0.0):.6f}, "
-            f"activation_effective_bits={stats.get('activation_effective_bits', 0)}"
+            f"activation_effective_bits={stats.get('activation_effective_bits', 0)}, "
+            f"per_token={self.scheme_b_activation_quant.get('per_token', True)}, "
+            f"clip_ratio={stats.get('clip_ratio', self.scheme_b_activation_quant.get('clip_ratio', 1.0))}"
         )
 
     def _build_encoder_cache_namespace(self, icae_path, model_args, training_args, gofa_args):
