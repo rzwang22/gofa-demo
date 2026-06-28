@@ -97,6 +97,7 @@ def main(params):
         "scheme_b_quant_target_aware_delta",
         "scheme_b_quant_cache_dir",
         "scheme_b_quant_fake_quant",
+        "scheme_b_quant_debug_zero_base",
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))

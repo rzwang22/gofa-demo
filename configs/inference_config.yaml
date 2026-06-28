@@ -17,6 +17,7 @@ scheme_b_quant:
   target_aware_delta: True
   cache_dir: ""
   fake_quant: True
+  debug_zero_base: False
 scheme_b_ablation:
   enabled: False
   mode: "none"

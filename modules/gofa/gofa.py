@@ -86,6 +86,7 @@ class ModelArguments:
     scheme_b_quant_target_aware_delta: Optional[bool] = field(default=None)
     scheme_b_quant_cache_dir: Optional[str] = field(default=None)
     scheme_b_quant_fake_quant: Optional[bool] = field(default=None)
+    scheme_b_quant_debug_zero_base: Optional[bool] = field(default=None)
     scheme_b_ablation: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_ablation_enabled: Optional[bool] = field(default=None)
     scheme_b_ablation_mode: Optional[str] = field(default=None)
@@ -245,7 +246,8 @@ class GOFAMistral(torch.nn.Module):
                         f"base_bits={self.scheme_b_quant['base_bits']}, "
                         f"delta_bits={self.scheme_b_quant['delta_bits']}, "
                         f"target_aware_delta={self.scheme_b_quant['target_aware_delta']}, "
-                        f"fake_quant={self.scheme_b_quant['fake_quant']}"
+                        f"fake_quant={self.scheme_b_quant['fake_quant']}, "
+                        f"debug_zero_base={self.scheme_b_quant['debug_zero_base']}"
                     )
                 if self.scheme_b_ablation_enabled:
                     print(
@@ -342,6 +344,7 @@ class GOFAMistral(torch.nn.Module):
             "target_aware_delta": True,
             "cache_dir": "",
             "fake_quant": True,
+            "debug_zero_base": False,
         }
         nested = getattr(model_args, "scheme_b_quant", None)
         if isinstance(nested, dict):
@@ -355,6 +358,7 @@ class GOFAMistral(torch.nn.Module):
             "target_aware_delta": "scheme_b_quant_target_aware_delta",
             "cache_dir": "scheme_b_quant_cache_dir",
             "fake_quant": "scheme_b_quant_fake_quant",
+            "debug_zero_base": "scheme_b_quant_debug_zero_base",
         }
         for cfg_key, field_name in direct_fields.items():
             value = getattr(model_args, field_name, None)
@@ -368,6 +372,7 @@ class GOFAMistral(torch.nn.Module):
         cfg["target_aware_delta"] = bool(cfg["target_aware_delta"])
         cfg["cache_dir"] = str(cfg["cache_dir"] or "")
         cfg["fake_quant"] = bool(cfg["fake_quant"])
+        cfg["debug_zero_base"] = bool(cfg["debug_zero_base"])
         return cfg
 
     def _normalize_scheme_b_ablation_config(self, model_args):
@@ -982,6 +987,37 @@ class GOFAMistral(torch.nn.Module):
                 if layer_kv.get("value") is not None:
                     layer_kv["value"].zero_()
 
+    def _apply_scheme_b_quant_debug_zero_base(self, cache_items, quant_base_payloads):
+        if not (self.scheme_b_quant_enabled and self.scheme_b_quant["debug_zero_base"]):
+            return
+        quant_base_item_count = sum(1 for payload in quant_base_payloads if payload is not None)
+        zeroed_base_item_count = 0
+        zeroed_memory_state_count = 0
+        zeroed_text_kv_count = 0
+        for item_idx, payload in enumerate(quant_base_payloads):
+            if payload is None:
+                continue
+            cache_item = cache_items[item_idx]
+            if cache_item is None:
+                continue
+            zeroed_base_item_count += 1
+            if cache_item.get("memory_state") is not None:
+                cache_item["memory_state"].zero_()
+                zeroed_memory_state_count += 1
+            for layer_kv in cache_item.get("text_kv", []):
+                if layer_kv.get("key") is not None:
+                    layer_kv["key"].zero_()
+                if layer_kv.get("value") is not None:
+                    layer_kv["value"].zero_()
+                zeroed_text_kv_count += 1
+        print(
+            "GOFA scheme-B quant debug_zero_base: "
+            f"quant_cache_base_item_count={quant_base_item_count}, "
+            f"zeroed_base_item_count={zeroed_base_item_count}, "
+            f"zeroed_memory_state_count={zeroed_memory_state_count}, "
+            f"zeroed_text_kv_count={zeroed_text_kv_count}"
+        )
+
     def _apply_scheme_b_ablation(self, cache_items, graph, skip_cache_indices=None):
         if not self._scheme_b_ablation_active():
             return
@@ -1190,6 +1226,7 @@ class GOFAMistral(torch.nn.Module):
                     )
             current_timing["save_s"] = time.perf_counter() - save_start
 
+        self._apply_scheme_b_quant_debug_zero_base(cache_items, quant_base_payloads)
         self._apply_scheme_b_ablation(cache_items, graph, skip_cache_indices=skip_cache_indices)
 
         self._sync_encoder_cache_timer(device)
