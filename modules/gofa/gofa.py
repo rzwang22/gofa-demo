@@ -22,6 +22,10 @@ from modules.gofa.cache_quant import (
     QUANT_DELTA_FORMAT,
     reconstruct_scheme_b_cache_item,
 )
+from modules.gofa.weight_quant import (
+    maybe_create_suffix_transformer_weight_quantizer,
+    weight_quant_context,
+)
 
 ###################################################################
 #                 Configurations                                  #
@@ -95,6 +99,15 @@ class ModelArguments:
     scheme_b_quant_fake_quant: Optional[bool] = field(default=None)
     scheme_b_quant_debug_zero_base: Optional[bool] = field(default=None)
     scheme_b_quant_strict: Optional[bool] = field(default=None)
+    scheme_b_weight_quant: Optional[Dict[str, Any]] = field(default_factory=dict)
+    scheme_b_weight_quant_enabled: Optional[bool] = field(default=None)
+    scheme_b_weight_quant_bits: Optional[int] = field(default=None)
+    scheme_b_weight_quant_target: Optional[str] = field(default=None)
+    scheme_b_weight_quant_fake_quant: Optional[bool] = field(default=None)
+    scheme_b_weight_quant_quantize_attention: Optional[bool] = field(default=None)
+    scheme_b_weight_quant_quantize_mlp: Optional[bool] = field(default=None)
+    scheme_b_weight_quant_quantize_layernorm: Optional[bool] = field(default=None)
+    scheme_b_weight_quant_log_quantized_modules: Optional[bool] = field(default=None)
     scheme_b_ablation: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_ablation_enabled: Optional[bool] = field(default=None)
     scheme_b_ablation_mode: Optional[str] = field(default=None)
@@ -158,6 +171,15 @@ class GOFAMistral(torch.nn.Module):
         self.scheme_b_quant_enabled = bool(self.scheme_b_quant["enabled"])
         self.scheme_b_quant_path_example_logged = False
         self.scheme_b_quant_stats = self._new_scheme_b_quant_stats()
+        self.scheme_b_weight_quant = self._normalize_scheme_b_weight_quant_config(model_args)
+        self.scheme_b_weight_quant_enabled = bool(self.scheme_b_weight_quant["enabled"])
+        self.scheme_b_weight_quantizer = None
+        self.scheme_b_weight_quant_stats = {
+            "quantized_module_count": 0,
+            "quantized_weight_original_bytes": 0,
+            "quantized_weight_effective_bytes": 0,
+            "compression_ratio": 0.0,
+        }
         self.encoder_cache_manifest = self._normalize_encoder_cache_manifest_config(model_args)
         self.encoder_cache_manifest_enabled = bool(self.encoder_cache_manifest["enabled"])
         self.encoder_cache_manifest_items = OrderedDict()
@@ -212,6 +234,22 @@ class GOFAMistral(torch.nn.Module):
             base_model.profile_stage_times = self.profile_stage_times
             base_model.profile_memory_kv_transformer_breakdown = self.profile_memory_kv_transformer_breakdown
             base_model.reset_stage_profile()
+        if self.scheme_b_weight_quant_enabled:
+            print(
+                "GOFA scheme-B suffix Transformer weight quantization enabled: "
+                f"target={self.scheme_b_weight_quant['target']}, "
+                f"bits={self.scheme_b_weight_quant['bits']}, "
+                f"fake_quant={self.scheme_b_weight_quant['fake_quant']}, "
+                f"quantize_attention={self.scheme_b_weight_quant['quantize_attention']}, "
+                f"quantize_mlp={self.scheme_b_weight_quant['quantize_mlp']}, "
+                f"quantize_layernorm={self.scheme_b_weight_quant['quantize_layernorm']}"
+            )
+            self.scheme_b_weight_quantizer = maybe_create_suffix_transformer_weight_quantizer(
+                base_model,
+                self.scheme_b_weight_quant,
+                logger=print,
+            )
+            self.scheme_b_weight_quant_stats = dict(self.scheme_b_weight_quantizer.stats)
         self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
         self.model.left_tokenizer.pad_token = self.model.left_tokenizer.bos_token
         for param in self.model.icae.parameters():
@@ -452,6 +490,48 @@ class GOFAMistral(torch.nn.Module):
         cfg["output_path"] = str(cfg["output_path"] or "")
         cfg["append"] = bool(cfg["append"])
         cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
+        return cfg
+
+    def _normalize_scheme_b_weight_quant_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "bits": 4,
+            "target": "suffix_transformer",
+            "fake_quant": True,
+            "quantize_attention": True,
+            "quantize_mlp": True,
+            "quantize_layernorm": False,
+            "log_quantized_modules": True,
+        }
+        nested = getattr(model_args, "scheme_b_weight_quant", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "scheme_b_weight_quant_enabled",
+            "bits": "scheme_b_weight_quant_bits",
+            "target": "scheme_b_weight_quant_target",
+            "fake_quant": "scheme_b_weight_quant_fake_quant",
+            "quantize_attention": "scheme_b_weight_quant_quantize_attention",
+            "quantize_mlp": "scheme_b_weight_quant_quantize_mlp",
+            "quantize_layernorm": "scheme_b_weight_quant_quantize_layernorm",
+            "log_quantized_modules": "scheme_b_weight_quant_log_quantized_modules",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["bits"] = int(cfg["bits"])
+        if cfg["bits"] not in {4, 8}:
+            raise ValueError("scheme_b_weight_quant.bits must be 4 or 8.")
+        cfg["target"] = str(cfg["target"] or "suffix_transformer")
+        if cfg["target"] != "suffix_transformer":
+            raise ValueError("scheme_b_weight_quant.target currently supports only 'suffix_transformer'.")
+        cfg["fake_quant"] = bool(cfg["fake_quant"])
+        cfg["quantize_attention"] = bool(cfg["quantize_attention"])
+        cfg["quantize_mlp"] = bool(cfg["quantize_mlp"])
+        cfg["quantize_layernorm"] = bool(cfg["quantize_layernorm"])
+        cfg["log_quantized_modules"] = bool(cfg["log_quantized_modules"])
         return cfg
 
     def _normalize_scheme_b_ablation_config(self, model_args):
@@ -1309,14 +1389,15 @@ class GOFAMistral(torch.nn.Module):
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
-        final_hidden_states = base_model.forward_from_gnn_boundary(
-            boundary_hidden_states=boundary_hidden_states,
-            graph=graph,
-            mem_mask=mem_mask,
-            partial_grad=partial_grad,
-            map_node=True,
-            return_dict=True,
-        ).last_hidden_state
+        with weight_quant_context(self.scheme_b_weight_quantizer):
+            final_hidden_states = base_model.forward_from_gnn_boundary(
+                boundary_hidden_states=boundary_hidden_states,
+                graph=graph,
+                mem_mask=mem_mask,
+                partial_grad=partial_grad,
+                map_node=True,
+                return_dict=True,
+            ).last_hidden_state
         self._sync_encoder_cache_timer(device)
         current_timing["suffix_compute_s"] = time.perf_counter() - suffix_start
         current_timing["total_s"] = time.perf_counter() - total_start
@@ -1742,11 +1823,12 @@ class GOFAMistral(torch.nn.Module):
             for batch_idx, original_idx in enumerate(missing):
                 seq_len = len(token_ids[original_idx])
                 text_len = seq_len - self.mem_size
-                cache_item = base_model.build_memory_text_kv_cache_item(
-                    prefix_output[batch_idx, :seq_len],
-                    text_len=text_len,
-                    partial_grad=partial_grad,
-                )
+                with weight_quant_context(self.scheme_b_weight_quantizer):
+                    cache_item = base_model.build_memory_text_kv_cache_item(
+                        prefix_output[batch_idx, :seq_len],
+                        text_len=text_len,
+                        partial_grad=partial_grad,
+                    )
                 built_items.append(cache_item)
                 cache_items[original_idx] = cache_item
             self._sync_encoder_cache_timer(device)
@@ -1799,12 +1881,13 @@ class GOFAMistral(torch.nn.Module):
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
-        final_memory_states, mapped_items = base_model.forward_memory_with_text_kv(
-            memory_states=memory_states,
-            text_kv_items=cache_items,
-            graph=graph,
-            map_node=True,
-        )
+        with weight_quant_context(self.scheme_b_weight_quantizer):
+            final_memory_states, mapped_items = base_model.forward_memory_with_text_kv(
+                memory_states=memory_states,
+                text_kv_items=cache_items,
+                graph=graph,
+                map_node=True,
+            )
         final_hidden_states = torch.zeros(
             (len(mapped_items), padded_token_ids.size(1), final_memory_states.size(-1)),
             dtype=final_memory_states.dtype,
@@ -1821,14 +1904,15 @@ class GOFAMistral(torch.nn.Module):
             try:
                 with torch.no_grad():
                     reference_embeddings = self.model.tokens_to_embeddings(padded_token_ids)
-                    reference_hidden_states = self.model.icae(
-                        inputs_embeds=reference_embeddings,
-                        output_hidden_states=True,
-                        graph=graph,
-                        mem_mask=mem_mask,
-                        partial_grad=partial_grad,
-                        map_node=True,
-                    ).hidden_states[-1]
+                    with weight_quant_context(self.scheme_b_weight_quantizer):
+                        reference_hidden_states = self.model.icae(
+                            inputs_embeds=reference_embeddings,
+                            output_hidden_states=True,
+                            graph=graph,
+                            mem_mask=mem_mask,
+                            partial_grad=partial_grad,
+                            map_node=True,
+                        ).hidden_states[-1]
             finally:
                 base_model.profile_stage_times = previous_profile_state
             diff_abs = (
@@ -2006,8 +2090,15 @@ class GOFAMistral(torch.nn.Module):
             self._sync_encoder_cache_timer(cur_device)
             full_start = time.perf_counter()
             autoencoder_input_embedding = self.model.tokens_to_embeddings(padded_text_output)
-            compress_outputs = self.model.icae(inputs_embeds=autoencoder_input_embedding, output_hidden_states=True,
-                                               graph=graph, mem_mask=mem_mask, partial_grad=partial_grad, map_node=True)
+            with weight_quant_context(self.scheme_b_weight_quantizer):
+                compress_outputs = self.model.icae(
+                    inputs_embeds=autoencoder_input_embedding,
+                    output_hidden_states=True,
+                    graph=graph,
+                    mem_mask=mem_mask,
+                    partial_grad=partial_grad,
+                    map_node=True,
+                )
             compress_outputs = compress_outputs.hidden_states[-1]
             self._sync_encoder_cache_timer(cur_device)
             full_elapsed = time.perf_counter() - full_start

@@ -57,6 +57,15 @@ scheme_b_quant:
   fake_quant: True  # set False, or base_bits=16, for identity/debug cache conversion
   debug_zero_base: False
   strict: True
+scheme_b_weight_quant:
+  enabled: False
+  bits: 4
+  target: "suffix_transformer"  # only suffix_transformer is supported for now
+  fake_quant: True
+  quantize_attention: True
+  quantize_mlp: True
+  quantize_layernorm: False
+  log_quantized_modules: True
 scheme_b_ablation:
   enabled: False
   mode: "none"  # options: none, target_only_zero_others

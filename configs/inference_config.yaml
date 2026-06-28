@@ -24,6 +24,15 @@ scheme_b_quant:
   fake_quant: True
   debug_zero_base: False
   strict: True
+scheme_b_weight_quant:
+  enabled: False
+  bits: 4
+  target: "suffix_transformer"
+  fake_quant: True
+  quantize_attention: True
+  quantize_mlp: True
+  quantize_layernorm: False
+  log_quantized_modules: True
 scheme_b_ablation:
   enabled: False
   mode: "none"

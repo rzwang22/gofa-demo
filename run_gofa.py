@@ -119,6 +119,20 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "scheme_b_weight_quant"):
+        model_args.scheme_b_weight_quant = params.scheme_b_weight_quant
+    for field_name in (
+        "scheme_b_weight_quant_enabled",
+        "scheme_b_weight_quant_bits",
+        "scheme_b_weight_quant_target",
+        "scheme_b_weight_quant_fake_quant",
+        "scheme_b_weight_quant_quantize_attention",
+        "scheme_b_weight_quant_quantize_mlp",
+        "scheme_b_weight_quant_quantize_layernorm",
+        "scheme_b_weight_quant_log_quantized_modules",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     if hasattr(params, "scheme_b_ablation"):
         model_args.scheme_b_ablation = params.scheme_b_ablation
     for field_name in (

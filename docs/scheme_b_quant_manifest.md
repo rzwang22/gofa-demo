@@ -62,3 +62,55 @@ python run_gofa.py --override configs/inference_config.yaml \
 ```
 
 If a different task accesses cache items outside this manifest-specific quant cache, strict mode should raise on the missing quant base item instead of falling back.
+
+## Suffix Weight Quant Profiling
+
+Full Scheme-B baseline:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False
+```
+
+Suffix W4A16 only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled True \
+  scheme_b_weight_quant_bits 4 \
+  scheme_b_weight_quant_fake_quant True
+```
+
+Cache 4-bit only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_strict True \
+  scheme_b_weight_quant_enabled False
+```
+
+Cache 4-bit plus suffix W4A16:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_strict True \
+  scheme_b_weight_quant_enabled True \
+  scheme_b_weight_quant_bits 4 \
+  scheme_b_weight_quant_fake_quant True
+```
