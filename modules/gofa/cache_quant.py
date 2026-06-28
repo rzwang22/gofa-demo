@@ -12,8 +12,8 @@ QUANT_DELTA_FORMAT = "memory_text_kv_quant_delta_v1"
 
 def _normalize_bits(bits: int) -> int:
     bits = int(bits)
-    if bits not in {4, 8, 16}:
-        raise ValueError(f"Unsupported cache quantization bits={bits}; expected one of 4, 8, 16.")
+    if bits not in {2, 4, 8, 16}:
+        raise ValueError(f"Unsupported cache quantization bits={bits}; expected one of 2, 4, 8, 16.")
     return bits
 
 
@@ -47,22 +47,33 @@ def _scale_view(scale: torch.Tensor, shape: Iterable[int], axis: int) -> torch.T
     return scale.reshape(view_shape)
 
 
-def _pack_int4(q: torch.Tensor) -> torch.Tensor:
-    q_u8 = (q.to(torch.int16) + 8).clamp_(0, 15).to(torch.uint8).flatten()
-    if q_u8.numel() % 2:
-        q_u8 = torch.cat([q_u8, torch.zeros(1, dtype=torch.uint8)])
-    low = q_u8[0::2]
-    high = q_u8[1::2] << 4
-    return low | high
+def _pack_low_bit(q: torch.Tensor, bits: int) -> torch.Tensor:
+    bits = int(bits)
+    values_per_byte = 8 // bits
+    offset = 1 << (bits - 1)
+    mask = (1 << bits) - 1
+    q_u8 = (q.to(torch.int16) + offset).clamp_(0, mask).to(torch.uint8).flatten()
+    padding = (-q_u8.numel()) % values_per_byte
+    if padding:
+        q_u8 = torch.cat([q_u8, torch.zeros(padding, dtype=torch.uint8)])
+    q_u8 = q_u8.reshape(-1, values_per_byte)
+    packed = torch.zeros(q_u8.shape[0], dtype=torch.uint8)
+    for value_idx in range(values_per_byte):
+        packed |= q_u8[:, value_idx] << (bits * value_idx)
+    return packed
 
 
-def _unpack_int4(packed: torch.Tensor, numel: int, shape: Iterable[int]) -> torch.Tensor:
+def _unpack_low_bit(packed: torch.Tensor, bits: int, numel: int, shape: Iterable[int]) -> torch.Tensor:
+    bits = int(bits)
+    values_per_byte = 8 // bits
+    offset = 1 << (bits - 1)
+    mask = (1 << bits) - 1
     packed = packed.to(torch.uint8).flatten()
-    values = torch.empty(packed.numel() * 2, dtype=torch.uint8)
-    values[0::2] = packed & 0x0F
-    values[1::2] = packed >> 4
+    values = torch.empty(packed.numel() * values_per_byte, dtype=torch.uint8)
+    for value_idx in range(values_per_byte):
+        values[value_idx::values_per_byte] = (packed >> (bits * value_idx)) & mask
     values = values[:numel]
-    return (values.to(torch.int16) - 8).to(torch.int8).reshape(tuple(shape))
+    return (values.to(torch.int16) - offset).to(torch.int8).reshape(tuple(shape))
 
 
 def quantize_tensor(
@@ -97,6 +108,7 @@ def quantize_tensor(
             "scale": torch.ones(scale_shape, dtype=torch.float32),
             "q": torch.empty(shape, dtype=torch.int8),
             "packed": False,
+            "pack_bits": None,
             "numel": 0,
         }
 
@@ -119,11 +131,12 @@ def quantize_tensor(
         "dtype": original_dtype,
         "channel_axis": axis,
         "scale": scale,
-        "packed": bits == 4,
+        "packed": bits in {2, 4},
+        "pack_bits": bits if bits in {2, 4} else None,
         "numel": tensor.numel(),
     }
-    if bits == 4:
-        payload["q_packed"] = _pack_int4(q)
+    if bits in {2, 4}:
+        payload["q_packed"] = _pack_low_bit(q, bits)
     else:
         payload["q"] = q
     return payload
@@ -139,7 +152,12 @@ def dequantize_tensor(payload: Dict, dtype: Optional[torch.dtype] = None) -> tor
 
     shape = list(payload["shape"])
     if payload.get("packed"):
-        q = _unpack_int4(payload["q_packed"], int(payload["numel"]), shape)
+        q = _unpack_low_bit(
+            payload["q_packed"],
+            int(payload.get("pack_bits") or payload.get("bits")),
+            int(payload["numel"]),
+            shape,
+        )
     else:
         q = payload["q"].reshape(tuple(shape)).to(torch.int8)
     scale = _scale_view(payload["scale"].to(torch.float32), shape, int(payload.get("channel_axis", -1)))

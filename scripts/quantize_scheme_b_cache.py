@@ -102,8 +102,8 @@ def main():
     parser = argparse.ArgumentParser(description="Quantize GOFA scheme-B memory/text-KV cache.")
     parser.add_argument("--input-cache-dir", required=True, help="Existing full-precision scheme-B cache root.")
     parser.add_argument("--output-cache-dir", required=True, help="Output root for quantized base cache.")
-    parser.add_argument("--base-bits", type=int, default=8, choices=(4, 8, 16))
-    parser.add_argument("--delta-bits", type=int, default=4, choices=(4, 8, 16))
+    parser.add_argument("--base-bits", type=int, default=8, choices=(2, 4, 8, 16))
+    parser.add_argument("--delta-bits", type=int, default=4, choices=(2, 4, 8, 16))
     parser.add_argument("--static-high-ratio", type=float, default=0.10)
     parser.add_argument("--static-mid-ratio", type=float, default=0.40)
     parser.add_argument(
@@ -214,4 +214,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
