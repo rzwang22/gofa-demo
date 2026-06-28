@@ -86,7 +86,10 @@ def _save_atomic(payload: Dict, path: Path):
 
 
 def _relative_output_path(input_dir: Path, output_dir: Path, cache_file: Path) -> Path:
-    return output_dir / cache_file.relative_to(input_dir)
+    relpath = cache_file.relative_to(input_dir)
+    if len(relpath.parts) == 2:
+        relpath = Path(input_dir.name) / relpath
+    return output_dir / relpath
 
 
 def _format_bytes(num_bytes: int) -> str:

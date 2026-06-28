@@ -87,6 +87,7 @@ class ModelArguments:
     scheme_b_quant_cache_dir: Optional[str] = field(default=None)
     scheme_b_quant_fake_quant: Optional[bool] = field(default=None)
     scheme_b_quant_debug_zero_base: Optional[bool] = field(default=None)
+    scheme_b_quant_strict: Optional[bool] = field(default=None)
     scheme_b_ablation: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_ablation_enabled: Optional[bool] = field(default=None)
     scheme_b_ablation_mode: Optional[str] = field(default=None)
@@ -148,6 +149,8 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_cache_mode = model_args.encoder_cache_mode
         self.scheme_b_quant = self._normalize_scheme_b_quant_config(model_args)
         self.scheme_b_quant_enabled = bool(self.scheme_b_quant["enabled"])
+        self.scheme_b_quant_path_example_logged = False
+        self.scheme_b_quant_stats = self._new_scheme_b_quant_stats()
         self.scheme_b_ablation = self._normalize_scheme_b_ablation_config(model_args)
         self.scheme_b_ablation_enabled = bool(self.scheme_b_ablation["enabled"])
         self.scheme_b_ablation_calls = 0
@@ -247,8 +250,21 @@ class GOFAMistral(torch.nn.Module):
                         f"delta_bits={self.scheme_b_quant['delta_bits']}, "
                         f"target_aware_delta={self.scheme_b_quant['target_aware_delta']}, "
                         f"fake_quant={self.scheme_b_quant['fake_quant']}, "
-                        f"debug_zero_base={self.scheme_b_quant['debug_zero_base']}"
+                        f"debug_zero_base={self.scheme_b_quant['debug_zero_base']}, "
+                        f"strict={self.scheme_b_quant['strict']}"
                     )
+                    print(
+                        "GOFA scheme-B quant cache path roots: "
+                        f"cache_tag={self.encoder_cache_namespace}, "
+                        f"full_cache_root={self._encoder_cache_root()}, "
+                        f"quant_cache_root={self._encoder_quant_cache_root()}, "
+                        f"quant_base_tag_root={self._encoder_quant_cache_tag_root(delta=False)}, "
+                        f"quant_delta_tag_root={self._encoder_quant_cache_tag_root(delta=True)}, "
+                        "full_cache_path_example=<full_cache_root>/<cache_key[:2]>/<cache_key>.pt, "
+                        "quant_base_cache_path_example=<quant_cache_root>/<cache_tag>/<cache_key[:2]>/<cache_key>.pt, "
+                        "quant_delta_cache_path_example=<quant_cache_root>/delta/<cache_tag>/<cache_key[:2]>/<cache_key>.pt"
+                    )
+                    self._validate_scheme_b_quant_cache_root()
                 if self.scheme_b_ablation_enabled:
                     print(
                         "GOFA scheme-B cache ablation enabled: "
@@ -345,6 +361,7 @@ class GOFAMistral(torch.nn.Module):
             "cache_dir": "",
             "fake_quant": True,
             "debug_zero_base": False,
+            "strict": True,
         }
         nested = getattr(model_args, "scheme_b_quant", None)
         if isinstance(nested, dict):
@@ -359,6 +376,7 @@ class GOFAMistral(torch.nn.Module):
             "cache_dir": "scheme_b_quant_cache_dir",
             "fake_quant": "scheme_b_quant_fake_quant",
             "debug_zero_base": "scheme_b_quant_debug_zero_base",
+            "strict": "scheme_b_quant_strict",
         }
         for cfg_key, field_name in direct_fields.items():
             value = getattr(model_args, field_name, None)
@@ -373,6 +391,7 @@ class GOFAMistral(torch.nn.Module):
         cfg["cache_dir"] = str(cfg["cache_dir"] or "")
         cfg["fake_quant"] = bool(cfg["fake_quant"])
         cfg["debug_zero_base"] = bool(cfg["debug_zero_base"])
+        cfg["strict"] = bool(cfg["strict"])
         return cfg
 
     def _normalize_scheme_b_ablation_config(self, model_args):
@@ -461,8 +480,30 @@ class GOFAMistral(torch.nn.Module):
     def _encoder_quant_cache_root(self):
         if self.scheme_b_quant.get("cache_dir"):
             return self.scheme_b_quant["cache_dir"]
-        suffix = f"_scheme_b_quant_b{self.scheme_b_quant['base_bits']}_d{self.scheme_b_quant['delta_bits']}"
-        return self._encoder_cache_root() + suffix
+        suffix = f"_quant_b{self.scheme_b_quant['base_bits']}d{self.scheme_b_quant['delta_bits']}"
+        return self.encoder_cache_dir.rstrip(os.sep) + suffix
+
+    def _encoder_quant_cache_tag_root(self, delta=False):
+        root = self._encoder_quant_cache_root()
+        if delta:
+            root = os.path.join(root, "delta")
+        return os.path.join(root, self.encoder_cache_namespace)
+
+    def _validate_scheme_b_quant_cache_root(self):
+        if not (self.scheme_b_quant_enabled and self.scheme_b_quant["strict"]):
+            return
+        quant_root = self._encoder_quant_cache_root()
+        quant_tag_root = self._encoder_quant_cache_tag_root(delta=False)
+        if not os.path.isdir(quant_root):
+            raise RuntimeError(
+                "GOFA scheme-B quant strict mode requires quant cache root to exist: "
+                f"{quant_root}"
+            )
+        if not os.path.isdir(quant_tag_root):
+            raise RuntimeError(
+                "GOFA scheme-B quant strict mode requires quant cache tag directory to exist: "
+                f"{quant_tag_root}"
+            )
 
     def _encoder_cache_key(self, token_ids):
         token_bytes = np.asarray(token_ids, dtype=np.int32).tobytes()
@@ -472,10 +513,7 @@ class GOFAMistral(torch.nn.Module):
         return os.path.join(self._encoder_cache_root(), cache_key[:2], cache_key + ".pt")
 
     def _encoder_quant_cache_path(self, cache_key, delta=False):
-        root = self._encoder_quant_cache_root()
-        if delta:
-            root = os.path.join(root, "delta")
-        return os.path.join(root, cache_key[:2], cache_key + ".pt")
+        return os.path.join(self._encoder_quant_cache_tag_root(delta=delta), cache_key[:2], cache_key + ".pt")
 
     def _load_encoder_cache_item(self, token_ids):
         cache_key = self._encoder_cache_key(token_ids)
@@ -525,41 +563,97 @@ class GOFAMistral(torch.nn.Module):
             "text_kv": text_kv,
         }, cache_key
 
-    def _load_encoder_quant_memory_kv_base_payload(self, token_ids):
+    def _load_encoder_quant_memory_kv_base_payload(self, token_ids, strict=False):
         cache_key = self._encoder_cache_key(token_ids)
         cache_path = self._encoder_quant_cache_path(cache_key, delta=False)
         if not os.path.exists(cache_path):
-            return None, cache_key, 0
-        payload = torch.load(cache_path, map_location="cpu")
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode missing quant base cache: "
+                    f"cache_key={cache_key}, path={cache_path}"
+                )
+            return None, cache_key, 0, "missing"
+        try:
+            payload = torch.load(cache_path, map_location="cpu")
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode failed to load quant base cache: "
+                    f"cache_key={cache_key}, path={cache_path}"
+                ) from exc
+            return None, cache_key, os.path.getsize(cache_path), "format_error"
         cache_size = os.path.getsize(cache_path)
         if payload.get("cache_format") != QUANT_BASE_FORMAT:
-            return None, cache_key, cache_size
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode found invalid quant base cache format: "
+                    f"cache_key={cache_key}, path={cache_path}, "
+                    f"cache_format={payload.get('cache_format')}, expected={QUANT_BASE_FORMAT}"
+                )
+            return None, cache_key, cache_size, "format_error"
+        if int(payload.get("base_bits", -1)) != int(self.scheme_b_quant["base_bits"]):
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode found mismatched base_bits: "
+                    f"cache_key={cache_key}, path={cache_path}, "
+                    f"payload_base_bits={payload.get('base_bits')}, configured_base_bits={self.scheme_b_quant['base_bits']}"
+                )
+            return None, cache_key, cache_size, "format_error"
         if payload.get("cache_key") != cache_key or payload.get("seq_len") != len(token_ids):
-            return None, cache_key, cache_size
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode found quant base metadata mismatch: "
+                    f"cache_key={cache_key}, path={cache_path}, "
+                    f"payload_cache_key={payload.get('cache_key')}, payload_seq_len={payload.get('seq_len')}, "
+                    f"expected_seq_len={len(token_ids)}"
+                )
+            return None, cache_key, cache_size, "format_error"
         if payload.get("mem_size") != self.mem_size:
-            return None, cache_key, cache_size
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode found mem_size mismatch: "
+                    f"cache_key={cache_key}, path={cache_path}, "
+                    f"payload_mem_size={payload.get('mem_size')}, expected_mem_size={self.mem_size}"
+                )
+            return None, cache_key, cache_size, "format_error"
         text_len = payload.get("text_len")
         if text_len is None or text_len + self.mem_size != len(token_ids):
-            return None, cache_key, cache_size
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode found text_len mismatch: "
+                    f"cache_key={cache_key}, path={cache_path}, text_len={text_len}, "
+                    f"seq_len={len(token_ids)}, mem_size={self.mem_size}"
+                )
+            return None, cache_key, cache_size, "format_error"
         text_kv = payload.get("text_kv")
         base_model = self.model.icae.get_base_model().model
         if not isinstance(text_kv, list) or len(text_kv) != base_model.gofa_config.num_layers:
-            return None, cache_key, cache_size
-        return payload, cache_key, cache_size
+            if strict:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode found invalid text_kv structure: "
+                    f"cache_key={cache_key}, path={cache_path}, "
+                    f"text_kv_layers={len(text_kv) if isinstance(text_kv, list) else None}, "
+                    f"expected_layers={base_model.gofa_config.num_layers}"
+                )
+            return None, cache_key, cache_size, "format_error"
+        return payload, cache_key, cache_size, "hit"
 
     def _load_encoder_quant_memory_kv_delta_payload(self, cache_key):
         cache_path = self._encoder_quant_cache_path(cache_key, delta=True)
         if not os.path.exists(cache_path):
-            return None, 0
-        payload = torch.load(cache_path, map_location="cpu")
+            return None, 0, "missing"
+        try:
+            payload = torch.load(cache_path, map_location="cpu")
+        except Exception:
+            return None, os.path.getsize(cache_path), "missing"
         cache_size = os.path.getsize(cache_path)
         if payload.get("cache_format") != QUANT_DELTA_FORMAT:
-            return None, cache_size
+            return None, cache_size, "missing"
         if payload.get("cache_key") != cache_key:
-            return None, cache_size
+            return None, cache_size, "missing"
         if payload.get("mem_size") != self.mem_size:
-            return None, cache_size
-        return payload, cache_size
+            return None, cache_size, "missing"
+        return payload, cache_size, "hit"
 
     def _save_encoder_memory_kv_cache_item(self, cache_key, token_ids, cache_item):
         cache_path = self._encoder_cache_path(cache_key)
@@ -596,6 +690,53 @@ class GOFAMistral(torch.nn.Module):
 
     def _stage_timing_percent(self, value, total):
         return 100.0 * value / total if total > 0 else 0.0
+
+    def _new_scheme_b_quant_stats(self):
+        return {
+            "full_scheme_b_cache_hit": 0,
+            "full_scheme_b_cache_miss": 0,
+            "quant_base_cache_hit": 0,
+            "quant_base_cache_missing": 0,
+            "quant_base_cache_format_error": 0,
+            "quant_delta_cache_hit": 0,
+            "quant_delta_cache_missing": 0,
+            "quant_reconstruct_count": 0,
+            "fallback_to_full_cache_count": 0,
+            "online_compute_count_under_quant": 0,
+            "quant_base_loaded_bytes": 0,
+            "quant_delta_loaded_bytes": 0,
+        }
+
+    def _add_scheme_b_quant_stats(self, current):
+        for key, value in current.items():
+            self.scheme_b_quant_stats[key] = self.scheme_b_quant_stats.get(key, 0) + value
+
+    def _maybe_log_scheme_b_quant_stats(self, current):
+        if not self.scheme_b_quant_enabled:
+            return
+        interval = max(int(self.profile_stage_log_interval), 1)
+        call_idx = self.encoder_cache_calls
+        if not (call_idx <= 3 or call_idx % interval == 0):
+            return
+        current_parts = [f"{key}={current.get(key, 0)}" for key in self._new_scheme_b_quant_stats()]
+        cumulative_parts = [f"cum_{key}={self.scheme_b_quant_stats.get(key, 0)}" for key in self._new_scheme_b_quant_stats()]
+        print("GOFA scheme-B quant cache stats: " + ", ".join(current_parts + cumulative_parts))
+
+    def _maybe_log_scheme_b_quant_path_example(self, cache_key):
+        if not self.scheme_b_quant_enabled or self.scheme_b_quant_path_example_logged:
+            return
+        full_path = self._encoder_cache_path(cache_key)
+        quant_base_path = self._encoder_quant_cache_path(cache_key, delta=False)
+        quant_delta_path = self._encoder_quant_cache_path(cache_key, delta=True)
+        print(
+            "GOFA scheme-B quant cache path check: "
+            f"cache_key={cache_key}, "
+            f"cache_tag={self.encoder_cache_namespace}, "
+            f"full_cache_path={full_path}, full_cache_exists={os.path.exists(full_path)}, "
+            f"quant_base_cache_path={quant_base_path}, quant_base_cache_exists={os.path.exists(quant_base_path)}, "
+            f"quant_delta_cache_path={quant_delta_path}, quant_delta_cache_exists={os.path.exists(quant_delta_path)}"
+        )
+        self.scheme_b_quant_path_example_logged = True
 
     def _maybe_log_stage_profile(self):
         if not self.profile_stage_times:
@@ -987,10 +1128,16 @@ class GOFAMistral(torch.nn.Module):
                 if layer_kv.get("value") is not None:
                     layer_kv["value"].zero_()
 
-    def _apply_scheme_b_quant_debug_zero_base(self, cache_items, quant_base_payloads):
+    def _apply_scheme_b_quant_debug_zero_base(self, cache_items, quant_base_payloads, non_skip_item_count):
         if not (self.scheme_b_quant_enabled and self.scheme_b_quant["debug_zero_base"]):
             return
         quant_base_item_count = sum(1 for payload in quant_base_payloads if payload is not None)
+        if non_skip_item_count > 0 and quant_base_item_count == 0:
+            raise RuntimeError(
+                "GOFA scheme-B quant debug_zero_base found zero quant base cache items for a non-empty batch: "
+                f"non_skip_item_count={non_skip_item_count}, quant_cache_root={self._encoder_quant_cache_root()}, "
+                f"cache_tag={self.encoder_cache_namespace}"
+            )
         zeroed_base_item_count = 0
         zeroed_memory_state_count = 0
         zeroed_text_kv_count = 0
@@ -1011,11 +1158,11 @@ class GOFAMistral(torch.nn.Module):
                     layer_kv["value"].zero_()
                 zeroed_text_kv_count += 1
         print(
-            "GOFA scheme-B quant debug_zero_base: "
-            f"quant_cache_base_item_count={quant_base_item_count}, "
-            f"zeroed_base_item_count={zeroed_base_item_count}, "
-            f"zeroed_memory_state_count={zeroed_memory_state_count}, "
-            f"zeroed_text_kv_count={zeroed_text_kv_count}"
+            "GOFA scheme-B quant debug_zero_base:\n"
+            f"  quant_cache_base_item_count={quant_base_item_count}\n"
+            f"  zeroed_base_item_count={zeroed_base_item_count}\n"
+            f"  zeroed_memory_state_count={zeroed_memory_state_count}\n"
+            f"  zeroed_text_kv_count={zeroed_text_kv_count}"
         )
 
     def _apply_scheme_b_ablation(self, cache_items, graph, skip_cache_indices=None):
@@ -1121,6 +1268,8 @@ class GOFAMistral(torch.nn.Module):
             "total_s": 0.0,
             "cache_size_bytes": 0.0,
         }
+        current_quant_stats = self._new_scheme_b_quant_stats()
+        strict_quant = self.scheme_b_quant_enabled and self.scheme_b_quant["strict"]
 
         skip_cache_indices = set(skip_cache_indices or [])
         cache_items = [None] * len(token_ids)
@@ -1138,22 +1287,46 @@ class GOFAMistral(torch.nn.Module):
                 skipped.append(i)
                 continue
             if self.scheme_b_quant_enabled:
+                cache_key = self._encoder_cache_key(ids)
+                self._maybe_log_scheme_b_quant_path_example(cache_key)
                 quant_start = time.perf_counter()
-                base_payload, cache_key, cache_size = self._load_encoder_quant_memory_kv_base_payload(ids)
+                base_payload, cache_key, cache_size, quant_status = self._load_encoder_quant_memory_kv_base_payload(
+                    ids,
+                    strict=strict_quant,
+                )
                 current_timing["quant_load_s"] += time.perf_counter() - quant_start
-                current_timing["cache_size_bytes"] += cache_size
-                if base_payload is not None:
+                if quant_status == "hit":
+                    current_quant_stats["quant_base_cache_hit"] += 1
+                    current_quant_stats["quant_base_loaded_bytes"] += cache_size
+                    current_timing["cache_size_bytes"] += cache_size
                     quant_base_payloads[i] = base_payload
                     quant_cache_keys[i] = cache_key
                     static_tiers[i] = base_payload.get("static_tier", "low")
                     continue
+                if quant_status == "missing":
+                    current_quant_stats["quant_base_cache_missing"] += 1
+                else:
+                    current_quant_stats["quant_base_cache_format_error"] += 1
             cache_item, cache_key = self._load_encoder_memory_kv_cache_item(ids)
             if cache_item is None:
+                if self.scheme_b_quant_enabled:
+                    current_quant_stats["full_scheme_b_cache_miss"] += 1
                 missing.append(i)
                 missing_keys.append(cache_key)
             else:
+                if self.scheme_b_quant_enabled:
+                    current_quant_stats["full_scheme_b_cache_hit"] += 1
+                    current_quant_stats["fallback_to_full_cache_count"] += 1
                 cache_items[i] = cache_item
         current_timing["load_s"] = time.perf_counter() - load_start
+
+        non_skip_item_count = len(token_ids) - len(skipped)
+        if strict_quant and non_skip_item_count > 0 and current_quant_stats["quant_base_cache_hit"] == 0:
+            raise RuntimeError(
+                "GOFA scheme-B quant strict mode loaded zero quant base cache items for a non-empty batch: "
+                f"non_skip_item_count={non_skip_item_count}, quant_cache_root={self._encoder_quant_cache_root()}, "
+                f"cache_tag={self.encoder_cache_namespace}"
+            )
 
         if self.scheme_b_quant_enabled and any(payload is not None for payload in quant_base_payloads):
             load_policy = build_scheme_b_load_policy(
@@ -1170,22 +1343,61 @@ class GOFAMistral(torch.nn.Module):
                 delta_payload = None
                 if load_policy[i] == BASE_DELTA and base_payload.get("has_delta", True):
                     delta_start = time.perf_counter()
-                    delta_payload, delta_size = self._load_encoder_quant_memory_kv_delta_payload(quant_cache_keys[i])
+                    delta_payload, delta_size, delta_status = self._load_encoder_quant_memory_kv_delta_payload(quant_cache_keys[i])
                     current_timing["delta_load_s"] += time.perf_counter() - delta_start
-                    current_timing["cache_size_bytes"] += delta_size
+                    if delta_status == "hit":
+                        current_quant_stats["quant_delta_cache_hit"] += 1
+                        current_quant_stats["quant_delta_loaded_bytes"] += delta_size
+                        current_timing["cache_size_bytes"] += delta_size
+                    else:
+                        current_quant_stats["quant_delta_cache_missing"] += 1
                 dequant_start = time.perf_counter()
-                cache_items[i] = reconstruct_scheme_b_cache_item(
-                    base_payload,
-                    delta_payload=delta_payload,
-                    load_delta=load_policy[i] == BASE_DELTA,
-                )
-                current_timing["dequant_s"] += time.perf_counter() - dequant_start
-            if self.encoder_cache_calls < 3 or (self.encoder_cache_calls + 1) % 50 == 0:
+                try:
+                    cache_items[i] = reconstruct_scheme_b_cache_item(
+                        base_payload,
+                        delta_payload=delta_payload,
+                        load_delta=load_policy[i] == BASE_DELTA,
+                    )
+                    current_quant_stats["quant_reconstruct_count"] += 1
+                    current_timing["dequant_s"] += time.perf_counter() - dequant_start
+                except Exception as exc:
+                    current_timing["dequant_s"] += time.perf_counter() - dequant_start
+                    if strict_quant:
+                        raise RuntimeError(
+                            "GOFA scheme-B quant strict mode failed to reconstruct quant cache item: "
+                            f"index={i}, cache_key={quant_cache_keys[i]}"
+                        ) from exc
+                    quant_base_payloads[i] = None
+                    cache_item, cache_key = self._load_encoder_memory_kv_cache_item(token_ids[i])
+                    if cache_item is None:
+                        current_quant_stats["full_scheme_b_cache_miss"] += 1
+                        missing.append(i)
+                        missing_keys.append(cache_key)
+                    else:
+                        current_quant_stats["full_scheme_b_cache_hit"] += 1
+                        current_quant_stats["fallback_to_full_cache_count"] += 1
+                        cache_items[i] = cache_item
+            quant_log_interval = max(int(self.profile_stage_log_interval), 1)
+            if self.encoder_cache_calls < 3 or (self.encoder_cache_calls + 1) % quant_log_interval == 0:
                 print(
                     "GOFA scheme-B quant policy: "
                     f"base_only={policy_stats['base_only']}, "
                     f"base_delta={policy_stats['base_delta']}, "
                     f"delta_load_ratio={policy_stats['delta_load_ratio']:.2%}"
+                )
+
+        if self.scheme_b_quant_enabled:
+            online_under_quant = sum(1 for idx in missing if idx not in skip_cache_indices)
+            current_quant_stats["online_compute_count_under_quant"] += online_under_quant
+            if strict_quant and current_quant_stats["fallback_to_full_cache_count"] > 0:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode unexpectedly fell back to full Scheme-B cache: "
+                    f"fallback_to_full_cache_count={current_quant_stats['fallback_to_full_cache_count']}"
+                )
+            if strict_quant and online_under_quant > 0:
+                raise RuntimeError(
+                    "GOFA scheme-B quant strict mode would execute online cache miss compute: "
+                    f"online_compute_count_under_quant={online_under_quant}, missing_indices={missing}"
                 )
 
         if missing:
@@ -1226,7 +1438,7 @@ class GOFAMistral(torch.nn.Module):
                     )
             current_timing["save_s"] = time.perf_counter() - save_start
 
-        self._apply_scheme_b_quant_debug_zero_base(cache_items, quant_base_payloads)
+        self._apply_scheme_b_quant_debug_zero_base(cache_items, quant_base_payloads, non_skip_item_count)
         self._apply_scheme_b_ablation(cache_items, graph, skip_cache_indices=skip_cache_indices)
 
         self._sync_encoder_cache_timer(device)
@@ -1249,6 +1461,7 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_cache_hits += current_hits
         self.encoder_cache_misses += current_misses
         self.encoder_cache_skips += current_skips
+        self._add_scheme_b_quant_stats(current_quant_stats)
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
@@ -1367,6 +1580,7 @@ class GOFAMistral(torch.nn.Module):
                 f"total_skips={self.encoder_cache_skips}"
             )
             self._encoder_cache_log_timing(current_timing)
+        self._maybe_log_scheme_b_quant_stats(current_quant_stats)
 
         return final_hidden_states
 
