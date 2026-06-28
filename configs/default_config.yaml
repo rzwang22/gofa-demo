@@ -66,6 +66,18 @@ scheme_b_weight_quant:
   quantize_mlp: True
   quantize_layernorm: False
   log_quantized_modules: True
+scheme_b_activation_quant:
+  enabled: False
+  bits: 8
+  target: "suffix_transformer"  # only suffix_transformer is supported for now
+  fake_quant: True
+  quantize_attention: True
+  quantize_mlp: True
+  quantize_qkv_outputs: False
+  quantize_attn_output: False
+  quantize_mlp_output: False
+  per_token: True
+  log_quantized_modules: True
 scheme_b_ablation:
   enabled: False
   mode: "none"  # options: none, target_only_zero_others

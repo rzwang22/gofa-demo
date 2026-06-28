@@ -133,6 +133,23 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "scheme_b_activation_quant"):
+        model_args.scheme_b_activation_quant = params.scheme_b_activation_quant
+    for field_name in (
+        "scheme_b_activation_quant_enabled",
+        "scheme_b_activation_quant_bits",
+        "scheme_b_activation_quant_target",
+        "scheme_b_activation_quant_fake_quant",
+        "scheme_b_activation_quant_quantize_attention",
+        "scheme_b_activation_quant_quantize_mlp",
+        "scheme_b_activation_quant_quantize_qkv_outputs",
+        "scheme_b_activation_quant_quantize_attn_output",
+        "scheme_b_activation_quant_quantize_mlp_output",
+        "scheme_b_activation_quant_per_token",
+        "scheme_b_activation_quant_log_quantized_modules",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     if hasattr(params, "scheme_b_ablation"):
         model_args.scheme_b_ablation = params.scheme_b_ablation
     for field_name in (

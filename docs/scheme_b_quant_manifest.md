@@ -114,3 +114,71 @@ python run_gofa.py --override configs/inference_config.yaml \
   scheme_b_weight_quant_bits 4 \
   scheme_b_weight_quant_fake_quant True
 ```
+
+## Suffix Activation Quant Profiling
+
+A8 only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 8 \
+  scheme_b_activation_quant_fake_quant True \
+  scheme_b_activation_quant_per_token True
+```
+
+W4A8 only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled True \
+  scheme_b_weight_quant_bits 4 \
+  scheme_b_weight_quant_fake_quant True \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 8 \
+  scheme_b_activation_quant_fake_quant True \
+  scheme_b_activation_quant_per_token True
+```
+
+Cache 4-bit plus A8:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_strict True \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 8 \
+  scheme_b_activation_quant_fake_quant True \
+  scheme_b_activation_quant_per_token True
+```
+
+Cache 4-bit plus W4A8:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_strict True \
+  scheme_b_weight_quant_enabled True \
+  scheme_b_weight_quant_bits 4 \
+  scheme_b_weight_quant_fake_quant True \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 8 \
+  scheme_b_activation_quant_fake_quant True \
+  scheme_b_activation_quant_per_token True
+```
