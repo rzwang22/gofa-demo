@@ -64,6 +64,23 @@ def main(params):
         model_args.encoder_cache_skip_nog = params.encoder_cache_skip_nog
     if getattr(params, "encoder_cache_mode", None):
         model_args.encoder_cache_mode = params.encoder_cache_mode
+    if hasattr(params, "encoder_cache_manifest"):
+        model_args.encoder_cache_manifest = params.encoder_cache_manifest
+    for field_name in (
+        "encoder_cache_manifest_enabled",
+        "encoder_cache_manifest_output_path",
+        "encoder_cache_manifest_append",
+        "encoder_cache_manifest_log_interval",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
+    for field_name in (
+        "eval_task_names",
+        "train_task_names",
+        "run_mode",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     if hasattr(params, "encoder_cache_verify"):
         model_args.encoder_cache_verify = params.encoder_cache_verify
     if hasattr(params, "encoder_cache_verify_tolerance"):
@@ -319,6 +336,8 @@ def main(params):
                                           precision=params.training_precision, top_k=params.save_model["top_k"],
                                           ckpt_path=params.ckpt_path, save_last=params.save_model["last"],
                                           ckpt_save_path=params.ckpt_save_path)
+    if hasattr(model.llm_model, "_maybe_dump_encoder_cache_manifest"):
+        model.llm_model._maybe_dump_encoder_cache_manifest(current_batch_seen=0, force=True)
     if params.last_save:
         model.save_partial(os.path.join(params.exp_dir, "best_ckpt.pth"))
 

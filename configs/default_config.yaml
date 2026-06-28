@@ -30,6 +30,11 @@ encoder_cache_dir: "./cache_data/encoder_cache"
 encoder_cache_tag: ""
 encoder_cache_skip_nog: False  # when True, NOG/prompt nodes are recomputed and not stored in encoder cache
 encoder_cache_mode: "boundary"  # boundary caches the layer-26 full hidden state; memory_kv caches memory + text-side KV
+encoder_cache_manifest:
+  enabled: False
+  output_path: ""
+  append: False
+  log_interval: 20
 encoder_cache_verify: False  # when using memory_kv, compare final memory slots against the full encoder path
 encoder_cache_verify_tolerance: 0.001  # strict max-absolute threshold; reported as exact_passed
 encoder_cache_verify_mean_tolerance: 0.03  # practical verification threshold for mean absolute drift

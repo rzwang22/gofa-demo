@@ -1,4 +1,5 @@
 # example code for running inference with fine-tuned checkpoint
+import atexit
 from typing import Any, Dict, Optional
 
 import hashlib
@@ -8,6 +9,7 @@ import time
 import numpy as np
 import torch
 from dataclasses import dataclass, field
+from datetime import datetime
 from transformers import MistralConfig
 
 from modules.gofa.gofa_icae import MistralICAE
@@ -63,6 +65,11 @@ class ModelArguments:
     encoder_cache_tag: str = field(default="")
     encoder_cache_skip_nog: bool = field(default=False, metadata={"help": "Do not cache NOG/prompt node states"})
     encoder_cache_mode: str = field(default="boundary", metadata={"help": "Encoder cache mode: boundary or memory_kv"})
+    encoder_cache_manifest: Optional[Dict[str, Any]] = field(default_factory=dict)
+    encoder_cache_manifest_enabled: Optional[bool] = field(default=None)
+    encoder_cache_manifest_output_path: Optional[str] = field(default=None)
+    encoder_cache_manifest_append: Optional[bool] = field(default=None)
+    encoder_cache_manifest_log_interval: Optional[int] = field(default=None)
     encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
     encoder_cache_verify_tolerance: float = field(default=1e-3, metadata={"help": "Strict max-absolute tolerance for exact verification reporting"})
     encoder_cache_verify_mean_tolerance: float = field(default=3e-2)
@@ -151,6 +158,16 @@ class GOFAMistral(torch.nn.Module):
         self.scheme_b_quant_enabled = bool(self.scheme_b_quant["enabled"])
         self.scheme_b_quant_path_example_logged = False
         self.scheme_b_quant_stats = self._new_scheme_b_quant_stats()
+        self.encoder_cache_manifest = self._normalize_encoder_cache_manifest_config(model_args)
+        self.encoder_cache_manifest_enabled = bool(self.encoder_cache_manifest["enabled"])
+        self.encoder_cache_manifest_items = OrderedDict()
+        self.encoder_cache_manifest_skip_items = OrderedDict()
+        self.encoder_cache_manifest_samples = 0
+        self.encoder_cache_manifest_dumps = 0
+        self.encoder_cache_manifest_append_loaded = False
+        self.encoder_cache_manifest_existing_items = OrderedDict()
+        self.encoder_cache_manifest_existing_skip_items = OrderedDict()
+        self.encoder_cache_manifest_existing_total_samples = 0
         self.scheme_b_ablation = self._normalize_scheme_b_ablation_config(model_args)
         self.scheme_b_ablation_enabled = bool(self.scheme_b_ablation["enabled"])
         self.scheme_b_ablation_calls = 0
@@ -211,6 +228,9 @@ class GOFAMistral(torch.nn.Module):
             if self.scheme_b_quant_enabled and self.encoder_cache_mode != "memory_kv":
                 print("GOFA scheme-B quant cache is only valid for encoder_cache_mode=memory_kv; disabling quant cache.")
                 self.scheme_b_quant_enabled = False
+            if self.encoder_cache_manifest_enabled and self.encoder_cache_mode != "memory_kv":
+                print("GOFA encoder cache manifest is only valid for encoder_cache_mode=memory_kv; disabling manifest.")
+                self.encoder_cache_manifest_enabled = False
             if self.scheme_b_ablation_enabled and self.encoder_cache_mode != "memory_kv":
                 print("GOFA scheme-B ablation is only valid for encoder_cache_mode=memory_kv; disabling ablation.")
                 self.scheme_b_ablation_enabled = False
@@ -265,6 +285,20 @@ class GOFAMistral(torch.nn.Module):
                         "quant_delta_cache_path_example=<quant_cache_root>/delta/<cache_tag>/<cache_key[:2]>/<cache_key>.pt"
                     )
                     self._validate_scheme_b_quant_cache_root()
+                if self.encoder_cache_manifest_enabled:
+                    if not self.encoder_cache_manifest["output_path"]:
+                        raise ValueError(
+                            "encoder_cache_manifest.enabled=True requires encoder_cache_manifest.output_path."
+                        )
+                    print(
+                        "GOFA encoder cache manifest enabled: "
+                        f"output_path={self.encoder_cache_manifest['output_path']}, "
+                        f"append={self.encoder_cache_manifest['append']}, "
+                        f"log_interval={self.encoder_cache_manifest['log_interval']}, "
+                        f"cache_tag={self.encoder_cache_namespace}, "
+                        f"full_cache_root={os.path.abspath(self.encoder_cache_dir)}"
+                    )
+                    atexit.register(self._maybe_dump_encoder_cache_manifest, current_batch_seen=0, force=True)
                 if self.scheme_b_ablation_enabled:
                     print(
                         "GOFA scheme-B cache ablation enabled: "
@@ -394,6 +428,32 @@ class GOFAMistral(torch.nn.Module):
         cfg["strict"] = bool(cfg["strict"])
         return cfg
 
+    def _normalize_encoder_cache_manifest_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "output_path": "",
+            "append": False,
+            "log_interval": 20,
+        }
+        nested = getattr(model_args, "encoder_cache_manifest", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "encoder_cache_manifest_enabled",
+            "output_path": "encoder_cache_manifest_output_path",
+            "append": "encoder_cache_manifest_append",
+            "log_interval": "encoder_cache_manifest_log_interval",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["output_path"] = str(cfg["output_path"] or "")
+        cfg["append"] = bool(cfg["append"])
+        cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
+        return cfg
+
     def _normalize_scheme_b_ablation_config(self, model_args):
         cfg = {
             "enabled": False,
@@ -512,8 +572,230 @@ class GOFAMistral(torch.nn.Module):
     def _encoder_cache_path(self, cache_key):
         return os.path.join(self._encoder_cache_root(), cache_key[:2], cache_key + ".pt")
 
+    def _encoder_cache_relpath(self, cache_key):
+        return os.path.join(self.encoder_cache_namespace, cache_key[:2], cache_key + ".pt")
+
     def _encoder_quant_cache_path(self, cache_key, delta=False):
         return os.path.join(self._encoder_quant_cache_tag_root(delta=delta), cache_key[:2], cache_key + ".pt")
+
+    def _manifest_jsonify(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, dict):
+            return {str(key): self._manifest_jsonify(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._manifest_jsonify(item) for item in value]
+        if isinstance(value, set):
+            return [self._manifest_jsonify(item) for item in sorted(value)]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _encoder_cache_manifest_task_names(self):
+        eval_task_names = getattr(self.model_args, "eval_task_names", None)
+        train_task_names = getattr(self.model_args, "train_task_names", None)
+        task_names = eval_task_names if eval_task_names is not None else train_task_names
+        return self._manifest_jsonify(task_names)
+
+    def _encoder_cache_manifest_cache_type(self, item_index, graph):
+        if graph is None:
+            return "unknown"
+        num_node_feat = int(getattr(graph, "num_node_feat", 0))
+        if item_index < num_node_feat:
+            return "node"
+        return "edge"
+
+    def _encoder_cache_manifest_shape_metadata(self, token_ids=None, cache_item=None, payload=None):
+        seq_len = len(token_ids) if token_ids is not None else None
+        text_len = None
+        mem_size = None
+        if isinstance(payload, dict):
+            seq_len = payload.get("seq_len", seq_len)
+            text_len = payload.get("text_len", text_len)
+            mem_size = payload.get("mem_size", mem_size)
+        if isinstance(cache_item, dict):
+            text_len = cache_item.get("text_len", text_len)
+            memory_state = cache_item.get("memory_state")
+            if memory_state is not None and hasattr(memory_state, "size"):
+                mem_size = int(memory_state.size(0))
+        if mem_size is None:
+            mem_size = self.mem_size
+        return {
+            "seq_len": int(seq_len) if seq_len is not None else None,
+            "text_len": int(text_len) if text_len is not None else None,
+            "mem_size": int(mem_size) if mem_size is not None else None,
+        }
+
+    def _merge_manifest_item(self, existing, incoming):
+        merged = dict(existing)
+        existing_count = int(merged.get("access_count", 0))
+        incoming_count = int(incoming.get("access_count", 1))
+        merged.update({key: value for key, value in incoming.items() if value is not None})
+        merged["access_count"] = existing_count + incoming_count
+        counts = dict(existing.get("hit_or_miss_counts", {}))
+        for key, value in incoming.get("hit_or_miss_counts", {}).items():
+            counts[key] = counts.get(key, 0) + int(value)
+        merged["hit_or_miss_counts"] = counts
+        return merged
+
+    def _record_encoder_cache_manifest_item(
+            self,
+            cache_key,
+            item_index,
+            token_ids=None,
+            cache_item=None,
+            payload=None,
+            graph=None,
+            hit_or_miss="unknown"):
+        if not self.encoder_cache_manifest_enabled or not cache_key:
+            return False
+        shape_meta = self._encoder_cache_manifest_shape_metadata(
+            token_ids=token_ids,
+            cache_item=cache_item,
+            payload=payload,
+        )
+        item = {
+            "cache_key": cache_key,
+            "relpath": self._encoder_cache_relpath(cache_key),
+            "cache_type": self._encoder_cache_manifest_cache_type(item_index, graph),
+            "skip_nog": False,
+            "seq_len": shape_meta["seq_len"],
+            "text_len": shape_meta["text_len"],
+            "mem_size": shape_meta["mem_size"],
+            "hit_or_miss": hit_or_miss,
+            "hit_or_miss_counts": {hit_or_miss: 1},
+            "access_count": 1,
+            "item_index": int(item_index),
+        }
+        if cache_key in self.encoder_cache_manifest_items:
+            self.encoder_cache_manifest_items[cache_key] = self._merge_manifest_item(
+                self.encoder_cache_manifest_items[cache_key],
+                item,
+            )
+            return False
+        self.encoder_cache_manifest_items[cache_key] = item
+        return True
+
+    def _record_encoder_cache_manifest_skip_item(self, cache_key, item_index, token_ids=None, graph=None, reason="skip_nog"):
+        if not self.encoder_cache_manifest_enabled or not cache_key:
+            return
+        skip_id = f"{cache_key}:{int(item_index)}"
+        if skip_id in self.encoder_cache_manifest_skip_items:
+            self.encoder_cache_manifest_skip_items[skip_id]["access_count"] += 1
+            return
+        self.encoder_cache_manifest_skip_items[skip_id] = {
+            "cache_key": cache_key,
+            "relpath": self._encoder_cache_relpath(cache_key),
+            "cache_type": self._encoder_cache_manifest_cache_type(item_index, graph),
+            "skip_nog": True,
+            "seq_len": int(len(token_ids)) if token_ids is not None else None,
+            "item_index": int(item_index),
+            "reason": reason,
+            "access_count": 1,
+        }
+
+    def _load_encoder_cache_manifest_append_state(self):
+        if self.encoder_cache_manifest_append_loaded:
+            return
+        self.encoder_cache_manifest_append_loaded = True
+        if not self.encoder_cache_manifest["append"]:
+            return
+        output_path = self.encoder_cache_manifest["output_path"]
+        if not output_path or not os.path.exists(output_path):
+            return
+        try:
+            with open(output_path, "r") as f:
+                existing = json.load(f)
+        except Exception as exc:
+            print(f"GOFA encoder cache manifest warning: failed to read append manifest {output_path}: {exc}")
+            return
+        for item in existing.get("cache_items", []):
+            cache_key = item.get("cache_key")
+            if cache_key:
+                self.encoder_cache_manifest_existing_items[cache_key] = item
+        for item in existing.get("skip_items", []):
+            skip_id = f"{item.get('cache_key')}:{item.get('item_index')}"
+            self.encoder_cache_manifest_existing_skip_items[skip_id] = item
+        self.encoder_cache_manifest_existing_total_samples = int(existing.get("total_samples", 0) or 0)
+
+    def _combined_encoder_cache_manifest_items(self):
+        self._load_encoder_cache_manifest_append_state()
+        combined = OrderedDict()
+        for cache_key, item in self.encoder_cache_manifest_existing_items.items():
+            combined[cache_key] = item
+        for cache_key, item in self.encoder_cache_manifest_items.items():
+            if cache_key in combined:
+                combined[cache_key] = self._merge_manifest_item(combined[cache_key], item)
+            else:
+                combined[cache_key] = item
+        return combined
+
+    def _combined_encoder_cache_manifest_skip_items(self):
+        self._load_encoder_cache_manifest_append_state()
+        combined = OrderedDict()
+        for skip_id, item in self.encoder_cache_manifest_existing_skip_items.items():
+            combined[skip_id] = item
+        for skip_id, item in self.encoder_cache_manifest_skip_items.items():
+            if skip_id in combined:
+                merged = dict(combined[skip_id])
+                merged["access_count"] = int(merged.get("access_count", 0)) + int(item.get("access_count", 1))
+                combined[skip_id] = merged
+            else:
+                combined[skip_id] = item
+        return combined
+
+    def _maybe_dump_encoder_cache_manifest(self, current_batch_seen=0, force=False):
+        if not self.encoder_cache_manifest_enabled:
+            return
+        output_path = self.encoder_cache_manifest["output_path"]
+        if not output_path:
+            return
+        interval = self.encoder_cache_manifest["log_interval"]
+        should_dump = (
+            force or
+            self.encoder_cache_manifest_samples <= 3 or
+            self.encoder_cache_manifest_samples % interval == 0
+        )
+        if not should_dump:
+            return
+        cache_items = self._combined_encoder_cache_manifest_items()
+        skip_items = self._combined_encoder_cache_manifest_skip_items()
+        total_samples = self.encoder_cache_manifest_existing_total_samples + self.encoder_cache_manifest_samples
+        manifest = {
+            "manifest_format": "gofa_scheme_b_cache_manifest_v1",
+            "task_names": self._encoder_cache_manifest_task_names(),
+            "eval_task_names": self._manifest_jsonify(getattr(self.model_args, "eval_task_names", None)),
+            "train_task_names": self._manifest_jsonify(getattr(self.model_args, "train_task_names", None)),
+            "run_mode": self._manifest_jsonify(getattr(self.model_args, "run_mode", None)),
+            "cache_tag": self.encoder_cache_namespace,
+            "encoder_cache_namespace": self.encoder_cache_namespace,
+            "full_cache_root": os.path.abspath(self.encoder_cache_dir),
+            "cache_mode": self.encoder_cache_mode,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "total_samples": total_samples,
+            "unique_cache_item_count": len(cache_items),
+            "cache_items": list(cache_items.values()),
+            "skip_item_count": len(skip_items),
+            "skip_items": list(skip_items.values()),
+        }
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        tmp_path = f"{output_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_path, output_path)
+        self.encoder_cache_manifest_dumps += 1
+        print(
+            "GOFA encoder cache manifest: "
+            f"current_batch_seen_cache_items={current_batch_seen}, "
+            f"cumulative_unique_cache_keys={len(cache_items)}, "
+            f"skip_items={len(skip_items)}, "
+            f"output_path={output_path}"
+        )
 
     def _load_encoder_cache_item(self, token_ids):
         cache_key = self._encoder_cache_key(token_ids)
@@ -1270,6 +1552,9 @@ class GOFAMistral(torch.nn.Module):
         }
         current_quant_stats = self._new_scheme_b_quant_stats()
         strict_quant = self.scheme_b_quant_enabled and self.scheme_b_quant["strict"]
+        manifest_batch_seen = 0
+        if self.encoder_cache_manifest_enabled:
+            self.encoder_cache_manifest_samples += 1
 
         skip_cache_indices = set(skip_cache_indices or [])
         cache_items = [None] * len(token_ids)
@@ -1282,6 +1567,15 @@ class GOFAMistral(torch.nn.Module):
         load_start = time.perf_counter()
         for i, ids in enumerate(token_ids):
             if i in skip_cache_indices:
+                if self.encoder_cache_manifest_enabled:
+                    skip_cache_key = self._encoder_cache_key(ids)
+                    self._record_encoder_cache_manifest_skip_item(
+                        skip_cache_key,
+                        i,
+                        token_ids=ids,
+                        graph=graph,
+                        reason="skip_nog",
+                    )
                 missing.append(i)
                 missing_keys.append(None)
                 skipped.append(i)
@@ -1302,6 +1596,16 @@ class GOFAMistral(torch.nn.Module):
                     quant_base_payloads[i] = base_payload
                     quant_cache_keys[i] = cache_key
                     static_tiers[i] = base_payload.get("static_tier", "low")
+                    if self.encoder_cache_manifest_enabled:
+                        self._record_encoder_cache_manifest_item(
+                            cache_key,
+                            i,
+                            token_ids=ids,
+                            payload=base_payload,
+                            graph=graph,
+                            hit_or_miss="quant_hit",
+                        )
+                        manifest_batch_seen += 1
                     continue
                 if quant_status == "missing":
                     current_quant_stats["quant_base_cache_missing"] += 1
@@ -1318,6 +1622,16 @@ class GOFAMistral(torch.nn.Module):
                     current_quant_stats["full_scheme_b_cache_hit"] += 1
                     current_quant_stats["fallback_to_full_cache_count"] += 1
                 cache_items[i] = cache_item
+                if self.encoder_cache_manifest_enabled:
+                    self._record_encoder_cache_manifest_item(
+                        cache_key,
+                        i,
+                        token_ids=ids,
+                        cache_item=cache_item,
+                        graph=graph,
+                        hit_or_miss="full_fallback_hit" if self.scheme_b_quant_enabled else "hit",
+                    )
+                    manifest_batch_seen += 1
         current_timing["load_s"] = time.perf_counter() - load_start
 
         non_skip_item_count = len(token_ids) - len(skipped)
@@ -1377,6 +1691,16 @@ class GOFAMistral(torch.nn.Module):
                         current_quant_stats["full_scheme_b_cache_hit"] += 1
                         current_quant_stats["fallback_to_full_cache_count"] += 1
                         cache_items[i] = cache_item
+                        if self.encoder_cache_manifest_enabled:
+                            self._record_encoder_cache_manifest_item(
+                                cache_key,
+                                i,
+                                token_ids=token_ids[i],
+                                cache_item=cache_item,
+                                graph=graph,
+                                hit_or_miss="reconstruct_fallback_hit",
+                            )
+                            manifest_batch_seen += 1
             quant_log_interval = max(int(self.profile_stage_log_interval), 1)
             if self.encoder_cache_calls < 3 or (self.encoder_cache_calls + 1) % quant_log_interval == 0:
                 print(
@@ -1436,6 +1760,16 @@ class GOFAMistral(torch.nn.Module):
                         token_ids[original_idx],
                         built_items[batch_idx],
                     )
+                    if self.encoder_cache_manifest_enabled:
+                        self._record_encoder_cache_manifest_item(
+                            missing_keys[batch_idx],
+                            original_idx,
+                            token_ids=token_ids[original_idx],
+                            cache_item=built_items[batch_idx],
+                            graph=graph,
+                            hit_or_miss="online_miss_under_quant" if self.scheme_b_quant_enabled else "miss",
+                        )
+                        manifest_batch_seen += 1
             current_timing["save_s"] = time.perf_counter() - save_start
 
         self._apply_scheme_b_quant_debug_zero_base(cache_items, quant_base_payloads, non_skip_item_count)
@@ -1581,6 +1915,7 @@ class GOFAMistral(torch.nn.Module):
             )
             self._encoder_cache_log_timing(current_timing)
         self._maybe_log_scheme_b_quant_stats(current_quant_stats)
+        self._maybe_dump_encoder_cache_manifest(current_batch_seen=manifest_batch_seen)
 
         return final_hidden_states
 

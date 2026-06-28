@@ -68,6 +68,64 @@ def _iter_cache_files(input_dir: Path) -> List[Path]:
     )
 
 
+def _manifest_item_relpath(item: Dict[str, Any]) -> Path:
+    relpath = item.get("relpath") or item.get("source_cache_relpath")
+    if not relpath:
+        cache_key = item.get("cache_key")
+        raise RuntimeError(f"Manifest cache item is missing relpath: cache_key={cache_key}")
+    relpath = Path(relpath)
+    if relpath.is_absolute():
+        raise RuntimeError(f"Manifest relpath must be relative, got: {relpath}")
+    if ".." in relpath.parts:
+        raise RuntimeError(f"Manifest relpath must not contain '..': {relpath}")
+    return relpath
+
+
+def _resolve_manifest_full_path(input_dir: Path, relpath: Path) -> Path:
+    candidate = input_dir / relpath
+    if candidate.exists():
+        return candidate
+    if len(relpath.parts) >= 3 and input_dir.name == relpath.parts[0]:
+        tag_root_candidate = input_dir / Path(*relpath.parts[1:])
+        if tag_root_candidate.exists():
+            return tag_root_candidate
+        return tag_root_candidate
+    return candidate
+
+
+def _load_manifest_entries(manifest_path: Path, input_dir: Path, skip_missing: bool) -> tuple[List[Dict[str, Any]], int]:
+    with manifest_path.open("r") as f:
+        manifest = json.load(f)
+    items = manifest.get("cache_items", [])
+    if not isinstance(items, list):
+        raise RuntimeError(f"Manifest cache_items must be a list: {manifest_path}")
+    entries = []
+    missing = 0
+    seen = set()
+    for ordinal, item in enumerate(items):
+        relpath = _manifest_item_relpath(item)
+        cache_key = item.get("cache_key")
+        dedupe_key = cache_key or str(relpath)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        full_path = _resolve_manifest_full_path(input_dir, relpath)
+        if not full_path.exists():
+            missing += 1
+            if skip_missing:
+                print(f"missing manifest cache item skipped: cache_key={cache_key}, full_path={full_path}")
+                continue
+            raise RuntimeError(f"Missing manifest full cache item: cache_key={cache_key}, full_path={full_path}")
+        entries.append({
+            "path": full_path,
+            "relpath": relpath,
+            "cache_key": cache_key,
+            "manifest_item": item,
+            "manifest_ordinal": ordinal,
+        })
+    return entries, missing
+
+
 def _load_scheme_b_payload(path: Path) -> Optional[Dict]:
     payload = torch.load(path, map_location="cpu")
     if payload.get("cache_format") != "memory_text_kv_v1":
@@ -105,6 +163,8 @@ def main():
     parser = argparse.ArgumentParser(description="Quantize GOFA scheme-B memory/text-KV cache.")
     parser.add_argument("--input-cache-dir", required=True, help="Existing full-precision scheme-B cache root.")
     parser.add_argument("--output-cache-dir", required=True, help="Output root for quantized base cache.")
+    parser.add_argument("--manifest", default=None, help="Optional task-specific encoder cache manifest JSON.")
+    parser.add_argument("--skip-missing", action="store_true", help="Skip missing manifest full cache items instead of raising.")
     parser.add_argument("--base-bits", type=int, default=8, choices=(2, 4, 8, 16))
     parser.add_argument("--delta-bits", type=int, default=4, choices=(2, 4, 8, 16))
     parser.add_argument("--static-high-ratio", type=float, default=0.10)
@@ -128,7 +188,28 @@ def main():
     if not input_dir.exists():
         raise FileNotFoundError(input_dir)
 
-    cache_files = _iter_cache_files(input_dir)
+    manifest_entries = None
+    manifest_item_count = 0
+    missing_item_count = 0
+    if args.manifest:
+        manifest_path = Path(args.manifest).resolve()
+        if not manifest_path.is_file():
+            raise FileNotFoundError(manifest_path)
+        with manifest_path.open("r") as f:
+            manifest_item_count = len(json.load(f).get("cache_items", []))
+        manifest_entries, missing_item_count = _load_manifest_entries(
+            manifest_path,
+            input_dir,
+            skip_missing=args.skip_missing,
+        )
+        cache_files = [entry["path"] for entry in manifest_entries]
+        print(
+            "Using task-specific cache manifest: "
+            f"manifest={manifest_path}, manifest_item_count={manifest_item_count}, "
+            f"candidate_item_count={len(cache_files)}, missing_item_count={missing_item_count}"
+        )
+    else:
+        cache_files = _iter_cache_files(input_dir)
     degree_metadata = _load_degree_metadata(args.degree_metadata)
     entries = []
     missing_degrees = 0
@@ -138,12 +219,26 @@ def main():
         payload = _load_scheme_b_payload(cache_file)
         if payload is None:
             continue
+        manifest_entry = manifest_entries[ordinal] if manifest_entries is not None else None
+        expected_cache_key = manifest_entry.get("cache_key") if manifest_entry is not None else None
+        if expected_cache_key and payload.get("cache_key") != expected_cache_key:
+            raise RuntimeError(
+                "Manifest cache_key does not match full cache payload: "
+                f"manifest_cache_key={expected_cache_key}, payload_cache_key={payload.get('cache_key')}, "
+                f"path={cache_file}"
+            )
         cache_key = payload["cache_key"]
         degree = _lookup_degree(degree_metadata, payload, cache_key, ordinal)
         if degree is None:
             missing_degrees += 1
             degree = 0.0
-        entries.append({"path": cache_file, "cache_key": cache_key, "degree": degree})
+        entries.append({
+            "path": cache_file,
+            "relpath": manifest_entry.get("relpath") if manifest_entry is not None else None,
+            "cache_key": cache_key,
+            "degree": degree,
+            "manifest_item": manifest_entry.get("manifest_item") if manifest_entry is not None else None,
+        })
         original_bytes += cache_file.stat().st_size
 
     if not entries:
@@ -179,16 +274,23 @@ def main():
         common_metadata = {
             "cache_key": payload["cache_key"],
             "seq_len": payload["seq_len"],
-            "source_cache_relpath": str(cache_file.relative_to(input_dir)),
+            "source_cache_relpath": str(entry["relpath"] or cache_file.relative_to(input_dir)),
             "static_degree": entry["degree"],
             "static_high_ratio": args.static_high_ratio,
             "static_mid_ratio": args.static_mid_ratio,
         }
+        if entry.get("manifest_item"):
+            common_metadata["manifest_cache_type"] = entry["manifest_item"].get("cache_type", "unknown")
+            common_metadata["manifest_relpath"] = str(entry["relpath"])
         base_payload.update(common_metadata)
         delta_payload.update(common_metadata)
 
-        base_path = _relative_output_path(input_dir, output_dir, cache_file)
-        delta_path = _relative_output_path(input_dir, delta_dir, cache_file)
+        if entry["relpath"] is not None:
+            base_path = output_dir / entry["relpath"]
+            delta_path = delta_dir / entry["relpath"]
+        else:
+            base_path = _relative_output_path(input_dir, output_dir, cache_file)
+            delta_path = _relative_output_path(input_dir, delta_dir, cache_file)
         _save_atomic(base_payload, base_path)
         _save_atomic(delta_payload, delta_path)
         base_bytes += base_path.stat().st_size
@@ -206,6 +308,8 @@ def main():
     tier_counts = {tier: tiers.count(tier) for tier in ("high", "mid", "low")}
     print(
         "GOFA scheme-B quantized cache stats: "
+        f"manifest_item_count={manifest_item_count if args.manifest else 0}, "
+        f"converted_item_count={converted}, missing_item_count={missing_item_count}, "
         f"items={converted}, tiers={tier_counts}, "
         f"original={_format_bytes(original_bytes)}, "
         f"base={_format_bytes(base_bytes)}, "

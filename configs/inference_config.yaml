@@ -8,6 +8,11 @@ load_model: True
 batch_size: 1
 use_encoder_cache: False
 encoder_cache_mode: "memory_kv"
+encoder_cache_manifest:
+  enabled: False
+  output_path: ""
+  append: False
+  log_interval: 20
 scheme_b_quant:
   enabled: False
   base_bits: 8
