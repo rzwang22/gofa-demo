@@ -175,6 +175,23 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "scheme_b_int_gemm"):
+        model_args.scheme_b_int_gemm = params.scheme_b_int_gemm
+    for field_name in (
+        "scheme_b_int_gemm_enabled",
+        "scheme_b_int_gemm_target",
+        "scheme_b_int_gemm_weight_bits",
+        "scheme_b_int_gemm_activation_bits",
+        "scheme_b_int_gemm_backend",
+        "scheme_b_int_gemm_quantize_attention",
+        "scheme_b_int_gemm_quantize_mlp",
+        "scheme_b_int_gemm_quantize_layernorm",
+        "scheme_b_int_gemm_fallback_to_fake_quant",
+        "scheme_b_int_gemm_log_modules",
+        "scheme_b_int_gemm_log_interval",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     if hasattr(params, "scheme_b_activation_observer"):
         model_args.scheme_b_activation_observer = params.scheme_b_activation_observer
     for field_name in (

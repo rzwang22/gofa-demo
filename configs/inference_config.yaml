@@ -70,6 +70,18 @@ scheme_b_activation_quant:
   o_proj_bits:
   mlp_bits:
   log_quantized_modules: True
+scheme_b_int_gemm:
+  enabled: False
+  target: "suffix_transformer"
+  weight_bits: 4
+  activation_bits: 8
+  backend: "torch_int_mm"
+  quantize_attention: True
+  quantize_mlp: True
+  quantize_layernorm: False
+  fallback_to_fake_quant: False
+  log_modules: True
+  log_interval: 20
 scheme_b_activation_observer:
   enabled: False
   output_dir: ""

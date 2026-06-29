@@ -1,5 +1,6 @@
 # example code for running inference with fine-tuned checkpoint
 import atexit
+from contextlib import ExitStack
 from typing import Any, Dict, Optional
 
 import hashlib
@@ -40,6 +41,10 @@ from modules.gofa.activation_observer import (
 from modules.gofa.weight_quant import (
     maybe_create_suffix_transformer_weight_quantizer,
     weight_quant_context,
+)
+from modules.gofa.int_gemm_quant import (
+    int_gemm_context,
+    maybe_create_suffix_transformer_int_gemm_quantizer,
 )
 
 ###################################################################
@@ -160,6 +165,18 @@ class ModelArguments:
     scheme_b_activation_quant_o_proj_bits: Optional[int] = field(default=None)
     scheme_b_activation_quant_mlp_bits: Optional[int] = field(default=None)
     scheme_b_activation_quant_log_quantized_modules: Optional[bool] = field(default=None)
+    scheme_b_int_gemm: Optional[Dict[str, Any]] = field(default_factory=dict)
+    scheme_b_int_gemm_enabled: Optional[bool] = field(default=None)
+    scheme_b_int_gemm_target: Optional[str] = field(default=None)
+    scheme_b_int_gemm_weight_bits: Optional[int] = field(default=None)
+    scheme_b_int_gemm_activation_bits: Optional[int] = field(default=None)
+    scheme_b_int_gemm_backend: Optional[str] = field(default=None)
+    scheme_b_int_gemm_quantize_attention: Optional[bool] = field(default=None)
+    scheme_b_int_gemm_quantize_mlp: Optional[bool] = field(default=None)
+    scheme_b_int_gemm_quantize_layernorm: Optional[bool] = field(default=None)
+    scheme_b_int_gemm_fallback_to_fake_quant: Optional[bool] = field(default=None)
+    scheme_b_int_gemm_log_modules: Optional[bool] = field(default=None)
+    scheme_b_int_gemm_log_interval: Optional[int] = field(default=None)
     scheme_b_activation_observer: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_activation_observer_enabled: Optional[bool] = field(default=None)
     scheme_b_activation_observer_output_dir: Optional[str] = field(default=None)
@@ -253,6 +270,11 @@ class GOFAMistral(torch.nn.Module):
         self.scheme_b_activation_quant_enabled = bool(self.scheme_b_activation_quant["enabled"])
         self.scheme_b_activation_quantizer = None
         self.scheme_b_activation_quant_last_logged_call_count = -1
+        self.scheme_b_int_gemm = self._normalize_scheme_b_int_gemm_config(model_args)
+        self.scheme_b_int_gemm_enabled = bool(self.scheme_b_int_gemm["enabled"])
+        self.scheme_b_int_gemm_quantizer = None
+        self.scheme_b_int_gemm_last_logged_call_count = -1
+        self.scheme_b_int_gemm_last_logged_signature = None
         self.scheme_b_activation_observer = self._normalize_scheme_b_activation_observer_config(model_args)
         self.scheme_b_activation_observer_enabled = bool(self.scheme_b_activation_observer["enabled"])
         self.scheme_b_activation_observer_instance = None
@@ -310,6 +332,30 @@ class GOFAMistral(torch.nn.Module):
             base_model.profile_stage_times = self.profile_stage_times
             base_model.profile_memory_kv_transformer_breakdown = self.profile_memory_kv_transformer_breakdown
             base_model.reset_stage_profile()
+        if self.scheme_b_int_gemm_enabled and (self.scheme_b_weight_quant_enabled or self.scheme_b_activation_quant_enabled):
+            raise ValueError(
+                "scheme_b_int_gemm.enabled=True cannot be combined with "
+                "scheme_b_weight_quant.enabled=True or scheme_b_activation_quant.enabled=True. "
+                "Disable fake quant hooks to avoid double quantization."
+            )
+        if self.scheme_b_int_gemm_enabled:
+            print(
+                "GOFA scheme-B suffix Transformer W4A8 integer GEMM enabled: "
+                f"target={self.scheme_b_int_gemm['target']}, "
+                f"weight_bits={self.scheme_b_int_gemm['weight_bits']}, "
+                f"activation_bits={self.scheme_b_int_gemm['activation_bits']}, "
+                f"backend={self.scheme_b_int_gemm['backend']}, "
+                f"quantize_attention={self.scheme_b_int_gemm['quantize_attention']}, "
+                f"quantize_mlp={self.scheme_b_int_gemm['quantize_mlp']}, "
+                f"quantize_layernorm={self.scheme_b_int_gemm['quantize_layernorm']}, "
+                f"fallback_to_fake_quant={self.scheme_b_int_gemm['fallback_to_fake_quant']}, "
+                f"log_interval={self.scheme_b_int_gemm['log_interval']}"
+            )
+            self.scheme_b_int_gemm_quantizer = maybe_create_suffix_transformer_int_gemm_quantizer(
+                base_model,
+                self.scheme_b_int_gemm,
+                logger=print,
+            )
         if self.scheme_b_weight_quant_enabled:
             print(
                 "GOFA scheme-B suffix Transformer weight quantization enabled: "
@@ -879,6 +925,61 @@ class GOFAMistral(torch.nn.Module):
         cfg["log_quantized_modules"] = bool(cfg["log_quantized_modules"])
         return cfg
 
+    def _normalize_scheme_b_int_gemm_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "target": "suffix_transformer",
+            "weight_bits": 4,
+            "activation_bits": 8,
+            "backend": "torch_int_mm",
+            "quantize_attention": True,
+            "quantize_mlp": True,
+            "quantize_layernorm": False,
+            "fallback_to_fake_quant": False,
+            "log_modules": True,
+            "log_interval": 20,
+        }
+        nested = getattr(model_args, "scheme_b_int_gemm", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "scheme_b_int_gemm_enabled",
+            "target": "scheme_b_int_gemm_target",
+            "weight_bits": "scheme_b_int_gemm_weight_bits",
+            "activation_bits": "scheme_b_int_gemm_activation_bits",
+            "backend": "scheme_b_int_gemm_backend",
+            "quantize_attention": "scheme_b_int_gemm_quantize_attention",
+            "quantize_mlp": "scheme_b_int_gemm_quantize_mlp",
+            "quantize_layernorm": "scheme_b_int_gemm_quantize_layernorm",
+            "fallback_to_fake_quant": "scheme_b_int_gemm_fallback_to_fake_quant",
+            "log_modules": "scheme_b_int_gemm_log_modules",
+            "log_interval": "scheme_b_int_gemm_log_interval",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["target"] = str(cfg["target"] or "suffix_transformer")
+        if cfg["target"] != "suffix_transformer":
+            raise ValueError("scheme_b_int_gemm.target currently supports only 'suffix_transformer'.")
+        cfg["weight_bits"] = int(cfg["weight_bits"])
+        if cfg["weight_bits"] != 4:
+            raise ValueError("scheme_b_int_gemm.weight_bits currently supports only 4.")
+        cfg["activation_bits"] = int(cfg["activation_bits"])
+        if cfg["activation_bits"] != 8:
+            raise ValueError("scheme_b_int_gemm.activation_bits currently supports only 8.")
+        cfg["backend"] = str(cfg["backend"] or "torch_int_mm")
+        if cfg["backend"] != "torch_int_mm":
+            raise ValueError("scheme_b_int_gemm.backend currently supports only 'torch_int_mm'.")
+        cfg["quantize_attention"] = bool(cfg["quantize_attention"])
+        cfg["quantize_mlp"] = bool(cfg["quantize_mlp"])
+        cfg["quantize_layernorm"] = bool(cfg["quantize_layernorm"])
+        cfg["fallback_to_fake_quant"] = bool(cfg["fallback_to_fake_quant"])
+        cfg["log_modules"] = bool(cfg["log_modules"])
+        cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
+        return cfg
+
     def _normalize_scheme_b_activation_observer_config(self, model_args):
         cfg = {
             "enabled": False,
@@ -994,6 +1095,46 @@ class GOFAMistral(torch.nn.Module):
         cfg["keep_target_edges"] = bool(cfg["keep_target_edges"])
         cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
         return cfg
+
+    def _encoder_suffix_quant_context(self):
+        stack = ExitStack()
+        stack.enter_context(int_gemm_context(self.scheme_b_int_gemm_quantizer))
+        stack.enter_context(weight_quant_context(self.scheme_b_weight_quantizer))
+        stack.enter_context(activation_observer_context(self.scheme_b_activation_observer_instance))
+        stack.enter_context(activation_quant_context(self.scheme_b_activation_quantizer))
+        return stack
+
+    def _maybe_log_scheme_b_int_gemm_stats(self):
+        quantizer = self.scheme_b_int_gemm_quantizer
+        if quantizer is None:
+            return
+        stats = quantizer.stats
+        call_count = int(stats.get("int_gemm_call_count", 0))
+        fallback_count = int(stats.get("fallback_count", 0))
+        log_signature = (call_count, fallback_count)
+        if log_signature == self.scheme_b_int_gemm_last_logged_signature:
+            return
+        interval = max(int(self.scheme_b_int_gemm.get("log_interval", 20)), 1)
+        encoder_call_idx = self.encoder_cache_calls + self.encoder_full_calls
+        if not (encoder_call_idx <= 3 or encoder_call_idx % interval == 0):
+            return
+        self.scheme_b_int_gemm_last_logged_call_count = call_count
+        self.scheme_b_int_gemm_last_logged_signature = log_signature
+        print(
+            "GOFA suffix int GEMM runtime stats: "
+            f"int_gemm_call_count={call_count}, "
+            f"int_gemm_numel_input={stats.get('int_gemm_numel_input', 0)}, "
+            f"int_gemm_numel_output={stats.get('int_gemm_numel_output', 0)}, "
+            f"int_gemm_int_mm_time_s={stats.get('int_gemm_int_mm_time_s', 0.0):.6f}, "
+            f"int_gemm_quant_time_s={stats.get('int_gemm_quant_time_s', 0.0):.6f}, "
+            f"int_gemm_dequant_time_s={stats.get('int_gemm_dequant_time_s', 0.0):.6f}, "
+            f"int_gemm_total_time_s={stats.get('int_gemm_total_time_s', 0.0):.6f}, "
+            f"int_gemm_backend={stats.get('int_gemm_backend', self.scheme_b_int_gemm.get('backend'))}, "
+            f"fallback_count={fallback_count}, "
+            f"quantized_module_count={stats.get('int_gemm_quantized_module_count', 0)}, "
+            f"weight_bits={stats.get('weight_bits', self.scheme_b_int_gemm.get('weight_bits'))}, "
+            f"activation_bits={stats.get('activation_bits', self.scheme_b_int_gemm.get('activation_bits'))}"
+        )
 
     def _maybe_log_scheme_b_activation_quant_stats(self):
         quantizer = self.scheme_b_activation_quantizer
@@ -2086,7 +2227,7 @@ class GOFAMistral(torch.nn.Module):
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
-        with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
+        with self._encoder_suffix_quant_context():
             final_hidden_states = base_model.forward_from_gnn_boundary(
                 boundary_hidden_states=boundary_hidden_states,
                 graph=graph,
@@ -2111,6 +2252,7 @@ class GOFAMistral(torch.nn.Module):
                 f"total_skips={self.encoder_cache_skips}"
             )
             self._encoder_cache_log_timing(current_timing)
+        self._maybe_log_scheme_b_int_gemm_stats()
         self._maybe_log_scheme_b_activation_quant_stats()
 
         return final_hidden_states
@@ -2574,7 +2716,7 @@ class GOFAMistral(torch.nn.Module):
             for batch_idx, original_idx in enumerate(missing):
                 seq_len = len(token_ids[original_idx])
                 text_len = seq_len - self.mem_size
-                with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
+                with self._encoder_suffix_quant_context():
                     cache_item = base_model.build_memory_text_kv_cache_item(
                         prefix_output[batch_idx, :seq_len],
                         text_len=text_len,
@@ -2632,7 +2774,7 @@ class GOFAMistral(torch.nn.Module):
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
-        with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
+        with self._encoder_suffix_quant_context():
             final_memory_states, mapped_items = base_model.forward_memory_with_text_kv(
                 memory_states=memory_states,
                 text_kv_items=cache_items,
@@ -2655,7 +2797,7 @@ class GOFAMistral(torch.nn.Module):
             try:
                 with torch.no_grad():
                     reference_embeddings = self.model.tokens_to_embeddings(padded_token_ids)
-                    with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
+                    with self._encoder_suffix_quant_context():
                         reference_hidden_states = self.model.icae(
                             inputs_embeds=reference_embeddings,
                             output_hidden_states=True,
@@ -2750,6 +2892,7 @@ class GOFAMistral(torch.nn.Module):
             )
             self._encoder_cache_log_timing(current_timing)
         self._maybe_log_scheme_b_quant_stats(current_quant_stats)
+        self._maybe_log_scheme_b_int_gemm_stats()
         self._maybe_log_scheme_b_activation_quant_stats()
         self._maybe_dump_encoder_cache_manifest(current_batch_seen=manifest_batch_seen)
 
@@ -2842,7 +2985,7 @@ class GOFAMistral(torch.nn.Module):
             self._sync_encoder_cache_timer(cur_device)
             full_start = time.perf_counter()
             autoencoder_input_embedding = self.model.tokens_to_embeddings(padded_text_output)
-            with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
+            with self._encoder_suffix_quant_context():
                 compress_outputs = self.model.icae(
                     inputs_embeds=autoencoder_input_embedding,
                     output_hidden_states=True,
@@ -2863,6 +3006,7 @@ class GOFAMistral(torch.nn.Module):
                     f"current={full_elapsed:.4f}s, "
                     f"cum_total={self.encoder_full_time_s:.4f}s"
                 )
+            self._maybe_log_scheme_b_int_gemm_stats()
             self._maybe_log_scheme_b_activation_quant_stats()
         self.model.icae.disable_adapter_layers()
 

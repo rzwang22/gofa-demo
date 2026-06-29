@@ -713,6 +713,75 @@ scheme_b_quant_target_aware_policy target_1hop_local_degree
 scheme_b_quant_local_degree_top_ratio 0.2
 ```
 
+## W4A8 Integer GEMM Baseline
+
+This path keeps Scheme-B cache quantization separate from suffix Transformer compute quantization. Use m4k4v4 base-only cache and enable `scheme_b_int_gemm`; keep fake weight and activation quant disabled to avoid double quantization.
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  data_root_path /home/rzwang/data/GOFA/TAGDataset \
+  load_dir /home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth \
+  train_task_names cora_link \
+  eval_task_names cora_link \
+  sample_size_per_task 100 \
+  inf_sample_size_per_task 100 \
+  ways 2 \
+  inf_ways 2 \
+  inf_hops 3 \
+  inf_max_nodes_per_hops 10 \
+  inf_instructs True \
+  inf_selections True \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  encoder_cache_verify False \
+  profile_stage_times True \
+  profile_stage_log_interval 20 \
+  profile_memory_kv_transformer_breakdown False \
+  encoder_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  encoder_cache_manifest_enabled False \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_memory_base_bits 4 \
+  scheme_b_quant_key_base_bits 4 \
+  scheme_b_quant_value_base_bits 4 \
+  scheme_b_quant_memory_delta_bits 4 \
+  scheme_b_quant_key_delta_bits 4 \
+  scheme_b_quant_value_delta_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v4d4 \
+  scheme_b_quant_fake_quant True \
+  scheme_b_quant_debug_zero_base False \
+  scheme_b_quant_strict True \
+  scheme_b_quant_target_aware_delta False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled False \
+  scheme_b_int_gemm_enabled True \
+  scheme_b_int_gemm_target suffix_transformer \
+  scheme_b_int_gemm_weight_bits 4 \
+  scheme_b_int_gemm_activation_bits 8 \
+  scheme_b_int_gemm_backend torch_int_mm \
+  scheme_b_int_gemm_quantize_attention True \
+  scheme_b_int_gemm_quantize_mlp True \
+  scheme_b_int_gemm_quantize_layernorm False \
+  scheme_b_int_gemm_fallback_to_fake_quant False \
+  scheme_b_int_gemm_log_modules True \
+  scheme_b_ablation_enabled False \
+  offline_log True \
+  num_workers 4
+```
+
+Expected startup/runtime checks:
+
+```text
+quantized_module_count=42
+int_gemm_call_count>0
+fallback_count=0
+```
+
+If `torch._int_mm` is unavailable and `scheme_b_int_gemm_fallback_to_fake_quant False`, runtime raises instead of silently falling back.
+
 ## Scheme-B Cache Tensor Visualization
 
 Inspect sampled full/quantized Scheme-B cache tensors offline. This analyzes `memory_state` and suffix text-side KV cache tensors without changing inference.
