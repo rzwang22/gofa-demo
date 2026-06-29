@@ -20,6 +20,12 @@ scheme_b_quant:
   static_high_ratio: 0.1
   static_mid_ratio: 0.4
   target_aware_delta: True
+  target_aware_policy: "target_1hop"
+  target_delta_hops: 1
+  keep_target_edges: True
+  local_degree_top_ratio: 0.0
+  local_degree_threshold:
+  max_delta_items_per_batch:
   cache_dir: ""
   fake_quant: True
   debug_zero_base: False

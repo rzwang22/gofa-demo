@@ -16,7 +16,13 @@ from modules.gofa.gofa_icae import MistralICAE
 from collections import OrderedDict
 from safetensors.torch import load_file
 from modules.utils import safe_download_hf_file
-from modules.gofa.cache_policy import BASE_DELTA, build_scheme_b_load_policy, summarize_load_policy
+from modules.gofa.cache_policy import (
+    BASE_DELTA,
+    build_scheme_b_load_policy,
+    local_neighbors_by_hop,
+    local_node_degrees,
+    summarize_load_policy,
+)
 from modules.gofa.cache_quant import (
     QUANT_BASE_FORMAT,
     QUANT_DELTA_FORMAT,
@@ -103,6 +109,12 @@ class ModelArguments:
     scheme_b_quant_static_high_ratio: Optional[float] = field(default=None)
     scheme_b_quant_static_mid_ratio: Optional[float] = field(default=None)
     scheme_b_quant_target_aware_delta: Optional[bool] = field(default=None)
+    scheme_b_quant_target_aware_policy: Optional[str] = field(default=None)
+    scheme_b_quant_target_delta_hops: Optional[int] = field(default=None)
+    scheme_b_quant_keep_target_edges: Optional[bool] = field(default=None)
+    scheme_b_quant_local_degree_top_ratio: Optional[float] = field(default=None)
+    scheme_b_quant_local_degree_threshold: Optional[Any] = field(default=None)
+    scheme_b_quant_max_delta_items_per_batch: Optional[Any] = field(default=None)
     scheme_b_quant_cache_dir: Optional[str] = field(default=None)
     scheme_b_quant_fake_quant: Optional[bool] = field(default=None)
     scheme_b_quant_debug_zero_base: Optional[bool] = field(default=None)
@@ -414,6 +426,12 @@ class GOFAMistral(torch.nn.Module):
                         f"base_bits={self.scheme_b_quant['base_bits']}, "
                         f"delta_bits={self.scheme_b_quant['delta_bits']}, "
                         f"target_aware_delta={self.scheme_b_quant['target_aware_delta']}, "
+                        f"target_aware_policy={self.scheme_b_quant['target_aware_policy']}, "
+                        f"target_delta_hops={self.scheme_b_quant['target_delta_hops']}, "
+                        f"keep_target_edges={self.scheme_b_quant['keep_target_edges']}, "
+                        f"local_degree_top_ratio={self.scheme_b_quant['local_degree_top_ratio']}, "
+                        f"local_degree_threshold={self.scheme_b_quant['local_degree_threshold']}, "
+                        f"max_delta_items_per_batch={self.scheme_b_quant['max_delta_items_per_batch']}, "
                         f"fake_quant={self.scheme_b_quant['fake_quant']}, "
                         f"debug_zero_base={self.scheme_b_quant['debug_zero_base']}, "
                         f"strict={self.scheme_b_quant['strict']}"
@@ -537,6 +555,12 @@ class GOFAMistral(torch.nn.Module):
             "static_high_ratio": 0.10,
             "static_mid_ratio": 0.40,
             "target_aware_delta": True,
+            "target_aware_policy": "target_1hop",
+            "target_delta_hops": 1,
+            "keep_target_edges": True,
+            "local_degree_top_ratio": 0.0,
+            "local_degree_threshold": None,
+            "max_delta_items_per_batch": None,
             "cache_dir": "",
             "fake_quant": True,
             "debug_zero_base": False,
@@ -552,6 +576,12 @@ class GOFAMistral(torch.nn.Module):
             "static_high_ratio": "scheme_b_quant_static_high_ratio",
             "static_mid_ratio": "scheme_b_quant_static_mid_ratio",
             "target_aware_delta": "scheme_b_quant_target_aware_delta",
+            "target_aware_policy": "scheme_b_quant_target_aware_policy",
+            "target_delta_hops": "scheme_b_quant_target_delta_hops",
+            "keep_target_edges": "scheme_b_quant_keep_target_edges",
+            "local_degree_top_ratio": "scheme_b_quant_local_degree_top_ratio",
+            "local_degree_threshold": "scheme_b_quant_local_degree_threshold",
+            "max_delta_items_per_batch": "scheme_b_quant_max_delta_items_per_batch",
             "cache_dir": "scheme_b_quant_cache_dir",
             "fake_quant": "scheme_b_quant_fake_quant",
             "debug_zero_base": "scheme_b_quant_debug_zero_base",
@@ -567,6 +597,29 @@ class GOFAMistral(torch.nn.Module):
         cfg["static_high_ratio"] = float(cfg["static_high_ratio"])
         cfg["static_mid_ratio"] = float(cfg["static_mid_ratio"])
         cfg["target_aware_delta"] = bool(cfg["target_aware_delta"])
+        cfg["target_aware_policy"] = str(cfg["target_aware_policy"] or "target_1hop")
+        if cfg["target_aware_policy"] not in {
+            "target_only",
+            "target_1hop",
+            "local_degree_top",
+            "target_1hop_local_degree",
+            "all_delta",
+        }:
+            raise ValueError(
+                "scheme_b_quant.target_aware_policy must be one of target_only, target_1hop, "
+                "local_degree_top, target_1hop_local_degree, all_delta."
+            )
+        cfg["target_delta_hops"] = max(int(cfg["target_delta_hops"]), 0)
+        cfg["keep_target_edges"] = bool(cfg["keep_target_edges"])
+        cfg["local_degree_top_ratio"] = max(float(cfg["local_degree_top_ratio"]), 0.0)
+        if isinstance(cfg["local_degree_threshold"], str) and cfg["local_degree_threshold"].strip().lower() in {"", "none", "null"}:
+            cfg["local_degree_threshold"] = None
+        if cfg["local_degree_threshold"] is not None:
+            cfg["local_degree_threshold"] = float(cfg["local_degree_threshold"])
+        if isinstance(cfg["max_delta_items_per_batch"], str) and cfg["max_delta_items_per_batch"].strip().lower() in {"", "none", "null"}:
+            cfg["max_delta_items_per_batch"] = None
+        if cfg["max_delta_items_per_batch"] is not None:
+            cfg["max_delta_items_per_batch"] = max(int(cfg["max_delta_items_per_batch"]), 0)
         cfg["cache_dir"] = str(cfg["cache_dir"] or "")
         cfg["fake_quant"] = bool(cfg["fake_quant"])
         cfg["debug_zero_base"] = bool(cfg["debug_zero_base"])
@@ -1059,6 +1112,121 @@ class GOFAMistral(torch.nn.Module):
             return "node"
         return "edge"
 
+    def _manifest_sequence_item(self, value, index):
+        if value is None:
+            return None
+        try:
+            if isinstance(value, torch.Tensor):
+                if index < value.numel():
+                    return self._manifest_jsonify(value.detach().cpu().reshape(-1)[index])
+                return None
+            if isinstance(value, np.ndarray):
+                if index < value.shape[0]:
+                    return self._manifest_jsonify(value[index])
+                return None
+            if isinstance(value, (list, tuple)):
+                if index < len(value):
+                    return self._manifest_jsonify(value[index])
+                return None
+        except Exception:
+            return None
+        return None
+
+    def _manifest_node_global_id(self, graph, local_node_idx):
+        if graph is None:
+            return None
+        for attr_name in ("node_ids", "node_id", "global_node_id", "global_node_ids"):
+            if hasattr(graph, attr_name):
+                value = self._manifest_sequence_item(getattr(graph, attr_name), local_node_idx)
+                if value is not None:
+                    return value
+        node_map = getattr(graph, "node_map", None)
+        return self._manifest_sequence_item(node_map, local_node_idx)
+
+    def _manifest_node_id_string(self, graph, local_node_idx):
+        if graph is None:
+            return None
+        for attr_name in ("node_id_string", "node_id_strings"):
+            if hasattr(graph, attr_name):
+                value = self._manifest_sequence_item(getattr(graph, attr_name), local_node_idx)
+                if value is not None:
+                    return value
+        x = getattr(graph, "x", None)
+        value = self._manifest_sequence_item(x, local_node_idx)
+        return str(value)[:200] if value is not None else None
+
+    def _manifest_node_global_degree(self, graph, local_node_idx):
+        if graph is None:
+            return None
+        for attr_name in ("global_degree", "global_degrees", "node_degree", "node_degrees", "degree", "degrees"):
+            if hasattr(graph, attr_name):
+                value = self._manifest_sequence_item(getattr(graph, attr_name), local_node_idx)
+                if value is not None:
+                    try:
+                        return int(value)
+                    except (TypeError, ValueError):
+                        return value
+        return None
+
+    def _manifest_local_degrees(self, graph):
+        if graph is None:
+            return []
+        return local_node_degrees(graph, num_nodes=int(getattr(graph, "num_node_feat", 0)))
+
+    def _manifest_edge_position_for_item(self, graph, local_edge_idx):
+        if graph is None:
+            return int(local_edge_idx)
+        edge_map = getattr(graph, "edge_map", None)
+        if isinstance(edge_map, torch.Tensor):
+            edge_map_cpu = edge_map.detach().cpu().reshape(-1)
+            matches = (edge_map_cpu == int(local_edge_idx)).nonzero(as_tuple=False)
+            if matches.numel() > 0:
+                return int(matches[0].item())
+        return int(local_edge_idx)
+
+    def _encoder_cache_manifest_graph_metadata(self, item_index, graph):
+        cache_type = self._encoder_cache_manifest_cache_type(item_index, graph)
+        if graph is None:
+            return {}
+        num_node_feat = int(getattr(graph, "num_node_feat", 0))
+        target_local = set(self._scheme_b_target_local_indices(graph))
+        hop_distances = local_neighbors_by_hop(graph, target_local, max_hops=1)
+        local_degrees = self._manifest_local_degrees(graph)
+        if cache_type == "node":
+            local_node_idx = int(item_index)
+            hop_distance = hop_distances.get(local_node_idx)
+            return {
+                "local_node_idx": local_node_idx,
+                "global_node_id": self._manifest_node_global_id(graph, local_node_idx),
+                "node_id_string": self._manifest_node_id_string(graph, local_node_idx),
+                "is_target": local_node_idx in target_local,
+                "is_target_neighbor": hop_distance == 1,
+                "hop_distance_to_target": hop_distance,
+                "local_degree": int(local_degrees[local_node_idx]) if local_node_idx < len(local_degrees) else None,
+                "global_degree": self._manifest_node_global_degree(graph, local_node_idx),
+            }
+        if cache_type == "edge":
+            local_edge_idx = int(item_index) - num_node_feat
+            edge_pos = self._manifest_edge_position_for_item(graph, local_edge_idx)
+            edge_index = getattr(graph, "edge_index", None)
+            src_local = dst_local = None
+            if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 2 and edge_pos < edge_index.size(1):
+                src_local = int(edge_index[0, edge_pos].detach().cpu().item())
+                dst_local = int(edge_index[1, edge_pos].detach().cpu().item())
+            target_or_neighbor = set(idx for idx, distance in hop_distances.items() if distance is not None and distance <= 1)
+            endpoints = {idx for idx in (src_local, dst_local) if idx is not None}
+            return {
+                "local_edge_idx": local_edge_idx,
+                "edge_pos": edge_pos,
+                "src_local": src_local,
+                "dst_local": dst_local,
+                "src_global": self._manifest_node_global_id(graph, src_local) if src_local is not None else None,
+                "dst_global": self._manifest_node_global_id(graph, dst_local) if dst_local is not None else None,
+                "is_incident_to_target": bool(endpoints & target_local),
+                "both_endpoints_target_or_neighbor": bool(endpoints) and endpoints.issubset(target_or_neighbor),
+            }
+        return {}
+
     def _encoder_cache_manifest_shape_metadata(self, token_ids=None, cache_item=None, payload=None):
         seq_len = len(token_ids) if token_ids is not None else None
         text_len = None
@@ -1121,6 +1289,7 @@ class GOFAMistral(torch.nn.Module):
             "access_count": 1,
             "item_index": int(item_index),
         }
+        item.update(self._encoder_cache_manifest_graph_metadata(item_index, graph))
         if cache_key in self.encoder_cache_manifest_items:
             self.encoder_cache_manifest_items[cache_key] = self._merge_manifest_item(
                 self.encoder_cache_manifest_items[cache_key],
@@ -1214,6 +1383,13 @@ class GOFAMistral(torch.nn.Module):
             return
         cache_items = self._combined_encoder_cache_manifest_items()
         skip_items = self._combined_encoder_cache_manifest_skip_items()
+        cache_item_values = list(cache_items.values())
+        manifest_node_item_count = sum(1 for item in cache_item_values if item.get("cache_type") == "node")
+        manifest_edge_item_count = sum(1 for item in cache_item_values if item.get("cache_type") == "edge")
+        manifest_global_degree_count = sum(1 for item in cache_item_values if item.get("global_degree") is not None)
+        manifest_local_degree_count = sum(1 for item in cache_item_values if item.get("local_degree") is not None)
+        manifest_target_item_count = sum(1 for item in cache_item_values if item.get("is_target") is True)
+        manifest_target_neighbor_item_count = sum(1 for item in cache_item_values if item.get("is_target_neighbor") is True)
         total_samples = self.encoder_cache_manifest_existing_total_samples + self.encoder_cache_manifest_samples
         manifest = {
             "manifest_format": "gofa_scheme_b_cache_manifest_v1",
@@ -1228,7 +1404,13 @@ class GOFAMistral(torch.nn.Module):
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "total_samples": total_samples,
             "unique_cache_item_count": len(cache_items),
-            "cache_items": list(cache_items.values()),
+            "manifest_node_item_count": manifest_node_item_count,
+            "manifest_edge_item_count": manifest_edge_item_count,
+            "manifest_items_with_global_degree_count": manifest_global_degree_count,
+            "manifest_items_with_local_degree_count": manifest_local_degree_count,
+            "manifest_target_items_count": manifest_target_item_count,
+            "manifest_target_neighbor_items_count": manifest_target_neighbor_item_count,
+            "cache_items": cache_item_values,
             "skip_item_count": len(skip_items),
             "skip_items": list(skip_items.values()),
         }
@@ -1246,6 +1428,12 @@ class GOFAMistral(torch.nn.Module):
             f"current_batch_seen_cache_items={current_batch_seen}, "
             f"cumulative_unique_cache_keys={len(cache_items)}, "
             f"skip_items={len(skip_items)}, "
+            f"node_items={manifest_node_item_count}, "
+            f"edge_items={manifest_edge_item_count}, "
+            f"items_with_global_degree={manifest_global_degree_count}, "
+            f"items_with_local_degree={manifest_local_degree_count}, "
+            f"target_items={manifest_target_item_count}, "
+            f"target_neighbor_items={manifest_target_neighbor_item_count}, "
             f"output_path={output_path}"
         )
 
@@ -2097,14 +2285,23 @@ class GOFAMistral(torch.nn.Module):
             )
 
         if self.scheme_b_quant_enabled and any(payload is not None for payload in quant_base_payloads):
-            load_policy = build_scheme_b_load_policy(
+            load_policy, policy_details = build_scheme_b_load_policy(
                 graph,
                 static_tiers=static_tiers,
                 num_items=len(token_ids),
                 target_aware_delta=self.scheme_b_quant["target_aware_delta"],
+                target_aware_policy=self.scheme_b_quant["target_aware_policy"],
+                target_delta_hops=self.scheme_b_quant["target_delta_hops"],
+                keep_target_edges=self.scheme_b_quant["keep_target_edges"],
+                local_degree_top_ratio=self.scheme_b_quant["local_degree_top_ratio"],
+                local_degree_threshold=self.scheme_b_quant["local_degree_threshold"],
+                max_delta_items_per_batch=self.scheme_b_quant["max_delta_items_per_batch"],
+                return_details=True,
             )
-            num_policy_nodes = int(getattr(graph, "num_node_feat", len(load_policy))) if graph is not None else len(load_policy)
-            policy_stats = summarize_load_policy(load_policy[:num_policy_nodes])
+            policy_stats = summarize_load_policy([
+                policy for policy, payload in zip(load_policy, quant_base_payloads)
+                if payload is not None
+            ])
             for i, base_payload in enumerate(quant_base_payloads):
                 if base_payload is None:
                     continue
@@ -2119,6 +2316,13 @@ class GOFAMistral(torch.nn.Module):
                         current_timing["cache_size_bytes"] += delta_size
                     else:
                         current_quant_stats["quant_delta_cache_missing"] += 1
+                        if strict_quant:
+                            raise RuntimeError(
+                                "GOFA scheme-B quant strict mode missing selected delta cache: "
+                                f"index={i}, cache_key={quant_cache_keys[i]}, "
+                                f"policy={self.scheme_b_quant['target_aware_policy']}, "
+                                f"path={self._encoder_quant_cache_path(quant_cache_keys[i], delta=True)}"
+                            )
                 dequant_start = time.perf_counter()
                 try:
                     cache_items[i] = reconstruct_scheme_b_cache_item(
@@ -2159,9 +2363,18 @@ class GOFAMistral(torch.nn.Module):
             if self.encoder_cache_calls < 3 or (self.encoder_cache_calls + 1) % quant_log_interval == 0:
                 print(
                     "GOFA scheme-B quant policy: "
+                    f"policy={self.scheme_b_quant['target_aware_policy']}, "
                     f"base_only={policy_stats['base_only']}, "
                     f"base_delta={policy_stats['base_delta']}, "
-                    f"delta_load_ratio={policy_stats['delta_load_ratio']:.2%}"
+                    f"delta_load_ratio={policy_stats['delta_load_ratio']:.2%}, "
+                    f"selected_target_node_local_idx={policy_details['target_node_indices']}, "
+                    f"selected_1hop_node_idx={policy_details['one_hop_node_indices']}, "
+                    f"selected_local_degree_node_idx={policy_details['local_degree_node_indices']}, "
+                    f"selected_edge_count={policy_details['selected_edge_count']}, "
+                    f"selected_edge_item_idx={policy_details['edge_item_indices']}, "
+                    f"quant_base_cache_hit={current_quant_stats['quant_base_cache_hit']}, "
+                    f"quant_delta_cache_hit={current_quant_stats['quant_delta_cache_hit']}, "
+                    f"delta_loaded_bytes={current_quant_stats['quant_delta_loaded_bytes']}"
                 )
 
         if self.scheme_b_quant_enabled:

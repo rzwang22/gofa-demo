@@ -229,6 +229,12 @@ def main():
             )
         cache_key = payload["cache_key"]
         degree = _lookup_degree(degree_metadata, payload, cache_key, ordinal)
+        manifest_item = manifest_entry.get("manifest_item") if manifest_entry is not None else None
+        if degree is None and isinstance(manifest_item, dict):
+            for degree_field in ("global_degree", "local_degree"):
+                if manifest_item.get(degree_field) is not None:
+                    degree = float(manifest_item[degree_field])
+                    break
         if degree is None:
             missing_degrees += 1
             degree = 0.0
@@ -237,7 +243,7 @@ def main():
             "relpath": manifest_entry.get("relpath") if manifest_entry is not None else None,
             "cache_key": cache_key,
             "degree": degree,
-            "manifest_item": manifest_entry.get("manifest_item") if manifest_entry is not None else None,
+            "manifest_item": manifest_item,
         })
         original_bytes += cache_file.stat().st_size
 
@@ -280,8 +286,28 @@ def main():
             "static_mid_ratio": args.static_mid_ratio,
         }
         if entry.get("manifest_item"):
-            common_metadata["manifest_cache_type"] = entry["manifest_item"].get("cache_type", "unknown")
+            manifest_item = entry["manifest_item"]
+            common_metadata["manifest_cache_type"] = manifest_item.get("cache_type", "unknown")
             common_metadata["manifest_relpath"] = str(entry["relpath"])
+            for metadata_field in (
+                "local_node_idx",
+                "global_node_id",
+                "node_id_string",
+                "is_target",
+                "is_target_neighbor",
+                "hop_distance_to_target",
+                "local_degree",
+                "global_degree",
+                "local_edge_idx",
+                "src_local",
+                "dst_local",
+                "src_global",
+                "dst_global",
+                "is_incident_to_target",
+                "both_endpoints_target_or_neighbor",
+            ):
+                if metadata_field in manifest_item:
+                    common_metadata[f"manifest_{metadata_field}"] = manifest_item.get(metadata_field)
         base_payload.update(common_metadata)
         delta_payload.update(common_metadata)
 

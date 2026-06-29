@@ -509,3 +509,96 @@ python scripts/plot_activation_observer.py \
 ```
 
 The observer writes sampled tensors under `tensors/`, per-sample stats to `activation_stats.jsonl`, and a final `activation_observer_summary.json`.
+
+## Scheme-B Two-Level Cache Policy
+
+Inspect whether a task exposes full-graph degree metadata and sampled-subgraph local metadata:
+
+```bash
+python scripts/inspect_gofa_graph_metadata.py \
+  --data-root-path /home/rzwang/data/GOFA/TAGDataset \
+  --task-name cora_link \
+  --max-samples 20
+```
+
+The script writes `/home/rzwang/data/GOFA/cache_data/gofa_cache_exp/metadata/cora_link_graph_inspect.json` by default. If no full graph is found, use the sampled subgraph local degree and target-distance policy below.
+
+Fixed compute configuration for cache policy profiling:
+
+```text
+W4 + Q8/K4/V8/O4/MLP4
+```
+
+Cache policy matrix:
+
+1. Full cache + fixed compute: `scheme_b_quant_enabled False`
+2. Cache4bit base-only + fixed compute: `scheme_b_quant_enabled True`, `scheme_b_quant_base_bits 4`, `scheme_b_quant_target_aware_delta False`
+3. Cache2bit base-only + fixed compute: `scheme_b_quant_enabled True`, `scheme_b_quant_base_bits 2`, `scheme_b_quant_target_aware_delta False`
+4. Cache2bit + all-delta + fixed compute: `scheme_b_quant_target_aware_policy all_delta`
+5. Cache2bit + target-only delta + fixed compute: `scheme_b_quant_target_aware_policy target_only`
+6. Cache2bit + target-1hop delta + fixed compute: `scheme_b_quant_target_aware_policy target_1hop`
+7. Cache2bit + target-1hop-local-degree delta + fixed compute: `scheme_b_quant_target_aware_policy target_1hop_local_degree`
+
+Example cache2bit + target-1hop policy:
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  data_root_path /home/rzwang/data/GOFA/TAGDataset \
+  load_dir /home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth \
+  train_task_names cora_link \
+  eval_task_names cora_link \
+  sample_size_per_task 100 \
+  inf_sample_size_per_task 100 \
+  ways 2 \
+  inf_ways 2 \
+  inf_hops 3 \
+  inf_max_nodes_per_hops 10 \
+  inf_instructs True \
+  inf_selections True \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  encoder_cache_verify False \
+  profile_stage_times True \
+  profile_stage_log_interval 20 \
+  encoder_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_base_bits 2 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_b2d4 \
+  scheme_b_quant_strict True \
+  scheme_b_quant_target_aware_delta True \
+  scheme_b_quant_target_aware_policy target_1hop \
+  scheme_b_quant_target_delta_hops 1 \
+  scheme_b_quant_keep_target_edges True \
+  scheme_b_quant_local_degree_top_ratio 0.0 \
+  scheme_b_quant_local_degree_threshold None \
+  scheme_b_quant_max_delta_items_per_batch None \
+  scheme_b_weight_quant_enabled True \
+  scheme_b_weight_quant_bits 4 \
+  scheme_b_weight_quant_quantize_attention True \
+  scheme_b_weight_quant_quantize_mlp True \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_q_proj_bits 8 \
+  scheme_b_activation_quant_k_proj_bits 4 \
+  scheme_b_activation_quant_v_proj_bits 8 \
+  scheme_b_activation_quant_o_proj_bits 4 \
+  scheme_b_activation_quant_mlp_bits 4 \
+  offline_log True \
+  num_workers 4
+```
+
+For the all-delta upper bound, change only:
+
+```bash
+scheme_b_quant_target_aware_policy all_delta
+```
+
+For local-degree union with target 1-hop, use:
+
+```bash
+scheme_b_quant_target_aware_policy target_1hop_local_degree
+scheme_b_quant_local_degree_top_ratio 0.2
+```
