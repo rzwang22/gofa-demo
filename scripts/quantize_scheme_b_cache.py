@@ -16,7 +16,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from modules.gofa.cache_policy import compute_static_tiers
-from modules.gofa.cache_quant import QUANT_BASE_FORMAT, QUANT_DELTA_FORMAT, quantize_scheme_b_cache_item
+from modules.gofa.cache_quant import (
+    QUANT_BASE_FORMAT,
+    QUANT_DELTA_FORMAT,
+    estimate_quantized_tensor_bits,
+    quantize_scheme_b_cache_item,
+)
 
 
 def _load_degree_metadata(path: Optional[str]) -> Any:
@@ -159,6 +164,47 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{value:.2f}TiB"
 
 
+def _optional_bits(value: Optional[int], fallback: int) -> int:
+    return int(fallback) if value is None else int(value)
+
+
+def _ceil_bits_to_bytes(num_bits: int) -> int:
+    return (int(num_bits) + 7) // 8
+
+
+def _component_original_bytes(payload: Dict) -> Dict[str, int]:
+    memory_bytes = int(payload["memory_state"].numel() * payload["memory_state"].element_size())
+    key_bytes = 0
+    value_bytes = 0
+    for layer_kv in payload.get("text_kv", []):
+        key = layer_kv.get("key")
+        value = layer_kv.get("value")
+        if key is not None:
+            key_bytes += int(key.numel() * key.element_size())
+        if value is not None:
+            value_bytes += int(value.numel() * value.element_size())
+    return {"memory": memory_bytes, "key": key_bytes, "value": value_bytes}
+
+
+def _component_quantized_bytes(base_payload: Dict, delta_payload: Dict) -> Dict[str, Dict[str, int]]:
+    memory_base = _ceil_bits_to_bytes(estimate_quantized_tensor_bits(base_payload.get("memory_state")))
+    memory_delta = _ceil_bits_to_bytes(estimate_quantized_tensor_bits(delta_payload.get("memory_state")))
+    key_base = 0
+    key_delta = 0
+    value_base = 0
+    value_delta = 0
+    for layer_base, layer_delta in zip(base_payload.get("text_kv", []), delta_payload.get("text_kv", [])):
+        key_base += _ceil_bits_to_bytes(estimate_quantized_tensor_bits(layer_base.get("key")))
+        key_delta += _ceil_bits_to_bytes(estimate_quantized_tensor_bits(layer_delta.get("key")))
+        value_base += _ceil_bits_to_bytes(estimate_quantized_tensor_bits(layer_base.get("value")))
+        value_delta += _ceil_bits_to_bytes(estimate_quantized_tensor_bits(layer_delta.get("value")))
+    return {
+        "memory": {"base": memory_base, "delta": memory_delta},
+        "key": {"base": key_base, "delta": key_delta},
+        "value": {"base": value_base, "delta": value_delta},
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Quantize GOFA scheme-B memory/text-KV cache.")
     parser.add_argument("--input-cache-dir", required=True, help="Existing full-precision scheme-B cache root.")
@@ -167,6 +213,12 @@ def main():
     parser.add_argument("--skip-missing", action="store_true", help="Skip missing manifest full cache items instead of raising.")
     parser.add_argument("--base-bits", type=int, default=8, choices=(2, 4, 8, 16))
     parser.add_argument("--delta-bits", type=int, default=4, choices=(2, 4, 8, 16))
+    parser.add_argument("--memory-base-bits", type=int, default=None, choices=(2, 4, 8, 16))
+    parser.add_argument("--key-base-bits", type=int, default=None, choices=(2, 4, 8, 16))
+    parser.add_argument("--value-base-bits", type=int, default=None, choices=(2, 4, 8, 16))
+    parser.add_argument("--memory-delta-bits", type=int, default=None, choices=(2, 4, 8, 16))
+    parser.add_argument("--key-delta-bits", type=int, default=None, choices=(2, 4, 8, 16))
+    parser.add_argument("--value-delta-bits", type=int, default=None, choices=(2, 4, 8, 16))
     parser.add_argument("--static-high-ratio", type=float, default=0.10)
     parser.add_argument("--static-mid-ratio", type=float, default=0.40)
     parser.add_argument(
@@ -187,6 +239,19 @@ def main():
     delta_dir = output_dir / "delta"
     if not input_dir.exists():
         raise FileNotFoundError(input_dir)
+    effective_memory_base_bits = _optional_bits(args.memory_base_bits, args.base_bits)
+    effective_key_base_bits = _optional_bits(args.key_base_bits, args.base_bits)
+    effective_value_base_bits = _optional_bits(args.value_base_bits, args.base_bits)
+    effective_memory_delta_bits = _optional_bits(args.memory_delta_bits, args.delta_bits)
+    effective_key_delta_bits = _optional_bits(args.key_delta_bits, args.delta_bits)
+    effective_value_delta_bits = _optional_bits(args.value_delta_bits, args.delta_bits)
+    print(
+        "GOFA scheme-B component quantization bits: "
+        f"base_bits={args.base_bits}, delta_bits={args.delta_bits}, "
+        f"memory_base_bits={effective_memory_base_bits}, key_base_bits={effective_key_base_bits}, "
+        f"value_base_bits={effective_value_base_bits}, memory_delta_bits={effective_memory_delta_bits}, "
+        f"key_delta_bits={effective_key_delta_bits}, value_delta_bits={effective_value_delta_bits}"
+    )
 
     manifest_entries = None
     manifest_item_count = 0
@@ -264,6 +329,9 @@ def main():
 
     base_bytes = 0
     delta_bytes = 0
+    component_original_bytes = {"memory": 0, "key": 0, "value": 0}
+    component_base_bytes = {"memory": 0, "key": 0, "value": 0}
+    component_delta_bytes = {"memory": 0, "key": 0, "value": 0}
     converted = 0
     for ordinal, entry in enumerate(entries):
         cache_file = entry["path"]
@@ -274,9 +342,21 @@ def main():
             payload,
             base_bits=args.base_bits,
             delta_bits=args.delta_bits,
+            memory_base_bits=args.memory_base_bits,
+            key_base_bits=args.key_base_bits,
+            value_base_bits=args.value_base_bits,
+            memory_delta_bits=args.memory_delta_bits,
+            key_delta_bits=args.key_delta_bits,
+            value_delta_bits=args.value_delta_bits,
             static_tier=tiers[ordinal],
             fake_quant=args.fake_quant,
         )
+        original_component = _component_original_bytes(payload)
+        quantized_component = _component_quantized_bytes(base_payload, delta_payload)
+        for component in ("memory", "key", "value"):
+            component_original_bytes[component] += original_component[component]
+            component_base_bytes[component] += quantized_component[component]["base"]
+            component_delta_bytes[component] += quantized_component[component]["delta"]
         common_metadata = {
             "cache_key": payload["cache_key"],
             "seq_len": payload["seq_len"],
@@ -332,6 +412,9 @@ def main():
     quant_bytes = base_bytes + delta_bytes
     compression_ratio = (original_bytes / quant_bytes) if quant_bytes else 0.0
     tier_counts = {tier: tiers.count(tier) for tier in ("high", "mid", "low")}
+    logical_original_bytes = sum(component_original_bytes.values())
+    logical_base_bytes = sum(component_base_bytes.values())
+    logical_delta_bytes = sum(component_delta_bytes.values())
     print(
         "GOFA scheme-B quantized cache stats: "
         f"manifest_item_count={manifest_item_count if args.manifest else 0}, "
@@ -342,6 +425,22 @@ def main():
         f"delta={_format_bytes(delta_bytes)}, "
         f"total_quantized={_format_bytes(quant_bytes)}, "
         f"compression_ratio={compression_ratio:.3f}x"
+    )
+    print(
+        "GOFA scheme-B component logical cache stats: "
+        f"memory_original={_format_bytes(component_original_bytes['memory'])}, "
+        f"memory_base={_format_bytes(component_base_bytes['memory'])}, "
+        f"memory_delta={_format_bytes(component_delta_bytes['memory'])}, "
+        f"key_original={_format_bytes(component_original_bytes['key'])}, "
+        f"key_base={_format_bytes(component_base_bytes['key'])}, "
+        f"key_delta={_format_bytes(component_delta_bytes['key'])}, "
+        f"value_original={_format_bytes(component_original_bytes['value'])}, "
+        f"value_base={_format_bytes(component_base_bytes['value'])}, "
+        f"value_delta={_format_bytes(component_delta_bytes['value'])}, "
+        f"total_original={_format_bytes(logical_original_bytes)}, "
+        f"total_base={_format_bytes(logical_base_bytes)}, "
+        f"total_delta={_format_bytes(logical_delta_bytes)}, "
+        f"total_quantized={_format_bytes(logical_base_bytes + logical_delta_bytes)}"
     )
 
 

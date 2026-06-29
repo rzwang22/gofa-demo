@@ -16,6 +16,10 @@ if str(REPO_ROOT) not in sys.path:
 from modules.gofa.cache_quant import QUANT_BASE_FORMAT, QUANT_DELTA_FORMAT, reconstruct_scheme_b_cache_item
 
 
+def _optional_bits(value: Optional[int], fallback: int) -> int:
+    return int(fallback) if value is None else int(value)
+
+
 def _iter_full_cache_files(full_cache_dir: Path) -> Iterable[Path]:
     for path in sorted(full_cache_dir.rglob("*.pt")):
         if "delta" in path.relative_to(full_cache_dir).parts:
@@ -115,11 +119,38 @@ def _assert_shape_match(full_item: Dict, reconstructed_item: Dict, quant_path: P
                 )
 
 
+def _payload_component_base_bits(payload: Dict) -> Dict[str, int]:
+    fallback = payload.get("base_bits")
+    return {
+        "memory_base_bits": int(payload.get("memory_base_bits", fallback if fallback is not None else -1)),
+        "key_base_bits": int(payload.get("key_base_bits", fallback if fallback is not None else -1)),
+        "value_base_bits": int(payload.get("value_base_bits", fallback if fallback is not None else -1)),
+    }
+
+
+def _assert_component_base_bits(payload: Dict, expected: Dict[str, int], quant_path: Path):
+    payload_bits = _payload_component_base_bits(payload)
+    mismatches = {
+        key: {"payload": payload_bits[key], "expected": expected[key]}
+        for key in expected
+        if payload_bits[key] != expected[key]
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"base component bits mismatch for {quant_path}: "
+            f"payload_base_bits={payload.get('base_bits')}, "
+            f"payload_component_bits={payload_bits}, expected={expected}, mismatches={mismatches}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Validate GOFA Scheme-B quant cache files against full cache files.")
     parser.add_argument("--full-cache-dir", required=True)
     parser.add_argument("--quant-cache-dir", required=True)
-    parser.add_argument("--base-bits", type=int, required=True)
+    parser.add_argument("--base-bits", type=int, required=True, choices=(2, 4, 8, 16))
+    parser.add_argument("--memory-base-bits", type=int, default=None, choices=(2, 4, 8, 16))
+    parser.add_argument("--key-base-bits", type=int, default=None, choices=(2, 4, 8, 16))
+    parser.add_argument("--value-base-bits", type=int, default=None, choices=(2, 4, 8, 16))
     parser.add_argument("--max-items", type=int, default=10)
     parser.add_argument("--manifest", default=None, help="Optional task-specific encoder cache manifest JSON.")
     args = parser.parse_args()
@@ -130,6 +161,11 @@ def main():
         raise FileNotFoundError(full_cache_dir)
     if not quant_cache_dir.is_dir():
         raise FileNotFoundError(quant_cache_dir)
+    expected_component_base_bits = {
+        "memory_base_bits": _optional_bits(args.memory_base_bits, args.base_bits),
+        "key_base_bits": _optional_bits(args.key_base_bits, args.base_bits),
+        "value_base_bits": _optional_bits(args.value_base_bits, args.base_bits),
+    }
 
     checked = 0
     if args.manifest:
@@ -178,11 +214,7 @@ def main():
                 f"Invalid quant delta cache format for {quant_delta_path}: "
                 f"{delta_payload.get('cache_format')} != {QUANT_DELTA_FORMAT}"
             )
-        if int(quant_payload.get("base_bits", -1)) != int(args.base_bits):
-            raise RuntimeError(
-                f"base_bits mismatch for {quant_base_path}: "
-                f"payload={quant_payload.get('base_bits')}, expected={args.base_bits}"
-            )
+        _assert_component_base_bits(quant_payload, expected_component_base_bits, quant_base_path)
         reconstructed = reconstruct_scheme_b_cache_item(quant_payload, delta_payload=delta_payload, load_delta=True)
         _assert_shape_match(full_payload, reconstructed, quant_base_path)
         checked += 1

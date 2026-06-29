@@ -17,6 +17,12 @@ def _normalize_bits(bits: int) -> int:
     return bits
 
 
+def _effective_bits(bits: Optional[int], fallback_bits: int) -> int:
+    if bits is None:
+        return _normalize_bits(fallback_bits)
+    return _normalize_bits(bits)
+
+
 def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).replace("torch.", "")
 
@@ -195,15 +201,30 @@ def reconstruct_base_delta_tensor(
     return base.to(dtype=original_dtype).contiguous()
 
 
-def _quantize_kv_list(text_kv, base_bits: int, delta_bits: int, fake_quant: bool):
+def _quantize_kv_list(
+    text_kv,
+    key_base_bits: int,
+    value_base_bits: int,
+    key_delta_bits: int,
+    value_delta_bits: int,
+    fake_quant: bool,
+):
     base_text_kv = []
     delta_text_kv = []
     for layer_kv in text_kv:
         base_key, delta_key = quantize_base_delta_tensor(
-            layer_kv["key"], base_bits=base_bits, delta_bits=delta_bits, channel_axis=-1, fake_quant=fake_quant
+            layer_kv["key"],
+            base_bits=key_base_bits,
+            delta_bits=key_delta_bits,
+            channel_axis=-1,
+            fake_quant=fake_quant,
         )
         base_value, delta_value = quantize_base_delta_tensor(
-            layer_kv["value"], base_bits=base_bits, delta_bits=delta_bits, channel_axis=-1, fake_quant=fake_quant
+            layer_kv["value"],
+            base_bits=value_base_bits,
+            delta_bits=value_delta_bits,
+            channel_axis=-1,
+            fake_quant=fake_quant,
         )
         base_text_kv.append({"key": base_key, "value": base_value})
         delta_text_kv.append({"key": delta_key, "value": delta_value})
@@ -214,18 +235,37 @@ def quantize_scheme_b_cache_item(
     cache_item: Dict,
     base_bits: int = 8,
     delta_bits: int = 4,
+    memory_base_bits: Optional[int] = None,
+    key_base_bits: Optional[int] = None,
+    value_base_bits: Optional[int] = None,
+    memory_delta_bits: Optional[int] = None,
+    key_delta_bits: Optional[int] = None,
+    value_delta_bits: Optional[int] = None,
     static_tier: str = "low",
     fake_quant: bool = True,
 ) -> Tuple[Dict, Dict]:
+    base_bits = _normalize_bits(base_bits)
+    delta_bits = _normalize_bits(delta_bits)
+    memory_base_bits = _effective_bits(memory_base_bits, base_bits)
+    key_base_bits = _effective_bits(key_base_bits, base_bits)
+    value_base_bits = _effective_bits(value_base_bits, base_bits)
+    memory_delta_bits = _effective_bits(memory_delta_bits, delta_bits)
+    key_delta_bits = _effective_bits(key_delta_bits, delta_bits)
+    value_delta_bits = _effective_bits(value_delta_bits, delta_bits)
     memory_base, memory_delta = quantize_base_delta_tensor(
         cache_item["memory_state"],
-        base_bits=base_bits,
-        delta_bits=delta_bits,
+        base_bits=memory_base_bits,
+        delta_bits=memory_delta_bits,
         channel_axis=-1,
         fake_quant=fake_quant,
     )
     text_kv_base, text_kv_delta = _quantize_kv_list(
-        cache_item["text_kv"], base_bits=base_bits, delta_bits=delta_bits, fake_quant=fake_quant
+        cache_item["text_kv"],
+        key_base_bits=key_base_bits,
+        value_base_bits=value_base_bits,
+        key_delta_bits=key_delta_bits,
+        value_delta_bits=value_delta_bits,
+        fake_quant=fake_quant,
     )
     base_payload = {
         "cache_format": QUANT_BASE_FORMAT,
@@ -237,6 +277,12 @@ def quantize_scheme_b_cache_item(
         "delta_bits": int(delta_bits),
         "fake_quant": bool(fake_quant),
         "static_tier": static_tier,
+        "memory_base_bits": int(memory_base_bits),
+        "key_base_bits": int(key_base_bits),
+        "value_base_bits": int(value_base_bits),
+        "memory_delta_bits": int(memory_delta_bits),
+        "key_delta_bits": int(key_delta_bits),
+        "value_delta_bits": int(value_delta_bits),
         "memory_state": memory_base,
         "text_kv": text_kv_base,
         "has_delta": memory_delta is not None,
@@ -246,6 +292,9 @@ def quantize_scheme_b_cache_item(
         "text_len": cache_item["text_len"],
         "mem_size": cache_item["mem_size"],
         "delta_bits": int(delta_bits),
+        "memory_delta_bits": int(memory_delta_bits),
+        "key_delta_bits": int(key_delta_bits),
+        "value_delta_bits": int(value_delta_bits),
         "memory_state": memory_delta,
         "text_kv": text_kv_delta,
     }
@@ -256,13 +305,19 @@ def reconstruct_scheme_b_cache_item(
     base_payload: Dict,
     delta_payload: Optional[Dict] = None,
     load_delta: bool = True,
+    load_memory_delta: bool = True,
+    load_key_delta: bool = True,
+    load_value_delta: bool = True,
     dtype: Optional[torch.dtype] = None,
 ) -> Dict:
     should_load_delta = load_delta and delta_payload is not None and bool(base_payload.get("has_delta", True))
+    should_load_memory_delta = should_load_delta and bool(load_memory_delta)
+    should_load_key_delta = should_load_delta and bool(load_key_delta)
+    should_load_value_delta = should_load_delta and bool(load_value_delta)
     memory_state = reconstruct_base_delta_tensor(
         base_payload["memory_state"],
-        None if not should_load_delta else delta_payload.get("memory_state"),
-        load_delta=should_load_delta,
+        None if not should_load_memory_delta else delta_payload.get("memory_state"),
+        load_delta=should_load_memory_delta,
         dtype=dtype,
     )
     text_kv = []
@@ -275,13 +330,13 @@ def reconstruct_scheme_b_cache_item(
                 "key": reconstruct_base_delta_tensor(
                     layer_base["key"],
                     None if layer_delta is None else layer_delta.get("key"),
-                    load_delta=should_load_delta,
+                    load_delta=should_load_key_delta,
                     dtype=dtype,
                 ),
                 "value": reconstruct_base_delta_tensor(
                     layer_base["value"],
                     None if layer_delta is None else layer_delta.get("value"),
-                    load_delta=should_load_delta,
+                    load_delta=should_load_value_delta,
                     dtype=dtype,
                 ),
             }

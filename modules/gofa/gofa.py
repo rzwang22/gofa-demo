@@ -26,6 +26,7 @@ from modules.gofa.cache_policy import (
 from modules.gofa.cache_quant import (
     QUANT_BASE_FORMAT,
     QUANT_DELTA_FORMAT,
+    estimate_quantized_tensor_bits,
     reconstruct_scheme_b_cache_item,
 )
 from modules.gofa.activation_quant import (
@@ -106,6 +107,12 @@ class ModelArguments:
     scheme_b_quant_enabled: Optional[bool] = field(default=None)
     scheme_b_quant_base_bits: Optional[int] = field(default=None)
     scheme_b_quant_delta_bits: Optional[int] = field(default=None)
+    scheme_b_quant_memory_base_bits: Optional[int] = field(default=None)
+    scheme_b_quant_key_base_bits: Optional[int] = field(default=None)
+    scheme_b_quant_value_base_bits: Optional[int] = field(default=None)
+    scheme_b_quant_memory_delta_bits: Optional[int] = field(default=None)
+    scheme_b_quant_key_delta_bits: Optional[int] = field(default=None)
+    scheme_b_quant_value_delta_bits: Optional[int] = field(default=None)
     scheme_b_quant_static_high_ratio: Optional[float] = field(default=None)
     scheme_b_quant_static_mid_ratio: Optional[float] = field(default=None)
     scheme_b_quant_target_aware_delta: Optional[bool] = field(default=None)
@@ -119,6 +126,9 @@ class ModelArguments:
     scheme_b_quant_fake_quant: Optional[bool] = field(default=None)
     scheme_b_quant_debug_zero_base: Optional[bool] = field(default=None)
     scheme_b_quant_strict: Optional[bool] = field(default=None)
+    scheme_b_quant_load_memory_delta: Optional[bool] = field(default=None)
+    scheme_b_quant_load_key_delta: Optional[bool] = field(default=None)
+    scheme_b_quant_load_value_delta: Optional[bool] = field(default=None)
     scheme_b_weight_quant: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_weight_quant_enabled: Optional[bool] = field(default=None)
     scheme_b_weight_quant_bits: Optional[int] = field(default=None)
@@ -425,6 +435,12 @@ class GOFAMistral(torch.nn.Module):
                         f"dir={self._encoder_quant_cache_root()}, "
                         f"base_bits={self.scheme_b_quant['base_bits']}, "
                         f"delta_bits={self.scheme_b_quant['delta_bits']}, "
+                        f"memory_base_bits={self.scheme_b_quant['memory_base_bits']}, "
+                        f"key_base_bits={self.scheme_b_quant['key_base_bits']}, "
+                        f"value_base_bits={self.scheme_b_quant['value_base_bits']}, "
+                        f"memory_delta_bits={self.scheme_b_quant['memory_delta_bits']}, "
+                        f"key_delta_bits={self.scheme_b_quant['key_delta_bits']}, "
+                        f"value_delta_bits={self.scheme_b_quant['value_delta_bits']}, "
                         f"target_aware_delta={self.scheme_b_quant['target_aware_delta']}, "
                         f"target_aware_policy={self.scheme_b_quant['target_aware_policy']}, "
                         f"target_delta_hops={self.scheme_b_quant['target_delta_hops']}, "
@@ -432,6 +448,9 @@ class GOFAMistral(torch.nn.Module):
                         f"local_degree_top_ratio={self.scheme_b_quant['local_degree_top_ratio']}, "
                         f"local_degree_threshold={self.scheme_b_quant['local_degree_threshold']}, "
                         f"max_delta_items_per_batch={self.scheme_b_quant['max_delta_items_per_batch']}, "
+                        f"load_memory_delta={self.scheme_b_quant['load_memory_delta']}, "
+                        f"load_key_delta={self.scheme_b_quant['load_key_delta']}, "
+                        f"load_value_delta={self.scheme_b_quant['load_value_delta']}, "
                         f"fake_quant={self.scheme_b_quant['fake_quant']}, "
                         f"debug_zero_base={self.scheme_b_quant['debug_zero_base']}, "
                         f"strict={self.scheme_b_quant['strict']}"
@@ -552,6 +571,12 @@ class GOFAMistral(torch.nn.Module):
             "enabled": False,
             "base_bits": 8,
             "delta_bits": 4,
+            "memory_base_bits": None,
+            "key_base_bits": None,
+            "value_base_bits": None,
+            "memory_delta_bits": None,
+            "key_delta_bits": None,
+            "value_delta_bits": None,
             "static_high_ratio": 0.10,
             "static_mid_ratio": 0.40,
             "target_aware_delta": True,
@@ -565,6 +590,9 @@ class GOFAMistral(torch.nn.Module):
             "fake_quant": True,
             "debug_zero_base": False,
             "strict": True,
+            "load_memory_delta": True,
+            "load_key_delta": True,
+            "load_value_delta": True,
         }
         nested = getattr(model_args, "scheme_b_quant", None)
         if isinstance(nested, dict):
@@ -573,6 +601,12 @@ class GOFAMistral(torch.nn.Module):
             "enabled": "scheme_b_quant_enabled",
             "base_bits": "scheme_b_quant_base_bits",
             "delta_bits": "scheme_b_quant_delta_bits",
+            "memory_base_bits": "scheme_b_quant_memory_base_bits",
+            "key_base_bits": "scheme_b_quant_key_base_bits",
+            "value_base_bits": "scheme_b_quant_value_base_bits",
+            "memory_delta_bits": "scheme_b_quant_memory_delta_bits",
+            "key_delta_bits": "scheme_b_quant_key_delta_bits",
+            "value_delta_bits": "scheme_b_quant_value_delta_bits",
             "static_high_ratio": "scheme_b_quant_static_high_ratio",
             "static_mid_ratio": "scheme_b_quant_static_mid_ratio",
             "target_aware_delta": "scheme_b_quant_target_aware_delta",
@@ -586,6 +620,9 @@ class GOFAMistral(torch.nn.Module):
             "fake_quant": "scheme_b_quant_fake_quant",
             "debug_zero_base": "scheme_b_quant_debug_zero_base",
             "strict": "scheme_b_quant_strict",
+            "load_memory_delta": "scheme_b_quant_load_memory_delta",
+            "load_key_delta": "scheme_b_quant_load_key_delta",
+            "load_value_delta": "scheme_b_quant_load_value_delta",
         }
         for cfg_key, field_name in direct_fields.items():
             value = getattr(model_args, field_name, None)
@@ -594,6 +631,20 @@ class GOFAMistral(torch.nn.Module):
         cfg["enabled"] = bool(cfg["enabled"])
         cfg["base_bits"] = int(cfg["base_bits"])
         cfg["delta_bits"] = int(cfg["delta_bits"])
+        for bits_key, fallback_key in (
+            ("memory_base_bits", "base_bits"),
+            ("key_base_bits", "base_bits"),
+            ("value_base_bits", "base_bits"),
+            ("memory_delta_bits", "delta_bits"),
+            ("key_delta_bits", "delta_bits"),
+            ("value_delta_bits", "delta_bits"),
+        ):
+            value = cfg[bits_key]
+            if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+                value = None
+            cfg[bits_key] = int(cfg[fallback_key]) if value is None else int(value)
+            if cfg[bits_key] not in {2, 4, 8, 16}:
+                raise ValueError(f"scheme_b_quant.{bits_key} must be one of 2, 4, 8, 16.")
         cfg["static_high_ratio"] = float(cfg["static_high_ratio"])
         cfg["static_mid_ratio"] = float(cfg["static_mid_ratio"])
         cfg["target_aware_delta"] = bool(cfg["target_aware_delta"])
@@ -624,6 +675,9 @@ class GOFAMistral(torch.nn.Module):
         cfg["fake_quant"] = bool(cfg["fake_quant"])
         cfg["debug_zero_base"] = bool(cfg["debug_zero_base"])
         cfg["strict"] = bool(cfg["strict"])
+        cfg["load_memory_delta"] = bool(cfg["load_memory_delta"])
+        cfg["load_key_delta"] = bool(cfg["load_key_delta"])
+        cfg["load_value_delta"] = bool(cfg["load_value_delta"])
         return cfg
 
     def _normalize_encoder_cache_manifest_config(self, model_args):
@@ -1045,7 +1099,27 @@ class GOFAMistral(torch.nn.Module):
     def _encoder_quant_cache_root(self):
         if self.scheme_b_quant.get("cache_dir"):
             return self.scheme_b_quant["cache_dir"]
-        suffix = f"_quant_b{self.scheme_b_quant['base_bits']}d{self.scheme_b_quant['delta_bits']}"
+        uniform_base = (
+            self.scheme_b_quant["memory_base_bits"] == self.scheme_b_quant["base_bits"] and
+            self.scheme_b_quant["key_base_bits"] == self.scheme_b_quant["base_bits"] and
+            self.scheme_b_quant["value_base_bits"] == self.scheme_b_quant["base_bits"]
+        )
+        uniform_delta = (
+            self.scheme_b_quant["memory_delta_bits"] == self.scheme_b_quant["delta_bits"] and
+            self.scheme_b_quant["key_delta_bits"] == self.scheme_b_quant["delta_bits"] and
+            self.scheme_b_quant["value_delta_bits"] == self.scheme_b_quant["delta_bits"]
+        )
+        if uniform_base and uniform_delta:
+            suffix = f"_quant_b{self.scheme_b_quant['base_bits']}d{self.scheme_b_quant['delta_bits']}"
+        else:
+            suffix = (
+                f"_quant_m{self.scheme_b_quant['memory_base_bits']}"
+                f"k{self.scheme_b_quant['key_base_bits']}"
+                f"v{self.scheme_b_quant['value_base_bits']}"
+                f"_dm{self.scheme_b_quant['memory_delta_bits']}"
+                f"dk{self.scheme_b_quant['key_delta_bits']}"
+                f"dv{self.scheme_b_quant['value_delta_bits']}"
+            )
         return self.encoder_cache_dir.rstrip(os.sep) + suffix
 
     def _encoder_quant_cache_tag_root(self, delta=False):
@@ -1069,6 +1143,33 @@ class GOFAMistral(torch.nn.Module):
                 "GOFA scheme-B quant strict mode requires quant cache tag directory to exist: "
                 f"{quant_tag_root}"
             )
+
+    def _scheme_b_payload_component_bits(self, payload, prefix):
+        if prefix == "base":
+            fallback_key = "base_bits"
+            component_keys = ("memory_base_bits", "key_base_bits", "value_base_bits")
+        elif prefix == "delta":
+            fallback_key = "delta_bits"
+            component_keys = ("memory_delta_bits", "key_delta_bits", "value_delta_bits")
+        else:
+            raise ValueError(f"Unsupported scheme-B quant bit prefix: {prefix}")
+        fallback_value = payload.get(fallback_key)
+        return {
+            key: int(payload.get(key, fallback_value if fallback_value is not None else -1))
+            for key in component_keys
+        }
+
+    def _scheme_b_quant_component_bits_match(self, payload, prefix):
+        payload_bits = self._scheme_b_payload_component_bits(payload, prefix)
+        mismatches = {}
+        for key, payload_value in payload_bits.items():
+            configured_value = int(self.scheme_b_quant[key])
+            if int(payload_value) != configured_value:
+                mismatches[key] = {
+                    "payload": int(payload_value),
+                    "configured": configured_value,
+                }
+        return mismatches
 
     def _encoder_cache_key(self, token_ids):
         token_bytes = np.asarray(token_ids, dtype=np.int32).tobytes()
@@ -1513,12 +1614,19 @@ class GOFAMistral(torch.nn.Module):
                     f"cache_format={payload.get('cache_format')}, expected={QUANT_BASE_FORMAT}"
                 )
             return None, cache_key, cache_size, "format_error"
-        if int(payload.get("base_bits", -1)) != int(self.scheme_b_quant["base_bits"]):
+        bit_mismatches = self._scheme_b_quant_component_bits_match(payload, "base")
+        if bit_mismatches:
             if strict:
                 raise RuntimeError(
-                    "GOFA scheme-B quant strict mode found mismatched base_bits: "
+                    "GOFA scheme-B quant strict mode found mismatched quant base component bits: "
                     f"cache_key={cache_key}, path={cache_path}, "
-                    f"payload_base_bits={payload.get('base_bits')}, configured_base_bits={self.scheme_b_quant['base_bits']}"
+                    f"payload_base_bits={payload.get('base_bits')}, "
+                    f"payload_component_bits={self._scheme_b_payload_component_bits(payload, 'base')}, "
+                    f"configured_component_bits={{"
+                    f"'memory_base_bits': {self.scheme_b_quant['memory_base_bits']}, "
+                    f"'key_base_bits': {self.scheme_b_quant['key_base_bits']}, "
+                    f"'value_base_bits': {self.scheme_b_quant['value_base_bits']}"
+                    f"}}, mismatches={bit_mismatches}"
                 )
             return None, cache_key, cache_size, "format_error"
         if payload.get("cache_key") != cache_key or payload.get("seq_len") != len(token_ids):
@@ -1575,6 +1683,8 @@ class GOFAMistral(torch.nn.Module):
             return None, cache_size, "missing"
         if payload.get("mem_size") != self.mem_size:
             return None, cache_size, "missing"
+        if self._scheme_b_quant_component_bits_match(payload, "delta"):
+            return None, cache_size, "missing"
         return payload, cache_size, "hit"
 
     def _save_encoder_memory_kv_cache_item(self, cache_key, token_ids, cache_item):
@@ -1627,7 +1737,34 @@ class GOFAMistral(torch.nn.Module):
             "online_compute_count_under_quant": 0,
             "quant_base_loaded_bytes": 0,
             "quant_delta_loaded_bytes": 0,
+            "memory_delta_load_count": 0,
+            "key_delta_load_count": 0,
+            "value_delta_load_count": 0,
+            "memory_delta_loaded_bytes": 0,
+            "key_delta_loaded_bytes": 0,
+            "value_delta_loaded_bytes": 0,
         }
+
+    def _scheme_b_quant_bytes_from_bits(self, bit_count):
+        return (int(bit_count) + 7) // 8
+
+    def _scheme_b_quant_delta_component_bytes(self, delta_payload):
+        component_bytes = {"memory": 0, "key": 0, "value": 0}
+        if not isinstance(delta_payload, dict):
+            return component_bytes
+        component_bytes["memory"] = self._scheme_b_quant_bytes_from_bits(
+            estimate_quantized_tensor_bits(delta_payload.get("memory_state"))
+        )
+        for layer_delta in delta_payload.get("text_kv", []):
+            if not isinstance(layer_delta, dict):
+                continue
+            component_bytes["key"] += self._scheme_b_quant_bytes_from_bits(
+                estimate_quantized_tensor_bits(layer_delta.get("key"))
+            )
+            component_bytes["value"] += self._scheme_b_quant_bytes_from_bits(
+                estimate_quantized_tensor_bits(layer_delta.get("value"))
+            )
+        return component_bytes
 
     def _add_scheme_b_quant_stats(self, current):
         for key, value in current.items():
@@ -2306,7 +2443,16 @@ class GOFAMistral(torch.nn.Module):
                 if base_payload is None:
                     continue
                 delta_payload = None
-                if load_policy[i] == BASE_DELTA and base_payload.get("has_delta", True):
+                should_load_selected_delta = (
+                    load_policy[i] == BASE_DELTA and
+                    base_payload.get("has_delta", True) and
+                    (
+                        self.scheme_b_quant["load_memory_delta"] or
+                        self.scheme_b_quant["load_key_delta"] or
+                        self.scheme_b_quant["load_value_delta"]
+                    )
+                )
+                if should_load_selected_delta:
                     delta_start = time.perf_counter()
                     delta_payload, delta_size, delta_status = self._load_encoder_quant_memory_kv_delta_payload(quant_cache_keys[i])
                     current_timing["delta_load_s"] += time.perf_counter() - delta_start
@@ -2314,6 +2460,16 @@ class GOFAMistral(torch.nn.Module):
                         current_quant_stats["quant_delta_cache_hit"] += 1
                         current_quant_stats["quant_delta_loaded_bytes"] += delta_size
                         current_timing["cache_size_bytes"] += delta_size
+                        component_bytes = self._scheme_b_quant_delta_component_bytes(delta_payload)
+                        if self.scheme_b_quant["load_memory_delta"] and component_bytes["memory"] > 0:
+                            current_quant_stats["memory_delta_load_count"] += 1
+                            current_quant_stats["memory_delta_loaded_bytes"] += component_bytes["memory"]
+                        if self.scheme_b_quant["load_key_delta"] and component_bytes["key"] > 0:
+                            current_quant_stats["key_delta_load_count"] += 1
+                            current_quant_stats["key_delta_loaded_bytes"] += component_bytes["key"]
+                        if self.scheme_b_quant["load_value_delta"] and component_bytes["value"] > 0:
+                            current_quant_stats["value_delta_load_count"] += 1
+                            current_quant_stats["value_delta_loaded_bytes"] += component_bytes["value"]
                     else:
                         current_quant_stats["quant_delta_cache_missing"] += 1
                         if strict_quant:
@@ -2329,6 +2485,9 @@ class GOFAMistral(torch.nn.Module):
                         base_payload,
                         delta_payload=delta_payload,
                         load_delta=load_policy[i] == BASE_DELTA,
+                        load_memory_delta=self.scheme_b_quant["load_memory_delta"],
+                        load_key_delta=self.scheme_b_quant["load_key_delta"],
+                        load_value_delta=self.scheme_b_quant["load_value_delta"],
                     )
                     current_quant_stats["quant_reconstruct_count"] += 1
                     current_timing["dequant_s"] += time.perf_counter() - dequant_start
@@ -2374,7 +2533,13 @@ class GOFAMistral(torch.nn.Module):
                     f"selected_edge_item_idx={policy_details['edge_item_indices']}, "
                     f"quant_base_cache_hit={current_quant_stats['quant_base_cache_hit']}, "
                     f"quant_delta_cache_hit={current_quant_stats['quant_delta_cache_hit']}, "
-                    f"delta_loaded_bytes={current_quant_stats['quant_delta_loaded_bytes']}"
+                    f"delta_loaded_bytes={current_quant_stats['quant_delta_loaded_bytes']}, "
+                    f"memory_delta_load_count={current_quant_stats['memory_delta_load_count']}, "
+                    f"key_delta_load_count={current_quant_stats['key_delta_load_count']}, "
+                    f"value_delta_load_count={current_quant_stats['value_delta_load_count']}, "
+                    f"memory_delta_loaded_bytes={current_quant_stats['memory_delta_loaded_bytes']}, "
+                    f"key_delta_loaded_bytes={current_quant_stats['key_delta_loaded_bytes']}, "
+                    f"value_delta_loaded_bytes={current_quant_stats['value_delta_loaded_bytes']}"
                 )
 
         if self.scheme_b_quant_enabled:

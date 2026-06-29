@@ -109,6 +109,12 @@ def main(params):
         "scheme_b_quant_enabled",
         "scheme_b_quant_base_bits",
         "scheme_b_quant_delta_bits",
+        "scheme_b_quant_memory_base_bits",
+        "scheme_b_quant_key_base_bits",
+        "scheme_b_quant_value_base_bits",
+        "scheme_b_quant_memory_delta_bits",
+        "scheme_b_quant_key_delta_bits",
+        "scheme_b_quant_value_delta_bits",
         "scheme_b_quant_static_high_ratio",
         "scheme_b_quant_static_mid_ratio",
         "scheme_b_quant_target_aware_delta",
@@ -122,6 +128,9 @@ def main(params):
         "scheme_b_quant_fake_quant",
         "scheme_b_quant_debug_zero_base",
         "scheme_b_quant_strict",
+        "scheme_b_quant_load_memory_delta",
+        "scheme_b_quant_load_key_delta",
+        "scheme_b_quant_load_value_delta",
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))

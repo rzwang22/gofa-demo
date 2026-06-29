@@ -17,6 +17,12 @@ scheme_b_quant:
   enabled: False
   base_bits: 8
   delta_bits: 4
+  memory_base_bits:
+  key_base_bits:
+  value_base_bits:
+  memory_delta_bits:
+  key_delta_bits:
+  value_delta_bits:
   static_high_ratio: 0.1
   static_mid_ratio: 0.4
   target_aware_delta: True
@@ -30,6 +36,9 @@ scheme_b_quant:
   fake_quant: True
   debug_zero_base: False
   strict: True
+  load_memory_delta: True
+  load_key_delta: True
+  load_value_delta: True
 scheme_b_weight_quant:
   enabled: False
   bits: 4

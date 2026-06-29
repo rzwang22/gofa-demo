@@ -29,6 +29,32 @@ python scripts/quantize_scheme_b_cache.py \
   --delta-bits 4
 ```
 
+Component bit-width experiments keep `base_bits` and `delta_bits` as defaults, then override memory, key, or value:
+
+```bash
+# m2k4v4: memory_state base is 2-bit, text-side K/V base stay 4-bit.
+python scripts/quantize_scheme_b_cache.py \
+  --input-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  --output-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m2k4v4d4 \
+  --manifest /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/manifest/cora_link_twolevel.json \
+  --base-bits 4 \
+  --delta-bits 4 \
+  --memory-base-bits 2 \
+  --key-base-bits 4 \
+  --value-base-bits 4
+
+# m4k4v2: text-side value base is 2-bit.
+python scripts/quantize_scheme_b_cache.py \
+  --input-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  --output-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v2d4 \
+  --manifest /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/manifest/cora_link_twolevel.json \
+  --base-bits 4 \
+  --delta-bits 4 \
+  --memory-base-bits 4 \
+  --key-base-bits 4 \
+  --value-base-bits 2
+```
+
 Output layout matches strict runtime:
 
 ```text
@@ -47,6 +73,20 @@ python scripts/check_scheme_b_quant_cache.py \
   --max-items 10
 ```
 
+For component cache checks, pass the expected component base bits:
+
+```bash
+python scripts/check_scheme_b_quant_cache.py \
+  --full-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  --quant-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m2k4v4d4 \
+  --manifest /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/manifest/cora_link_twolevel.json \
+  --base-bits 4 \
+  --memory-base-bits 2 \
+  --key-base-bits 4 \
+  --value-base-bits 4 \
+  --max-items 10
+```
+
 ## 4. Run Strict Quant Inference
 
 ```bash
@@ -59,6 +99,26 @@ python run_gofa.py --override configs/inference_config.yaml \
   scheme_b_quant_base_bits 2 \
   scheme_b_quant_delta_bits 4 \
   scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_node_b2d4
+```
+
+For component bit-width cache:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_strict True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_memory_base_bits 2 \
+  scheme_b_quant_key_base_bits 4 \
+  scheme_b_quant_value_base_bits 4 \
+  scheme_b_quant_memory_delta_bits 4 \
+  scheme_b_quant_key_delta_bits 4 \
+  scheme_b_quant_value_delta_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m2k4v4d4
 ```
 
 If a different task accesses cache items outside this manifest-specific quant cache, strict mode should raise on the missing quant base item instead of falling back.
@@ -539,6 +599,17 @@ Cache policy matrix:
 6. Cache2bit + target-1hop delta + fixed compute: `scheme_b_quant_target_aware_policy target_1hop`
 7. Cache2bit + target-1hop-local-degree delta + fixed compute: `scheme_b_quant_target_aware_policy target_1hop_local_degree`
 
+Component base-only matrix:
+
+1. m4k4v4: `scheme_b_quant_memory_base_bits 4`, `scheme_b_quant_key_base_bits 4`, `scheme_b_quant_value_base_bits 4`
+2. m2k4v4: `scheme_b_quant_memory_base_bits 2`, `scheme_b_quant_key_base_bits 4`, `scheme_b_quant_value_base_bits 4`
+3. m4k2v4: `scheme_b_quant_memory_base_bits 4`, `scheme_b_quant_key_base_bits 2`, `scheme_b_quant_value_base_bits 4`
+4. m4k4v2: `scheme_b_quant_memory_base_bits 4`, `scheme_b_quant_key_base_bits 4`, `scheme_b_quant_value_base_bits 2`
+5. m2k2v4: `scheme_b_quant_memory_base_bits 2`, `scheme_b_quant_key_base_bits 2`, `scheme_b_quant_value_base_bits 4`
+6. m2k4v2: `scheme_b_quant_memory_base_bits 2`, `scheme_b_quant_key_base_bits 4`, `scheme_b_quant_value_base_bits 2`
+7. m4k2v2: `scheme_b_quant_memory_base_bits 4`, `scheme_b_quant_key_base_bits 2`, `scheme_b_quant_value_base_bits 2`
+8. m2k2v2: `scheme_b_quant_memory_base_bits 2`, `scheme_b_quant_key_base_bits 2`, `scheme_b_quant_value_base_bits 2`
+
 Example cache2bit + target-1hop policy:
 
 ```bash
@@ -594,6 +665,45 @@ For the all-delta upper bound, change only:
 
 ```bash
 scheme_b_quant_target_aware_policy all_delta
+```
+
+For m2k2v2 component-only delta upper bounds, keep `scheme_b_quant_target_aware_policy all_delta` and toggle the three load flags:
+
+```bash
+# memory delta only
+scheme_b_quant_load_memory_delta True
+scheme_b_quant_load_key_delta False
+scheme_b_quant_load_value_delta False
+
+# key delta only
+scheme_b_quant_load_memory_delta False
+scheme_b_quant_load_key_delta True
+scheme_b_quant_load_value_delta False
+
+# value delta only
+scheme_b_quant_load_memory_delta False
+scheme_b_quant_load_key_delta False
+scheme_b_quant_load_value_delta True
+
+# memory + key
+scheme_b_quant_load_memory_delta True
+scheme_b_quant_load_key_delta True
+scheme_b_quant_load_value_delta False
+
+# memory + value
+scheme_b_quant_load_memory_delta True
+scheme_b_quant_load_key_delta False
+scheme_b_quant_load_value_delta True
+
+# key + value
+scheme_b_quant_load_memory_delta False
+scheme_b_quant_load_key_delta True
+scheme_b_quant_load_value_delta True
+
+# memory + key + value
+scheme_b_quant_load_memory_delta True
+scheme_b_quant_load_key_delta True
+scheme_b_quant_load_value_delta True
 ```
 
 For local-degree union with target 1-hop, use:

@@ -336,6 +336,40 @@ def _metadata_from_manifest(item: Dict[str, Any]) -> Dict[str, Any]:
     return {field: item.get(field) for field in METADATA_FIELDS}
 
 
+def _quant_bit_metadata(base_payload: Optional[Dict], delta_payload: Optional[Dict]) -> Dict[str, Any]:
+    metadata = {
+        "memory_base_bits": None,
+        "key_base_bits": None,
+        "value_base_bits": None,
+        "memory_delta_bits": None,
+        "key_delta_bits": None,
+        "value_delta_bits": None,
+    }
+    if base_payload is not None:
+        base_bits = base_payload.get("base_bits")
+        delta_bits = base_payload.get("delta_bits")
+        metadata.update(
+            {
+                "memory_base_bits": base_payload.get("memory_base_bits", base_bits),
+                "key_base_bits": base_payload.get("key_base_bits", base_bits),
+                "value_base_bits": base_payload.get("value_base_bits", base_bits),
+                "memory_delta_bits": base_payload.get("memory_delta_bits", delta_bits),
+                "key_delta_bits": base_payload.get("key_delta_bits", delta_bits),
+                "value_delta_bits": base_payload.get("value_delta_bits", delta_bits),
+            }
+        )
+    if delta_payload is not None:
+        delta_bits = delta_payload.get("delta_bits")
+        metadata.update(
+            {
+                "memory_delta_bits": delta_payload.get("memory_delta_bits", metadata["memory_delta_bits"] or delta_bits),
+                "key_delta_bits": delta_payload.get("key_delta_bits", metadata["key_delta_bits"] or delta_bits),
+                "value_delta_bits": delta_payload.get("value_delta_bits", metadata["value_delta_bits"] or delta_bits),
+            }
+        )
+    return metadata
+
+
 def _safe_cache_key(cache_key: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in str(cache_key))[:32]
 
@@ -545,6 +579,7 @@ def main():
                 "quant_delta_exists": quant_delta_path.exists() if quant_delta_path is not None else False,
             }
         )
+        metadata.update(_quant_bit_metadata(base_payload, delta_payload))
         tensors = _collect_tensor_versions(
             full_payload,
             base_item,
