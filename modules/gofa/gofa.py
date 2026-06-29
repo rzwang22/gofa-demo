@@ -118,6 +118,10 @@ class ModelArguments:
     scheme_b_activation_quant_target: Optional[str] = field(default=None)
     scheme_b_activation_quant_fake_quant: Optional[bool] = field(default=None)
     scheme_b_activation_quant_quantize_attention: Optional[bool] = field(default=None)
+    scheme_b_activation_quant_quantize_q_proj: Optional[bool] = field(default=None)
+    scheme_b_activation_quant_quantize_k_proj: Optional[bool] = field(default=None)
+    scheme_b_activation_quant_quantize_v_proj: Optional[bool] = field(default=None)
+    scheme_b_activation_quant_quantize_o_proj: Optional[bool] = field(default=None)
     scheme_b_activation_quant_quantize_mlp: Optional[bool] = field(default=None)
     scheme_b_activation_quant_quantize_qkv_outputs: Optional[bool] = field(default=None)
     scheme_b_activation_quant_quantize_attn_output: Optional[bool] = field(default=None)
@@ -278,6 +282,10 @@ class GOFAMistral(torch.nn.Module):
                 f"bits={self.scheme_b_activation_quant['bits']}, "
                 f"fake_quant={self.scheme_b_activation_quant['fake_quant']}, "
                 f"quantize_attention={self.scheme_b_activation_quant['quantize_attention']}, "
+                f"quantize_q_proj={self.scheme_b_activation_quant['quantize_q_proj']}, "
+                f"quantize_k_proj={self.scheme_b_activation_quant['quantize_k_proj']}, "
+                f"quantize_v_proj={self.scheme_b_activation_quant['quantize_v_proj']}, "
+                f"quantize_o_proj={self.scheme_b_activation_quant['quantize_o_proj']}, "
                 f"quantize_mlp={self.scheme_b_activation_quant['quantize_mlp']}, "
                 f"quantize_qkv_outputs={self.scheme_b_activation_quant['quantize_qkv_outputs']}, "
                 f"quantize_attn_output={self.scheme_b_activation_quant['quantize_attn_output']}, "
@@ -539,6 +547,10 @@ class GOFAMistral(torch.nn.Module):
             "target": "suffix_transformer",
             "fake_quant": True,
             "quantize_attention": True,
+            "quantize_q_proj": True,
+            "quantize_k_proj": True,
+            "quantize_v_proj": True,
+            "quantize_o_proj": True,
             "quantize_mlp": True,
             "quantize_layernorm": False,
             "log_quantized_modules": True,
@@ -598,6 +610,10 @@ class GOFAMistral(torch.nn.Module):
             "target": "scheme_b_activation_quant_target",
             "fake_quant": "scheme_b_activation_quant_fake_quant",
             "quantize_attention": "scheme_b_activation_quant_quantize_attention",
+            "quantize_q_proj": "scheme_b_activation_quant_quantize_q_proj",
+            "quantize_k_proj": "scheme_b_activation_quant_quantize_k_proj",
+            "quantize_v_proj": "scheme_b_activation_quant_quantize_v_proj",
+            "quantize_o_proj": "scheme_b_activation_quant_quantize_o_proj",
             "quantize_mlp": "scheme_b_activation_quant_quantize_mlp",
             "quantize_qkv_outputs": "scheme_b_activation_quant_quantize_qkv_outputs",
             "quantize_attn_output": "scheme_b_activation_quant_quantize_attn_output",
@@ -619,6 +635,15 @@ class GOFAMistral(torch.nn.Module):
             raise ValueError("scheme_b_activation_quant.target currently supports only 'suffix_transformer'.")
         cfg["fake_quant"] = bool(cfg["fake_quant"])
         cfg["quantize_attention"] = bool(cfg["quantize_attention"])
+        cfg["quantize_q_proj"] = bool(cfg["quantize_q_proj"])
+        cfg["quantize_k_proj"] = bool(cfg["quantize_k_proj"])
+        cfg["quantize_v_proj"] = bool(cfg["quantize_v_proj"])
+        cfg["quantize_o_proj"] = bool(cfg["quantize_o_proj"])
+        if not cfg["quantize_attention"]:
+            cfg["quantize_q_proj"] = False
+            cfg["quantize_k_proj"] = False
+            cfg["quantize_v_proj"] = False
+            cfg["quantize_o_proj"] = False
         cfg["quantize_mlp"] = bool(cfg["quantize_mlp"])
         cfg["quantize_qkv_outputs"] = bool(cfg["quantize_qkv_outputs"])
         cfg["quantize_attn_output"] = bool(cfg["quantize_attn_output"])
@@ -689,7 +714,13 @@ class GOFAMistral(torch.nn.Module):
             f"activation_quant_time_s={stats.get('activation_quant_time_s', 0.0):.6f}, "
             f"activation_effective_bits={stats.get('activation_effective_bits', 0)}, "
             f"per_token={self.scheme_b_activation_quant.get('per_token', True)}, "
-            f"clip_ratio={stats.get('clip_ratio', self.scheme_b_activation_quant.get('clip_ratio', 1.0))}"
+            f"clip_ratio={stats.get('clip_ratio', self.scheme_b_activation_quant.get('clip_ratio', 1.0))}, "
+            f"quantize_attention={self.scheme_b_activation_quant.get('quantize_attention', True)}, "
+            f"quantize_q_proj={self.scheme_b_activation_quant.get('quantize_q_proj', True)}, "
+            f"quantize_k_proj={self.scheme_b_activation_quant.get('quantize_k_proj', True)}, "
+            f"quantize_v_proj={self.scheme_b_activation_quant.get('quantize_v_proj', True)}, "
+            f"quantize_o_proj={self.scheme_b_activation_quant.get('quantize_o_proj', True)}, "
+            f"quantize_mlp={self.scheme_b_activation_quant.get('quantize_mlp', True)}"
         )
 
     def _build_encoder_cache_namespace(self, icae_path, model_args, training_args, gofa_args):

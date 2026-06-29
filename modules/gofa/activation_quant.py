@@ -87,6 +87,10 @@ class SuffixTransformerActivationQuantizer:
             bits: int = 8,
             fake_quant: bool = True,
             quantize_attention: bool = True,
+            quantize_q_proj: bool = True,
+            quantize_k_proj: bool = True,
+            quantize_v_proj: bool = True,
+            quantize_o_proj: bool = True,
             quantize_mlp: bool = True,
             quantize_qkv_outputs: bool = False,
             quantize_attn_output: bool = False,
@@ -99,6 +103,10 @@ class SuffixTransformerActivationQuantizer:
         self.bits = _normalize_bits(bits)
         self.fake_quant = bool(fake_quant)
         self.quantize_attention = bool(quantize_attention)
+        self.quantize_q_proj = self.quantize_attention and bool(quantize_q_proj)
+        self.quantize_k_proj = self.quantize_attention and bool(quantize_k_proj)
+        self.quantize_v_proj = self.quantize_attention and bool(quantize_v_proj)
+        self.quantize_o_proj = self.quantize_attention and bool(quantize_o_proj)
         self.quantize_mlp = bool(quantize_mlp)
         self.quantize_qkv_outputs = bool(quantize_qkv_outputs)
         self.quantize_attn_output = bool(quantize_attn_output)
@@ -140,7 +148,17 @@ class SuffixTransformerActivationQuantizer:
     def _target_paths(self) -> List[str]:
         paths = []
         if self.quantize_attention:
-            paths.extend(f"self_attn.{name}" for name in ATTENTION_PROJECTIONS)
+            attention_projection_flags = {
+                "q_proj": self.quantize_q_proj,
+                "k_proj": self.quantize_k_proj,
+                "v_proj": self.quantize_v_proj,
+                "o_proj": self.quantize_o_proj,
+            }
+            paths.extend(
+                f"self_attn.{name}"
+                for name in ATTENTION_PROJECTIONS
+                if attention_projection_flags.get(name, False)
+            )
         if self.quantize_mlp:
             paths.extend(f"mlp.{name}" for name in MLP_PROJECTIONS)
         return paths
@@ -214,7 +232,13 @@ class SuffixTransformerActivationQuantizer:
             "GOFA suffix activation quantization stats: "
             f"activation_quantized_module_count={self.stats['activation_quantized_module_count']}, "
             f"activation_effective_bits={self.stats['activation_effective_bits']}, "
-            f"per_token={self.per_token}, clip_ratio={self.clip_ratio}, target=suffix_transformer"
+            f"per_token={self.per_token}, clip_ratio={self.clip_ratio}, target=suffix_transformer, "
+            f"quantize_attention={self.quantize_attention}, "
+            f"quantize_q_proj={self.quantize_q_proj}, "
+            f"quantize_k_proj={self.quantize_k_proj}, "
+            f"quantize_v_proj={self.quantize_v_proj}, "
+            f"quantize_o_proj={self.quantize_o_proj}, "
+            f"quantize_mlp={self.quantize_mlp}"
         )
 
 
@@ -232,6 +256,10 @@ def maybe_create_suffix_transformer_activation_quantizer(
         bits=int(cfg.get("bits", 8)),
         fake_quant=bool(cfg.get("fake_quant", True)),
         quantize_attention=bool(cfg.get("quantize_attention", True)),
+        quantize_q_proj=bool(cfg.get("quantize_q_proj", True)),
+        quantize_k_proj=bool(cfg.get("quantize_k_proj", True)),
+        quantize_v_proj=bool(cfg.get("quantize_v_proj", True)),
+        quantize_o_proj=bool(cfg.get("quantize_o_proj", True)),
         quantize_mlp=bool(cfg.get("quantize_mlp", True)),
         quantize_qkv_outputs=bool(cfg.get("quantize_qkv_outputs", False)),
         quantize_attn_output=bool(cfg.get("quantize_attn_output", False)),

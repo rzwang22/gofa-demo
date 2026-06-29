@@ -252,3 +252,129 @@ python run_gofa.py --override configs/inference_config.yaml \
   scheme_b_activation_quant_per_token True \
   scheme_b_activation_quant_clip_ratio 1.0
 ```
+
+## Attention Projection Activation Ablation
+
+A4 q_proj only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_quantize_attention True \
+  scheme_b_activation_quant_quantize_q_proj True \
+  scheme_b_activation_quant_quantize_k_proj False \
+  scheme_b_activation_quant_quantize_v_proj False \
+  scheme_b_activation_quant_quantize_o_proj False \
+  scheme_b_activation_quant_quantize_mlp False
+```
+
+A4 k_proj only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_quantize_attention True \
+  scheme_b_activation_quant_quantize_q_proj False \
+  scheme_b_activation_quant_quantize_k_proj True \
+  scheme_b_activation_quant_quantize_v_proj False \
+  scheme_b_activation_quant_quantize_o_proj False \
+  scheme_b_activation_quant_quantize_mlp False
+```
+
+A4 v_proj only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_quantize_attention True \
+  scheme_b_activation_quant_quantize_q_proj False \
+  scheme_b_activation_quant_quantize_k_proj False \
+  scheme_b_activation_quant_quantize_v_proj True \
+  scheme_b_activation_quant_quantize_o_proj False \
+  scheme_b_activation_quant_quantize_mlp False
+```
+
+A4 o_proj only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_quantize_attention True \
+  scheme_b_activation_quant_quantize_q_proj False \
+  scheme_b_activation_quant_quantize_k_proj False \
+  scheme_b_activation_quant_quantize_v_proj False \
+  scheme_b_activation_quant_quantize_o_proj True \
+  scheme_b_activation_quant_quantize_mlp False
+```
+
+A4 q+k only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_quantize_attention True \
+  scheme_b_activation_quant_quantize_q_proj True \
+  scheme_b_activation_quant_quantize_k_proj True \
+  scheme_b_activation_quant_quantize_v_proj False \
+  scheme_b_activation_quant_quantize_o_proj False \
+  scheme_b_activation_quant_quantize_mlp False
+```
+
+A4 v+o only:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_quantize_attention True \
+  scheme_b_activation_quant_quantize_q_proj False \
+  scheme_b_activation_quant_quantize_k_proj False \
+  scheme_b_activation_quant_quantize_v_proj True \
+  scheme_b_activation_quant_quantize_o_proj True \
+  scheme_b_activation_quant_quantize_mlp False
+```
+
+Mixed precision target configuration:
+
+Current config has one activation bit-width per run. Use full attention A8 as the reference, then run MLP-only A4 with attention unquantized:
+
+```bash
+python run_gofa.py --override configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_quantize_attention False \
+  scheme_b_activation_quant_quantize_mlp True
+```
+
+Separate bit-widths for attention and MLP can be added later if the profiling result justifies it.

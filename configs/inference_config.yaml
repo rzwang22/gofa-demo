@@ -30,6 +30,10 @@ scheme_b_weight_quant:
   target: "suffix_transformer"
   fake_quant: True
   quantize_attention: True
+  quantize_q_proj: True
+  quantize_k_proj: True
+  quantize_v_proj: True
+  quantize_o_proj: True
   quantize_mlp: True
   quantize_layernorm: False
   log_quantized_modules: True
