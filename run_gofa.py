@@ -160,6 +160,28 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "scheme_b_activation_observer"):
+        model_args.scheme_b_activation_observer = params.scheme_b_activation_observer
+    for field_name in (
+        "scheme_b_activation_observer_enabled",
+        "scheme_b_activation_observer_output_dir",
+        "scheme_b_activation_observer_max_batches",
+        "scheme_b_activation_observer_max_items_per_module",
+        "scheme_b_activation_observer_target",
+        "scheme_b_activation_observer_layers",
+        "scheme_b_activation_observer_projections",
+        "scheme_b_activation_observer_save_tensor",
+        "scheme_b_activation_observer_save_stats",
+        "scheme_b_activation_observer_sample_tokens",
+        "scheme_b_activation_observer_sample_channels",
+        "scheme_b_activation_observer_compute_quant_error",
+        "scheme_b_activation_observer_quant_bits",
+        "scheme_b_activation_observer_per_token",
+        "scheme_b_activation_observer_clip_ratio",
+        "scheme_b_activation_observer_log_interval",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     if hasattr(params, "scheme_b_ablation"):
         model_args.scheme_b_ablation = params.scheme_b_ablation
     for field_name in (
@@ -379,6 +401,8 @@ def main(params):
                                           ckpt_save_path=params.ckpt_save_path)
     if hasattr(model.llm_model, "_maybe_dump_encoder_cache_manifest"):
         model.llm_model._maybe_dump_encoder_cache_manifest(current_batch_seen=0, force=True)
+    if hasattr(model.llm_model, "_maybe_dump_activation_observer"):
+        model.llm_model._maybe_dump_activation_observer()
     if params.last_save:
         model.save_partial(os.path.join(params.exp_dir, "best_ckpt.pth"))
 

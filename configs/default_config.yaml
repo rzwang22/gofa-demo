@@ -88,6 +88,23 @@ scheme_b_activation_quant:
   o_proj_bits:
   mlp_bits:
   log_quantized_modules: True
+scheme_b_activation_observer:
+  enabled: False
+  output_dir: ""
+  max_batches: 2
+  max_items_per_module: 4
+  target: "suffix_transformer"
+  layers: [26, 29, 31]
+  projections: ["q_proj", "k_proj", "v_proj", "o_proj", "mlp"]
+  save_tensor: True
+  save_stats: True
+  sample_tokens: 512
+  sample_channels: 256
+  compute_quant_error: True
+  quant_bits: [4, 8]
+  per_token: True
+  clip_ratio: 1.0
+  log_interval: 20
 scheme_b_ablation:
   enabled: False
   mode: "none"  # options: none, target_only_zero_others

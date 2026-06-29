@@ -26,6 +26,10 @@ from modules.gofa.activation_quant import (
     activation_quant_context,
     maybe_create_suffix_transformer_activation_quantizer,
 )
+from modules.gofa.activation_observer import (
+    activation_observer_context,
+    maybe_create_suffix_transformer_activation_observer,
+)
 from modules.gofa.weight_quant import (
     maybe_create_suffix_transformer_weight_quantizer,
     weight_quant_context,
@@ -134,6 +138,23 @@ class ModelArguments:
     scheme_b_activation_quant_o_proj_bits: Optional[int] = field(default=None)
     scheme_b_activation_quant_mlp_bits: Optional[int] = field(default=None)
     scheme_b_activation_quant_log_quantized_modules: Optional[bool] = field(default=None)
+    scheme_b_activation_observer: Optional[Dict[str, Any]] = field(default_factory=dict)
+    scheme_b_activation_observer_enabled: Optional[bool] = field(default=None)
+    scheme_b_activation_observer_output_dir: Optional[str] = field(default=None)
+    scheme_b_activation_observer_max_batches: Optional[int] = field(default=None)
+    scheme_b_activation_observer_max_items_per_module: Optional[int] = field(default=None)
+    scheme_b_activation_observer_target: Optional[str] = field(default=None)
+    scheme_b_activation_observer_layers: Optional[Any] = field(default=None)
+    scheme_b_activation_observer_projections: Optional[Any] = field(default=None)
+    scheme_b_activation_observer_save_tensor: Optional[bool] = field(default=None)
+    scheme_b_activation_observer_save_stats: Optional[bool] = field(default=None)
+    scheme_b_activation_observer_sample_tokens: Optional[int] = field(default=None)
+    scheme_b_activation_observer_sample_channels: Optional[int] = field(default=None)
+    scheme_b_activation_observer_compute_quant_error: Optional[bool] = field(default=None)
+    scheme_b_activation_observer_quant_bits: Optional[Any] = field(default=None)
+    scheme_b_activation_observer_per_token: Optional[bool] = field(default=None)
+    scheme_b_activation_observer_clip_ratio: Optional[float] = field(default=None)
+    scheme_b_activation_observer_log_interval: Optional[int] = field(default=None)
     scheme_b_ablation: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_ablation_enabled: Optional[bool] = field(default=None)
     scheme_b_ablation_mode: Optional[str] = field(default=None)
@@ -210,6 +231,9 @@ class GOFAMistral(torch.nn.Module):
         self.scheme_b_activation_quant_enabled = bool(self.scheme_b_activation_quant["enabled"])
         self.scheme_b_activation_quantizer = None
         self.scheme_b_activation_quant_last_logged_call_count = -1
+        self.scheme_b_activation_observer = self._normalize_scheme_b_activation_observer_config(model_args)
+        self.scheme_b_activation_observer_enabled = bool(self.scheme_b_activation_observer["enabled"])
+        self.scheme_b_activation_observer_instance = None
         self.encoder_cache_manifest = self._normalize_encoder_cache_manifest_config(model_args)
         self.encoder_cache_manifest_enabled = bool(self.encoder_cache_manifest["enabled"])
         self.encoder_cache_manifest_items = OrderedDict()
@@ -280,6 +304,31 @@ class GOFAMistral(torch.nn.Module):
                 logger=print,
             )
             self.scheme_b_weight_quant_stats = dict(self.scheme_b_weight_quantizer.stats)
+        if self.scheme_b_activation_observer_enabled:
+            print(
+                "GOFA scheme-B suffix Transformer activation observer enabled: "
+                f"target={self.scheme_b_activation_observer['target']}, "
+                f"output_dir={self.scheme_b_activation_observer['output_dir']}, "
+                f"max_batches={self.scheme_b_activation_observer['max_batches']}, "
+                f"max_items_per_module={self.scheme_b_activation_observer['max_items_per_module']}, "
+                f"layers={self.scheme_b_activation_observer['layers']}, "
+                f"projections={self.scheme_b_activation_observer['projections']}, "
+                f"save_tensor={self.scheme_b_activation_observer['save_tensor']}, "
+                f"save_stats={self.scheme_b_activation_observer['save_stats']}, "
+                f"sample_tokens={self.scheme_b_activation_observer['sample_tokens']}, "
+                f"sample_channels={self.scheme_b_activation_observer['sample_channels']}, "
+                f"compute_quant_error={self.scheme_b_activation_observer['compute_quant_error']}, "
+                f"quant_bits={self.scheme_b_activation_observer['quant_bits']}, "
+                f"per_token={self.scheme_b_activation_observer['per_token']}, "
+                f"clip_ratio={self.scheme_b_activation_observer['clip_ratio']}"
+            )
+            self.scheme_b_activation_observer_instance = maybe_create_suffix_transformer_activation_observer(
+                base_model,
+                self.scheme_b_activation_observer,
+                task=self._encoder_cache_manifest_task_names(),
+                cache_mode=self.encoder_cache_mode,
+                logger=print,
+            )
         if self.scheme_b_activation_quant_enabled:
             print(
                 "GOFA scheme-B suffix Transformer activation quantization enabled: "
@@ -602,6 +651,39 @@ class GOFAMistral(torch.nn.Module):
             raise ValueError(f"scheme_b_activation_quant.{field_name} must be None, 4, or 8.")
         return value
 
+    def _normalize_csv_int_list(self, value, default, field_name):
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return list(default)
+            values = [part.strip() for part in value.split(",") if part.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            values = list(value)
+        else:
+            values = [value]
+        try:
+            return [int(item) for item in values]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"scheme_b_activation_observer.{field_name} must be an int list or comma-separated ints.") from exc
+
+    def _normalize_csv_str_list(self, value, default, field_name):
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return list(default)
+            values = [part.strip() for part in value.split(",") if part.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            values = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            values = [str(value).strip()]
+        if not values:
+            raise ValueError(f"scheme_b_activation_observer.{field_name} must not be empty.")
+        return values
+
     def _normalize_scheme_b_activation_quant_config(self, model_args):
         cfg = {
             "enabled": False,
@@ -690,6 +772,85 @@ class GOFAMistral(torch.nn.Module):
         cfg["log_quantized_modules"] = bool(cfg["log_quantized_modules"])
         return cfg
 
+    def _normalize_scheme_b_activation_observer_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "output_dir": "",
+            "max_batches": 2,
+            "max_items_per_module": 4,
+            "target": "suffix_transformer",
+            "layers": [26, 29, 31],
+            "projections": ["q_proj", "k_proj", "v_proj", "o_proj", "mlp"],
+            "save_tensor": True,
+            "save_stats": True,
+            "sample_tokens": 512,
+            "sample_channels": 256,
+            "compute_quant_error": True,
+            "quant_bits": [4, 8],
+            "per_token": True,
+            "clip_ratio": 1.0,
+            "log_interval": 20,
+        }
+        nested = getattr(model_args, "scheme_b_activation_observer", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "scheme_b_activation_observer_enabled",
+            "output_dir": "scheme_b_activation_observer_output_dir",
+            "max_batches": "scheme_b_activation_observer_max_batches",
+            "max_items_per_module": "scheme_b_activation_observer_max_items_per_module",
+            "target": "scheme_b_activation_observer_target",
+            "layers": "scheme_b_activation_observer_layers",
+            "projections": "scheme_b_activation_observer_projections",
+            "save_tensor": "scheme_b_activation_observer_save_tensor",
+            "save_stats": "scheme_b_activation_observer_save_stats",
+            "sample_tokens": "scheme_b_activation_observer_sample_tokens",
+            "sample_channels": "scheme_b_activation_observer_sample_channels",
+            "compute_quant_error": "scheme_b_activation_observer_compute_quant_error",
+            "quant_bits": "scheme_b_activation_observer_quant_bits",
+            "per_token": "scheme_b_activation_observer_per_token",
+            "clip_ratio": "scheme_b_activation_observer_clip_ratio",
+            "log_interval": "scheme_b_activation_observer_log_interval",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["output_dir"] = str(cfg["output_dir"] or "")
+        if cfg["enabled"] and not cfg["output_dir"]:
+            raise ValueError("scheme_b_activation_observer.output_dir must be set when observer is enabled.")
+        cfg["max_batches"] = max(int(cfg["max_batches"]), 1)
+        cfg["max_items_per_module"] = max(int(cfg["max_items_per_module"]), 1)
+        cfg["target"] = str(cfg["target"] or "suffix_transformer")
+        if cfg["target"] != "suffix_transformer":
+            raise ValueError("scheme_b_activation_observer.target currently supports only 'suffix_transformer'.")
+        cfg["layers"] = self._normalize_csv_int_list(cfg["layers"], [26, 29, 31], "layers")
+        cfg["projections"] = self._normalize_csv_str_list(
+            cfg["projections"],
+            ["q_proj", "k_proj", "v_proj", "o_proj", "mlp"],
+            "projections",
+        )
+        valid_projections = {"q_proj", "k_proj", "v_proj", "o_proj", "mlp", "gate_proj", "up_proj", "down_proj"}
+        invalid_projections = [projection for projection in cfg["projections"] if projection not in valid_projections]
+        if invalid_projections:
+            raise ValueError(f"scheme_b_activation_observer.projections has unsupported values: {invalid_projections}")
+        cfg["save_tensor"] = bool(cfg["save_tensor"])
+        cfg["save_stats"] = bool(cfg["save_stats"])
+        cfg["sample_tokens"] = max(int(cfg["sample_tokens"]), 1)
+        cfg["sample_channels"] = max(int(cfg["sample_channels"]), 1)
+        cfg["compute_quant_error"] = bool(cfg["compute_quant_error"])
+        cfg["quant_bits"] = self._normalize_csv_int_list(cfg["quant_bits"], [4, 8], "quant_bits")
+        invalid_bits = [bit for bit in cfg["quant_bits"] if bit not in {4, 8}]
+        if invalid_bits:
+            raise ValueError(f"scheme_b_activation_observer.quant_bits must contain only 4 and 8; got {invalid_bits}.")
+        cfg["per_token"] = bool(cfg["per_token"])
+        cfg["clip_ratio"] = float(cfg["clip_ratio"])
+        if cfg["clip_ratio"] <= 0.0 or cfg["clip_ratio"] > 1.0:
+            raise ValueError("scheme_b_activation_observer.clip_ratio must be in (0, 1].")
+        cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
+        return cfg
+
     def _normalize_scheme_b_ablation_config(self, model_args):
         cfg = {
             "enabled": False,
@@ -765,6 +926,21 @@ class GOFAMistral(torch.nn.Module):
             f"quantize_v_proj={self.scheme_b_activation_quant.get('quantize_v_proj', True)}, "
             f"quantize_o_proj={self.scheme_b_activation_quant.get('quantize_o_proj', True)}, "
             f"quantize_mlp={self.scheme_b_activation_quant.get('quantize_mlp', True)}"
+        )
+
+    def _maybe_dump_activation_observer(self):
+        observer = self.scheme_b_activation_observer_instance
+        if observer is None:
+            return
+        summary = observer.dump_summary()
+        print(
+            "GOFA activation observer summary dumped: "
+            f"output_dir={summary.get('output_dir')}, "
+            f"observed_batches={summary.get('observed_batches')}, "
+            f"saved_tensors={summary.get('saved_tensors')}, "
+            f"stats_records={summary.get('stats_records')}, "
+            f"stats_path={summary.get('stats_path')}, "
+            f"tensor_dir={summary.get('tensor_dir')}"
         )
 
     def _build_encoder_cache_namespace(self, icae_path, model_args, training_args, gofa_args):
@@ -1585,7 +1761,7 @@ class GOFAMistral(torch.nn.Module):
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
-        with weight_quant_context(self.scheme_b_weight_quantizer), activation_quant_context(self.scheme_b_activation_quantizer):
+        with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
             final_hidden_states = base_model.forward_from_gnn_boundary(
                 boundary_hidden_states=boundary_hidden_states,
                 graph=graph,
@@ -2020,7 +2196,7 @@ class GOFAMistral(torch.nn.Module):
             for batch_idx, original_idx in enumerate(missing):
                 seq_len = len(token_ids[original_idx])
                 text_len = seq_len - self.mem_size
-                with weight_quant_context(self.scheme_b_weight_quantizer), activation_quant_context(self.scheme_b_activation_quantizer):
+                with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
                     cache_item = base_model.build_memory_text_kv_cache_item(
                         prefix_output[batch_idx, :seq_len],
                         text_len=text_len,
@@ -2078,7 +2254,7 @@ class GOFAMistral(torch.nn.Module):
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
-        with weight_quant_context(self.scheme_b_weight_quantizer), activation_quant_context(self.scheme_b_activation_quantizer):
+        with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
             final_memory_states, mapped_items = base_model.forward_memory_with_text_kv(
                 memory_states=memory_states,
                 text_kv_items=cache_items,
@@ -2101,7 +2277,7 @@ class GOFAMistral(torch.nn.Module):
             try:
                 with torch.no_grad():
                     reference_embeddings = self.model.tokens_to_embeddings(padded_token_ids)
-                    with weight_quant_context(self.scheme_b_weight_quantizer), activation_quant_context(self.scheme_b_activation_quantizer):
+                    with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
                         reference_hidden_states = self.model.icae(
                             inputs_embeds=reference_embeddings,
                             output_hidden_states=True,
@@ -2288,7 +2464,7 @@ class GOFAMistral(torch.nn.Module):
             self._sync_encoder_cache_timer(cur_device)
             full_start = time.perf_counter()
             autoencoder_input_embedding = self.model.tokens_to_embeddings(padded_text_output)
-            with weight_quant_context(self.scheme_b_weight_quantizer), activation_quant_context(self.scheme_b_activation_quantizer):
+            with weight_quant_context(self.scheme_b_weight_quantizer), activation_observer_context(self.scheme_b_activation_observer_instance), activation_quant_context(self.scheme_b_activation_quantizer):
                 compress_outputs = self.model.icae(
                     inputs_embeds=autoencoder_input_embedding,
                     output_hidden_states=True,

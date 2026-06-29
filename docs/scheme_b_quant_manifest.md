@@ -448,3 +448,64 @@ python run_gofa.py \
   offline_log True \
   num_workers 4
 ```
+
+## Suffix Activation Observer
+
+Use the observer to sample original suffix Transformer Linear input activations for layers 26, 29, and 31 without enabling cache, weight, or activation quantization:
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  data_root_path /home/rzwang/data/GOFA/TAGDataset \
+  load_dir /home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth \
+  train_task_names cora_link \
+  eval_task_names cora_link \
+  sample_size_per_task 20 \
+  inf_sample_size_per_task 20 \
+  ways 2 \
+  inf_ways 2 \
+  inf_hops 3 \
+  inf_max_nodes_per_hops 10 \
+  inf_instructs True \
+  inf_selections True \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  encoder_cache_verify False \
+  profile_stage_times True \
+  profile_stage_log_interval 10 \
+  profile_memory_kv_transformer_breakdown False \
+  encoder_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  encoder_cache_manifest_enabled False \
+  scheme_b_quant_enabled False \
+  scheme_b_weight_quant_enabled False \
+  scheme_b_activation_quant_enabled False \
+  scheme_b_activation_observer_enabled True \
+  scheme_b_activation_observer_output_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/observer/cora_link_full \
+  scheme_b_activation_observer_max_batches 2 \
+  scheme_b_activation_observer_max_items_per_module 2 \
+  scheme_b_activation_observer_layers 26,29,31 \
+  scheme_b_activation_observer_projections q_proj,k_proj,v_proj,o_proj,mlp \
+  scheme_b_activation_observer_save_tensor True \
+  scheme_b_activation_observer_save_stats True \
+  scheme_b_activation_observer_sample_tokens 512 \
+  scheme_b_activation_observer_sample_channels 256 \
+  scheme_b_activation_observer_compute_quant_error True \
+  scheme_b_activation_observer_quant_bits 4,8 \
+  scheme_b_activation_observer_per_token True \
+  scheme_b_activation_observer_clip_ratio 1.0 \
+  scheme_b_ablation_enabled False \
+  offline_log True \
+  num_workers 4
+```
+
+Plot the saved tensors and aggregate the JSONL statistics:
+
+```bash
+python scripts/plot_activation_observer.py \
+  --input-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/observer/cora_link_full \
+  --output-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/observer/cora_link_full/plots \
+  --max-files 50
+```
+
+The observer writes sampled tensors under `tensors/`, per-sample stats to `activation_stats.jsonl`, and a final `activation_observer_summary.json`.
