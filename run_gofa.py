@@ -151,6 +151,11 @@ def main(params):
         "scheme_b_activation_quant_quantize_mlp_output",
         "scheme_b_activation_quant_per_token",
         "scheme_b_activation_quant_clip_ratio",
+        "scheme_b_activation_quant_q_proj_bits",
+        "scheme_b_activation_quant_k_proj_bits",
+        "scheme_b_activation_quant_v_proj_bits",
+        "scheme_b_activation_quant_o_proj_bits",
+        "scheme_b_activation_quant_mlp_bits",
         "scheme_b_activation_quant_log_quantized_modules",
     ):
         if hasattr(params, field_name):

@@ -30,10 +30,6 @@ scheme_b_weight_quant:
   target: "suffix_transformer"
   fake_quant: True
   quantize_attention: True
-  quantize_q_proj: True
-  quantize_k_proj: True
-  quantize_v_proj: True
-  quantize_o_proj: True
   quantize_mlp: True
   quantize_layernorm: False
   log_quantized_modules: True
@@ -43,12 +39,21 @@ scheme_b_activation_quant:
   target: "suffix_transformer"
   fake_quant: True
   quantize_attention: True
+  quantize_q_proj: True
+  quantize_k_proj: True
+  quantize_v_proj: True
+  quantize_o_proj: True
   quantize_mlp: True
   quantize_qkv_outputs: False
   quantize_attn_output: False
   quantize_mlp_output: False
   per_token: True
   clip_ratio: 1.0
+  q_proj_bits:
+  k_proj_bits:
+  v_proj_bits:
+  o_proj_bits:
+  mlp_bits:
   log_quantized_modules: True
 scheme_b_ablation:
   enabled: False

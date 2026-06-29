@@ -377,4 +377,74 @@ python run_gofa.py --override configs/inference_config.yaml \
   scheme_b_activation_quant_quantize_mlp True
 ```
 
-Separate bit-widths for attention and MLP can be added later if the profiling result justifies it.
+Use the per-projection bit fields below when one run needs different activation bit-widths for q/k/v/o and MLP.
+
+## Per-Projection Activation Bits
+
+Cache 4-bit plus W4 plus Q8/K4/V8/O4/MLP4:
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  data_root_path /home/rzwang/data/GOFA/TAGDataset \
+  load_dir /home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth \
+  train_task_names cora_link \
+  eval_task_names cora_link \
+  sample_size_per_task 100 \
+  inf_sample_size_per_task 100 \
+  ways 2 \
+  inf_ways 2 \
+  inf_hops 3 \
+  inf_max_nodes_per_hops 10 \
+  inf_instructs True \
+  inf_selections True \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  encoder_cache_verify False \
+  profile_stage_times True \
+  profile_stage_log_interval 20 \
+  profile_memory_kv_transformer_breakdown False \
+  encoder_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  encoder_cache_manifest_enabled False \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_target_aware_delta False \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_b4d4 \
+  scheme_b_quant_fake_quant True \
+  scheme_b_quant_debug_zero_base False \
+  scheme_b_quant_strict True \
+  scheme_b_weight_quant_enabled True \
+  scheme_b_weight_quant_bits 4 \
+  scheme_b_weight_quant_target suffix_transformer \
+  scheme_b_weight_quant_fake_quant True \
+  scheme_b_weight_quant_quantize_attention True \
+  scheme_b_weight_quant_quantize_mlp True \
+  scheme_b_weight_quant_quantize_layernorm False \
+  scheme_b_weight_quant_log_quantized_modules True \
+  scheme_b_activation_quant_enabled True \
+  scheme_b_activation_quant_bits 4 \
+  scheme_b_activation_quant_target suffix_transformer \
+  scheme_b_activation_quant_fake_quant True \
+  scheme_b_activation_quant_quantize_attention True \
+  scheme_b_activation_quant_quantize_q_proj True \
+  scheme_b_activation_quant_quantize_k_proj True \
+  scheme_b_activation_quant_quantize_v_proj True \
+  scheme_b_activation_quant_quantize_o_proj True \
+  scheme_b_activation_quant_quantize_mlp True \
+  scheme_b_activation_quant_q_proj_bits 8 \
+  scheme_b_activation_quant_k_proj_bits 4 \
+  scheme_b_activation_quant_v_proj_bits 8 \
+  scheme_b_activation_quant_o_proj_bits 4 \
+  scheme_b_activation_quant_mlp_bits 4 \
+  scheme_b_activation_quant_quantize_qkv_outputs False \
+  scheme_b_activation_quant_quantize_attn_output False \
+  scheme_b_activation_quant_quantize_mlp_output False \
+  scheme_b_activation_quant_per_token True \
+  scheme_b_activation_quant_clip_ratio 1.0 \
+  scheme_b_activation_quant_log_quantized_modules True \
+  scheme_b_ablation_enabled False \
+  offline_log True \
+  num_workers 4
+```

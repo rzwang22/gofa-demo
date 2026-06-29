@@ -25,6 +25,8 @@ class ActivationQuantizedModule:
     name: str
     module: nn.Module
     weight_shape: Optional[Tuple[int, ...]]
+    activation_bits: int
+    projection_type: str
 
 
 def _normalize_bits(bits: int) -> int:
@@ -32,6 +34,12 @@ def _normalize_bits(bits: int) -> int:
     if bits not in SUPPORTED_ACTIVATION_BITS:
         raise ValueError("scheme_b_activation_quant.bits must be 4 or 8.")
     return bits
+
+
+def _normalize_optional_bits(bits: Optional[int], fallback_bits: int) -> int:
+    if bits is None:
+        return fallback_bits
+    return _normalize_bits(bits)
 
 
 def _normalize_clip_ratio(clip_ratio: float) -> float:
@@ -92,6 +100,11 @@ class SuffixTransformerActivationQuantizer:
             quantize_v_proj: bool = True,
             quantize_o_proj: bool = True,
             quantize_mlp: bool = True,
+            q_proj_bits: Optional[int] = None,
+            k_proj_bits: Optional[int] = None,
+            v_proj_bits: Optional[int] = None,
+            o_proj_bits: Optional[int] = None,
+            mlp_bits: Optional[int] = None,
             quantize_qkv_outputs: bool = False,
             quantize_attn_output: bool = False,
             quantize_mlp_output: bool = False,
@@ -108,6 +121,11 @@ class SuffixTransformerActivationQuantizer:
         self.quantize_v_proj = self.quantize_attention and bool(quantize_v_proj)
         self.quantize_o_proj = self.quantize_attention and bool(quantize_o_proj)
         self.quantize_mlp = bool(quantize_mlp)
+        self.q_proj_bits = _normalize_optional_bits(q_proj_bits, self.bits)
+        self.k_proj_bits = _normalize_optional_bits(k_proj_bits, self.bits)
+        self.v_proj_bits = _normalize_optional_bits(v_proj_bits, self.bits)
+        self.o_proj_bits = _normalize_optional_bits(o_proj_bits, self.bits)
+        self.mlp_bits = _normalize_optional_bits(mlp_bits, self.bits)
         self.quantize_qkv_outputs = bool(quantize_qkv_outputs)
         self.quantize_attn_output = bool(quantize_attn_output)
         self.quantize_mlp_output = bool(quantize_mlp_output)
@@ -117,6 +135,7 @@ class SuffixTransformerActivationQuantizer:
         self.logger = logger
         self.active_depth = 0
         self.modules: List[ActivationQuantizedModule] = []
+        self.module_to_item: Dict[int, ActivationQuantizedModule] = {}
         self.handles = []
         self.stats = {
             "activation_quantized_module_count": 0,
@@ -126,6 +145,27 @@ class SuffixTransformerActivationQuantizer:
             "activation_quant_time_s": 0.0,
             "activation_effective_bits": self.bits,
             "clip_ratio": self.clip_ratio,
+            "q_proj_bits": self.q_proj_bits,
+            "k_proj_bits": self.k_proj_bits,
+            "v_proj_bits": self.v_proj_bits,
+            "o_proj_bits": self.o_proj_bits,
+            "mlp_bits": self.mlp_bits,
+            "activation_quant_call_count_by_bits": {4: 0, 8: 0},
+            "activation_quant_numel_by_bits": {4: 0, 8: 0},
+            "activation_quant_call_count_by_projection": {
+                "q_proj": 0,
+                "k_proj": 0,
+                "v_proj": 0,
+                "o_proj": 0,
+                "mlp": 0,
+            },
+            "activation_quant_numel_by_projection": {
+                "q_proj": 0,
+                "k_proj": 0,
+                "v_proj": 0,
+                "o_proj": 0,
+                "mlp": 0,
+            },
         }
         if not self.fake_quant:
             raise NotImplementedError(
@@ -145,22 +185,23 @@ class SuffixTransformerActivationQuantizer:
         end = int(self.base_model.config.num_hidden_layers)
         return start, end
 
-    def _target_paths(self) -> List[str]:
+    def _target_paths(self) -> List[Tuple[str, str, int]]:
         paths = []
         if self.quantize_attention:
-            attention_projection_flags = {
-                "q_proj": self.quantize_q_proj,
-                "k_proj": self.quantize_k_proj,
-                "v_proj": self.quantize_v_proj,
-                "o_proj": self.quantize_o_proj,
+            attention_projection_config = {
+                "q_proj": (self.quantize_q_proj, self.q_proj_bits),
+                "k_proj": (self.quantize_k_proj, self.k_proj_bits),
+                "v_proj": (self.quantize_v_proj, self.v_proj_bits),
+                "o_proj": (self.quantize_o_proj, self.o_proj_bits),
             }
             paths.extend(
-                f"self_attn.{name}"
+                (f"self_attn.{name}", name, bits)
                 for name in ATTENTION_PROJECTIONS
-                if attention_projection_flags.get(name, False)
+                for enabled, bits in [attention_projection_config.get(name, (False, self.bits))]
+                if enabled
             )
         if self.quantize_mlp:
-            paths.extend(f"mlp.{name}" for name in MLP_PROJECTIONS)
+            paths.extend((f"mlp.{name}", "mlp", self.mlp_bits) for name in MLP_PROJECTIONS)
         return paths
 
     def _collect_modules(self):
@@ -170,26 +211,28 @@ class SuffixTransformerActivationQuantizer:
         target_paths = self._target_paths()
         for layer_idx in range(start, end):
             decoder_layer = self.base_model.layers[layer_idx]
-            for path in target_paths:
+            for path, projection_type, activation_bits in target_paths:
                 module = _resolve_submodule(decoder_layer, path)
                 if module is None:
                     continue
                 weight = _module_weight(module)
-                self.modules.append(
-                    ActivationQuantizedModule(
-                        layer_idx=layer_idx,
-                        name=f"layers.{layer_idx}.{path}",
-                        module=module,
-                        weight_shape=tuple(weight.shape) if weight is not None else None,
-                    )
+                item = ActivationQuantizedModule(
+                    layer_idx=layer_idx,
+                    name=f"layers.{layer_idx}.{path}",
+                    module=module,
+                    weight_shape=tuple(weight.shape) if weight is not None else None,
+                    activation_bits=activation_bits,
+                    projection_type=projection_type,
                 )
+                self.modules.append(item)
+                self.module_to_item[id(module)] = item
         self.stats["activation_quantized_module_count"] = len(self.modules)
 
     def _register_hooks(self):
         for item in self.modules:
             self.handles.append(item.module.register_forward_pre_hook(self._pre_forward_hook))
 
-    def _pre_forward_hook(self, _module: nn.Module, inputs):
+    def _pre_forward_hook(self, module: nn.Module, inputs):
         if self.active_depth <= 0:
             return
         if not inputs:
@@ -197,10 +240,13 @@ class SuffixTransformerActivationQuantizer:
         first_input = inputs[0]
         if not isinstance(first_input, torch.Tensor):
             return
+        item = self.module_to_item.get(id(module))
+        activation_bits = item.activation_bits if item is not None else self.bits
+        projection_type = item.projection_type if item is not None else "unknown"
         start_time = time.perf_counter()
         quantized = fake_quant_activation_symmetric(
             first_input,
-            bits=self.bits,
+            bits=activation_bits,
             per_token=self.per_token,
             clip_ratio=self.clip_ratio,
         )
@@ -209,6 +255,18 @@ class SuffixTransformerActivationQuantizer:
         self.stats["activation_quant_tensor_count"] += 1
         self.stats["activation_quant_numel"] += int(first_input.numel())
         self.stats["activation_quant_time_s"] += elapsed
+        self.stats["activation_quant_call_count_by_bits"][activation_bits] = (
+            self.stats["activation_quant_call_count_by_bits"].get(activation_bits, 0) + 1
+        )
+        self.stats["activation_quant_numel_by_bits"][activation_bits] = (
+            self.stats["activation_quant_numel_by_bits"].get(activation_bits, 0) + int(first_input.numel())
+        )
+        self.stats["activation_quant_call_count_by_projection"][projection_type] = (
+            self.stats["activation_quant_call_count_by_projection"].get(projection_type, 0) + 1
+        )
+        self.stats["activation_quant_numel_by_projection"][projection_type] = (
+            self.stats["activation_quant_numel_by_projection"].get(projection_type, 0) + int(first_input.numel())
+        )
         return (quantized,) + tuple(inputs[1:])
 
     @contextmanager
@@ -225,12 +283,19 @@ class SuffixTransformerActivationQuantizer:
                 self.logger(
                     "GOFA suffix activation quantized module: "
                     f"layer_index={item.layer_idx}, module={item.name}, "
-                    f"weight_shape={item.weight_shape}, activation_bits={self.bits}, "
+                    f"projection_type={item.projection_type}, weight_shape={item.weight_shape}, "
+                    f"activation_bits={item.activation_bits}, "
                     f"per_token={self.per_token}, clip_ratio={self.clip_ratio}"
                 )
         self.logger(
             "GOFA suffix activation quantization stats: "
             f"activation_quantized_module_count={self.stats['activation_quantized_module_count']}, "
+            f"global_bits={self.bits}, "
+            f"q_proj_bits={self.q_proj_bits}, "
+            f"k_proj_bits={self.k_proj_bits}, "
+            f"v_proj_bits={self.v_proj_bits}, "
+            f"o_proj_bits={self.o_proj_bits}, "
+            f"mlp_bits={self.mlp_bits}, "
             f"activation_effective_bits={self.stats['activation_effective_bits']}, "
             f"per_token={self.per_token}, clip_ratio={self.clip_ratio}, target=suffix_transformer, "
             f"quantize_attention={self.quantize_attention}, "
@@ -261,6 +326,11 @@ def maybe_create_suffix_transformer_activation_quantizer(
         quantize_v_proj=bool(cfg.get("quantize_v_proj", True)),
         quantize_o_proj=bool(cfg.get("quantize_o_proj", True)),
         quantize_mlp=bool(cfg.get("quantize_mlp", True)),
+        q_proj_bits=cfg.get("q_proj_bits"),
+        k_proj_bits=cfg.get("k_proj_bits"),
+        v_proj_bits=cfg.get("v_proj_bits"),
+        o_proj_bits=cfg.get("o_proj_bits"),
+        mlp_bits=cfg.get("mlp_bits"),
         quantize_qkv_outputs=bool(cfg.get("quantize_qkv_outputs", False)),
         quantize_attn_output=bool(cfg.get("quantize_attn_output", False)),
         quantize_mlp_output=bool(cfg.get("quantize_mlp_output", False)),

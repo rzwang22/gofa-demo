@@ -128,6 +128,11 @@ class ModelArguments:
     scheme_b_activation_quant_quantize_mlp_output: Optional[bool] = field(default=None)
     scheme_b_activation_quant_per_token: Optional[bool] = field(default=None)
     scheme_b_activation_quant_clip_ratio: Optional[float] = field(default=None)
+    scheme_b_activation_quant_q_proj_bits: Optional[int] = field(default=None)
+    scheme_b_activation_quant_k_proj_bits: Optional[int] = field(default=None)
+    scheme_b_activation_quant_v_proj_bits: Optional[int] = field(default=None)
+    scheme_b_activation_quant_o_proj_bits: Optional[int] = field(default=None)
+    scheme_b_activation_quant_mlp_bits: Optional[int] = field(default=None)
     scheme_b_activation_quant_log_quantized_modules: Optional[bool] = field(default=None)
     scheme_b_ablation: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_ablation_enabled: Optional[bool] = field(default=None)
@@ -291,7 +296,12 @@ class GOFAMistral(torch.nn.Module):
                 f"quantize_attn_output={self.scheme_b_activation_quant['quantize_attn_output']}, "
                 f"quantize_mlp_output={self.scheme_b_activation_quant['quantize_mlp_output']}, "
                 f"per_token={self.scheme_b_activation_quant['per_token']}, "
-                f"clip_ratio={self.scheme_b_activation_quant['clip_ratio']}"
+                f"clip_ratio={self.scheme_b_activation_quant['clip_ratio']}, "
+                f"q_proj_bits={self.scheme_b_activation_quant['q_proj_bits']}, "
+                f"k_proj_bits={self.scheme_b_activation_quant['k_proj_bits']}, "
+                f"v_proj_bits={self.scheme_b_activation_quant['v_proj_bits']}, "
+                f"o_proj_bits={self.scheme_b_activation_quant['o_proj_bits']}, "
+                f"mlp_bits={self.scheme_b_activation_quant['mlp_bits']}"
             )
             self.scheme_b_activation_quantizer = maybe_create_suffix_transformer_activation_quantizer(
                 base_model,
@@ -547,10 +557,6 @@ class GOFAMistral(torch.nn.Module):
             "target": "suffix_transformer",
             "fake_quant": True,
             "quantize_attention": True,
-            "quantize_q_proj": True,
-            "quantize_k_proj": True,
-            "quantize_v_proj": True,
-            "quantize_o_proj": True,
             "quantize_mlp": True,
             "quantize_layernorm": False,
             "log_quantized_modules": True,
@@ -586,6 +592,16 @@ class GOFAMistral(torch.nn.Module):
         cfg["log_quantized_modules"] = bool(cfg["log_quantized_modules"])
         return cfg
 
+    def _normalize_optional_activation_bits(self, value, field_name):
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+            return None
+        value = int(value)
+        if value not in {4, 8}:
+            raise ValueError(f"scheme_b_activation_quant.{field_name} must be None, 4, or 8.")
+        return value
+
     def _normalize_scheme_b_activation_quant_config(self, model_args):
         cfg = {
             "enabled": False,
@@ -593,12 +609,21 @@ class GOFAMistral(torch.nn.Module):
             "target": "suffix_transformer",
             "fake_quant": True,
             "quantize_attention": True,
+            "quantize_q_proj": True,
+            "quantize_k_proj": True,
+            "quantize_v_proj": True,
+            "quantize_o_proj": True,
             "quantize_mlp": True,
             "quantize_qkv_outputs": False,
             "quantize_attn_output": False,
             "quantize_mlp_output": False,
             "per_token": True,
             "clip_ratio": 1.0,
+            "q_proj_bits": None,
+            "k_proj_bits": None,
+            "v_proj_bits": None,
+            "o_proj_bits": None,
+            "mlp_bits": None,
             "log_quantized_modules": True,
         }
         nested = getattr(model_args, "scheme_b_activation_quant", None)
@@ -620,6 +645,11 @@ class GOFAMistral(torch.nn.Module):
             "quantize_mlp_output": "scheme_b_activation_quant_quantize_mlp_output",
             "per_token": "scheme_b_activation_quant_per_token",
             "clip_ratio": "scheme_b_activation_quant_clip_ratio",
+            "q_proj_bits": "scheme_b_activation_quant_q_proj_bits",
+            "k_proj_bits": "scheme_b_activation_quant_k_proj_bits",
+            "v_proj_bits": "scheme_b_activation_quant_v_proj_bits",
+            "o_proj_bits": "scheme_b_activation_quant_o_proj_bits",
+            "mlp_bits": "scheme_b_activation_quant_mlp_bits",
             "log_quantized_modules": "scheme_b_activation_quant_log_quantized_modules",
         }
         for cfg_key, field_name in direct_fields.items():
@@ -652,6 +682,11 @@ class GOFAMistral(torch.nn.Module):
         cfg["clip_ratio"] = float(cfg["clip_ratio"])
         if cfg["clip_ratio"] <= 0.0 or cfg["clip_ratio"] > 1.0:
             raise ValueError("scheme_b_activation_quant.clip_ratio must be in (0, 1].")
+        cfg["q_proj_bits"] = self._normalize_optional_activation_bits(cfg["q_proj_bits"], "q_proj_bits")
+        cfg["k_proj_bits"] = self._normalize_optional_activation_bits(cfg["k_proj_bits"], "k_proj_bits")
+        cfg["v_proj_bits"] = self._normalize_optional_activation_bits(cfg["v_proj_bits"], "v_proj_bits")
+        cfg["o_proj_bits"] = self._normalize_optional_activation_bits(cfg["o_proj_bits"], "o_proj_bits")
+        cfg["mlp_bits"] = self._normalize_optional_activation_bits(cfg["mlp_bits"], "mlp_bits")
         cfg["log_quantized_modules"] = bool(cfg["log_quantized_modules"])
         return cfg
 
@@ -713,6 +748,15 @@ class GOFAMistral(torch.nn.Module):
             f"activation_quant_numel={stats.get('activation_quant_numel', 0)}, "
             f"activation_quant_time_s={stats.get('activation_quant_time_s', 0.0):.6f}, "
             f"activation_effective_bits={stats.get('activation_effective_bits', 0)}, "
+            f"q_proj_bits={stats.get('q_proj_bits', self.scheme_b_activation_quant.get('q_proj_bits'))}, "
+            f"k_proj_bits={stats.get('k_proj_bits', self.scheme_b_activation_quant.get('k_proj_bits'))}, "
+            f"v_proj_bits={stats.get('v_proj_bits', self.scheme_b_activation_quant.get('v_proj_bits'))}, "
+            f"o_proj_bits={stats.get('o_proj_bits', self.scheme_b_activation_quant.get('o_proj_bits'))}, "
+            f"mlp_bits={stats.get('mlp_bits', self.scheme_b_activation_quant.get('mlp_bits'))}, "
+            f"activation_quant_call_count_by_bits={stats.get('activation_quant_call_count_by_bits', {})}, "
+            f"activation_quant_numel_by_bits={stats.get('activation_quant_numel_by_bits', {})}, "
+            f"activation_quant_call_count_by_projection={stats.get('activation_quant_call_count_by_projection', {})}, "
+            f"activation_quant_numel_by_projection={stats.get('activation_quant_numel_by_projection', {})}, "
             f"per_token={self.scheme_b_activation_quant.get('per_token', True)}, "
             f"clip_ratio={stats.get('clip_ratio', self.scheme_b_activation_quant.get('clip_ratio', 1.0))}, "
             f"quantize_attention={self.scheme_b_activation_quant.get('quantize_attention', True)}, "
