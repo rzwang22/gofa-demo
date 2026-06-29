@@ -602,3 +602,63 @@ For local-degree union with target 1-hop, use:
 scheme_b_quant_target_aware_policy target_1hop_local_degree
 scheme_b_quant_local_degree_top_ratio 0.2
 ```
+
+## Scheme-B Cache Tensor Visualization
+
+Inspect sampled full/quantized Scheme-B cache tensors offline. This analyzes `memory_state` and suffix text-side KV cache tensors without changing inference.
+
+Example 1: inspect 4-bit cache:
+
+```bash
+python scripts/inspect_scheme_b_cache_tensors.py \
+  --full-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  --quant-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_b4d4 \
+  --manifest /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/manifest/cora_link.json \
+  --output-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/cache_observer/cora_link_b4d4 \
+  --sample-items 20 \
+  --sample-policy random \
+  --include-memory-state True \
+  --include-text-kv True \
+  --layers 26,27,28,29,30,31 \
+  --kv-types key,value \
+  --reconstruct-mode full,base,base_delta \
+  --sample-tokens 512 \
+  --sample-channels 256 \
+  --compute-quant-error True
+```
+
+Example 2: inspect 2-bit base plus 4-bit delta cache:
+
+```bash
+python scripts/inspect_scheme_b_cache_tensors.py \
+  --full-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  --quant-cache-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_b2d4 \
+  --manifest /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/manifest/cora_link.json \
+  --output-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/cache_observer/cora_link_b2d4 \
+  --sample-items 20 \
+  --sample-policy random \
+  --include-memory-state True \
+  --include-text-kv True \
+  --layers 26,27,28,29,30,31 \
+  --kv-types key,value \
+  --reconstruct-mode full,base,base_delta \
+  --sample-tokens 512 \
+  --sample-channels 256 \
+  --compute-quant-error True
+```
+
+Plot saved tensors and aggregate CSV summaries:
+
+```bash
+python scripts/plot_scheme_b_cache_tensors.py \
+  --input-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/cache_observer/cora_link_b2d4 \
+  --output-dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/cache_observer/cora_link_b2d4/plots \
+  --max-files 100
+```
+
+Outputs:
+
+- `tensors/*.pt`: sampled standardized `[tokens, channels]` tensors for full/base/base_delta.
+- `stats/cache_tensor_stats.jsonl`: per-tensor distribution and reconstruction-error metrics.
+- `plots/*.png`: heatmap, 3D surface, token/channel stats, histogram, and full/base/base_delta comparison plots.
+- `plots/summary_by_*.csv`: aggregate summaries by tensor kind, layer, and reconstruct mode.
