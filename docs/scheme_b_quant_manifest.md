@@ -802,6 +802,9 @@ python run_gofa.py \
   scheme_b_quant_value_base_bits 4 \
   scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v4d4 \
   scheme_b_quant_target_aware_delta False \
+  scheme_b_quant_load_memory_delta False \
+  scheme_b_quant_load_key_delta False \
+  scheme_b_quant_load_value_delta False \
   scheme_b_int_gemm_enabled True \
   scheme_b_int_gemm_backend torch_int_mm \
   scheme_b_quant_kv_attention_enabled True \
@@ -823,6 +826,58 @@ fallback_count=0
 backend=torch_int_mm_qscale_fold
 key_scale_fold_into_q=True
 pv_compute_mode=scale_delayed_v
+```
+
+For integer PV, keep the same m4k4v4 cache and enable `pv_compute_mode=int_pv`. Softmax remains high precision; only the post-softmax probability tensor is quantized to non-negative int8 before `P_q @ V_q`.
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  encoder_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/full/shared \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_strict True \
+  scheme_b_quant_base_bits 4 \
+  scheme_b_quant_delta_bits 4 \
+  scheme_b_quant_memory_base_bits 4 \
+  scheme_b_quant_key_base_bits 4 \
+  scheme_b_quant_value_base_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v4d4 \
+  scheme_b_quant_target_aware_delta False \
+  scheme_b_quant_load_memory_delta False \
+  scheme_b_quant_load_key_delta False \
+  scheme_b_quant_load_value_delta False \
+  scheme_b_int_gemm_enabled True \
+  scheme_b_int_gemm_weight_bits 4 \
+  scheme_b_int_gemm_activation_bits 8 \
+  scheme_b_int_gemm_backend torch_int_mm \
+  scheme_b_quant_kv_attention_enabled True \
+  scheme_b_quant_kv_attention_backend torch_int_mm_qscale_fold \
+  scheme_b_quant_kv_attention_key_scale_fold_into_q True \
+  scheme_b_quant_kv_attention_quantize_query_bits 8 \
+  scheme_b_quant_kv_attention_key_bits 4 \
+  scheme_b_quant_kv_attention_value_bits 4 \
+  scheme_b_quant_kv_attention_use_int_qk True \
+  scheme_b_quant_kv_attention_pv_compute_mode int_pv \
+  scheme_b_quant_kv_attention_quantize_prob_bits 8 \
+  scheme_b_quant_kv_attention_prob_quant_granularity per_query \
+  scheme_b_quant_kv_attention_prob_quant_unsigned False \
+  scheme_b_quant_kv_attention_prob_quant_qmax 127 \
+  scheme_b_quant_kv_attention_fallback_to_fp_attention False \
+  scheme_b_quant_kv_attention_fallback_to_scale_delayed_v False
+```
+
+Expected runtime checks:
+
+```text
+quant_kv_attention_call_count>0
+prob_quant_numel>0
+pv_int_mm_time_s>0
+fallback_count=0
+fallback_count_pv=0
+pv_compute_mode=int_pv
 ```
 
 ## Scheme-B Cache Tensor Visualization

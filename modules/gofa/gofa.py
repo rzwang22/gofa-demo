@@ -186,7 +186,13 @@ class ModelArguments:
     scheme_b_quant_kv_attention_value_bits: Optional[int] = field(default=None)
     scheme_b_quant_kv_attention_use_int_qk: Optional[bool] = field(default=None)
     scheme_b_quant_kv_attention_pv_compute_mode: Optional[str] = field(default=None)
+    scheme_b_quant_kv_attention_quantize_prob_bits: Optional[int] = field(default=None)
+    scheme_b_quant_kv_attention_prob_quant_granularity: Optional[str] = field(default=None)
+    scheme_b_quant_kv_attention_prob_quant_unsigned: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_attention_prob_quant_qmax: Optional[int] = field(default=None)
     scheme_b_quant_kv_attention_fallback_to_fp_attention: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_attention_fallback_to_scale_delayed_v: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_attention_compare_int_pv_with_fp_pv: Optional[bool] = field(default=None)
     scheme_b_quant_kv_attention_log_interval: Optional[int] = field(default=None)
     scheme_b_activation_observer: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_activation_observer_enabled: Optional[bool] = field(default=None)
@@ -570,7 +576,13 @@ class GOFAMistral(torch.nn.Module):
                         f"value_bits={self.scheme_b_quant_kv_attention['value_bits']}, "
                         f"use_int_qk={self.scheme_b_quant_kv_attention['use_int_qk']}, "
                         f"pv_compute_mode={self.scheme_b_quant_kv_attention['pv_compute_mode']}, "
-                        f"fallback_to_fp_attention={self.scheme_b_quant_kv_attention['fallback_to_fp_attention']}"
+                        f"quantize_prob_bits={self.scheme_b_quant_kv_attention['quantize_prob_bits']}, "
+                        f"prob_quant_granularity={self.scheme_b_quant_kv_attention['prob_quant_granularity']}, "
+                        f"prob_quant_unsigned={self.scheme_b_quant_kv_attention['prob_quant_unsigned']}, "
+                        f"prob_quant_qmax={self.scheme_b_quant_kv_attention['prob_quant_qmax']}, "
+                        f"fallback_to_fp_attention={self.scheme_b_quant_kv_attention['fallback_to_fp_attention']}, "
+                        f"fallback_to_scale_delayed_v={self.scheme_b_quant_kv_attention['fallback_to_scale_delayed_v']}, "
+                        f"compare_int_pv_with_fp_pv={self.scheme_b_quant_kv_attention['compare_int_pv_with_fp_pv']}"
                     )
                 if self.encoder_cache_manifest_enabled:
                     if not self.encoder_cache_manifest["output_path"]:
@@ -1049,7 +1061,13 @@ class GOFAMistral(torch.nn.Module):
             "value_bits": 4,
             "use_int_qk": True,
             "pv_compute_mode": "scale_delayed_v",
+            "quantize_prob_bits": 8,
+            "prob_quant_granularity": "per_query",
+            "prob_quant_unsigned": False,
+            "prob_quant_qmax": 127,
             "fallback_to_fp_attention": False,
+            "fallback_to_scale_delayed_v": False,
+            "compare_int_pv_with_fp_pv": False,
             "log_interval": 20,
         }
         nested = getattr(model_args, "scheme_b_quant_kv_attention", None)
@@ -1064,7 +1082,13 @@ class GOFAMistral(torch.nn.Module):
             "value_bits": "scheme_b_quant_kv_attention_value_bits",
             "use_int_qk": "scheme_b_quant_kv_attention_use_int_qk",
             "pv_compute_mode": "scheme_b_quant_kv_attention_pv_compute_mode",
+            "quantize_prob_bits": "scheme_b_quant_kv_attention_quantize_prob_bits",
+            "prob_quant_granularity": "scheme_b_quant_kv_attention_prob_quant_granularity",
+            "prob_quant_unsigned": "scheme_b_quant_kv_attention_prob_quant_unsigned",
+            "prob_quant_qmax": "scheme_b_quant_kv_attention_prob_quant_qmax",
             "fallback_to_fp_attention": "scheme_b_quant_kv_attention_fallback_to_fp_attention",
+            "fallback_to_scale_delayed_v": "scheme_b_quant_kv_attention_fallback_to_scale_delayed_v",
+            "compare_int_pv_with_fp_pv": "scheme_b_quant_kv_attention_compare_int_pv_with_fp_pv",
             "log_interval": "scheme_b_quant_kv_attention_log_interval",
         }
         for cfg_key, field_name in direct_fields.items():
@@ -1091,9 +1115,23 @@ class GOFAMistral(torch.nn.Module):
         if not cfg["use_int_qk"]:
             raise ValueError("scheme_b_quant_kv_attention.use_int_qk must be True.")
         cfg["pv_compute_mode"] = str(cfg["pv_compute_mode"] or "scale_delayed_v")
-        if cfg["pv_compute_mode"] != "scale_delayed_v":
-            raise ValueError("scheme_b_quant_kv_attention.pv_compute_mode currently supports only 'scale_delayed_v'.")
+        if cfg["pv_compute_mode"] not in {"scale_delayed_v", "int_pv"}:
+            raise ValueError("scheme_b_quant_kv_attention.pv_compute_mode must be 'scale_delayed_v' or 'int_pv'.")
+        cfg["quantize_prob_bits"] = int(cfg["quantize_prob_bits"])
+        if cfg["quantize_prob_bits"] != 8:
+            raise ValueError("scheme_b_quant_kv_attention.quantize_prob_bits currently supports only 8.")
+        cfg["prob_quant_granularity"] = str(cfg["prob_quant_granularity"] or "per_query")
+        if cfg["prob_quant_granularity"] != "per_query":
+            raise ValueError("scheme_b_quant_kv_attention.prob_quant_granularity currently supports only 'per_query'.")
+        cfg["prob_quant_unsigned"] = bool(cfg["prob_quant_unsigned"])
+        if cfg["prob_quant_unsigned"]:
+            raise ValueError("scheme_b_quant_kv_attention.prob_quant_unsigned must be False; use int8 [0, qmax].")
+        cfg["prob_quant_qmax"] = int(cfg["prob_quant_qmax"])
+        if cfg["prob_quant_qmax"] <= 0 or cfg["prob_quant_qmax"] > 127:
+            raise ValueError("scheme_b_quant_kv_attention.prob_quant_qmax must be in [1, 127].")
         cfg["fallback_to_fp_attention"] = bool(cfg["fallback_to_fp_attention"])
+        cfg["fallback_to_scale_delayed_v"] = bool(cfg["fallback_to_scale_delayed_v"])
+        cfg["compare_int_pv_with_fp_pv"] = bool(cfg["compare_int_pv_with_fp_pv"])
         cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
         return cfg
 
@@ -1262,12 +1300,13 @@ class GOFAMistral(torch.nn.Module):
             return
         call_count = int(stats.get("quant_kv_attention_call_count", 0))
         fallback_count = int(stats.get("fallback_count", 0))
-        log_signature = (call_count, fallback_count)
+        fallback_count_pv = int(stats.get("fallback_count_pv", 0))
+        log_signature = (call_count, fallback_count, fallback_count_pv)
         if log_signature == self.scheme_b_quant_kv_attention_last_logged_signature:
             return
         interval = max(int(self.scheme_b_quant_kv_attention.get("log_interval", self.profile_stage_log_interval)), 1)
         encoder_call_idx = self.encoder_cache_calls + self.encoder_full_calls
-        if not (encoder_call_idx <= 3 or encoder_call_idx % interval == 0 or fallback_count > 0):
+        if not (encoder_call_idx <= 3 or encoder_call_idx % interval == 0 or fallback_count > 0 or fallback_count_pv > 0):
             return
         self.scheme_b_quant_kv_attention_last_logged_signature = log_signature
         print(
@@ -1282,12 +1321,31 @@ class GOFAMistral(torch.nn.Module):
             f"v_unpack_time_s={stats.get('v_unpack_time_s', 0.0):.6f}, "
             f"pv_matmul_time_s={stats.get('pv_matmul_time_s', 0.0):.6f}, "
             f"v_scale_apply_time_s={stats.get('v_scale_apply_time_s', 0.0):.6f}, "
+            f"prob_quant_time_s={stats.get('prob_quant_time_s', 0.0):.6f}, "
+            f"prob_quant_numel={stats.get('prob_quant_numel', 0)}, "
+            f"prob_quant_scale_min={stats.get('prob_quant_scale_min')}, "
+            f"prob_quant_scale_max={stats.get('prob_quant_scale_max')}, "
+            f"prob_quant_scale_mean={stats.get('prob_quant_scale_mean')}, "
+            f"prob_quant_zero_ratio={stats.get('prob_quant_zero_ratio', 0.0):.6f}, "
+            f"prob_quant_saturation_ratio={stats.get('prob_quant_saturation_ratio', 0.0):.6f}, "
+            f"pv_int_mm_time_s={stats.get('pv_int_mm_time_s', 0.0):.6f}, "
+            f"pv_dequant_time_s={stats.get('pv_dequant_time_s', 0.0):.6f}, "
+            f"pv_int_mm_shape_examples={stats.get('pv_int_mm_shape_examples', [])}, "
             f"fallback_count={fallback_count}, "
+            f"fallback_count_pv={fallback_count_pv}, "
             f"backend={self.scheme_b_quant_kv_attention.get('backend')}, "
             f"key_scale_fold_into_q={self.scheme_b_quant_kv_attention.get('key_scale_fold_into_q')}, "
             f"key_bits={self.scheme_b_quant_kv_attention.get('key_bits')}, "
             f"value_bits={self.scheme_b_quant_kv_attention.get('value_bits')}, "
             f"pv_compute_mode={self.scheme_b_quant_kv_attention.get('pv_compute_mode')}, "
+            f"quantize_prob_bits={self.scheme_b_quant_kv_attention.get('quantize_prob_bits')}, "
+            f"prob_quant_granularity={self.scheme_b_quant_kv_attention.get('prob_quant_granularity')}, "
+            f"prob_quant_unsigned={self.scheme_b_quant_kv_attention.get('prob_quant_unsigned')}, "
+            f"prob_quant_qmax={self.scheme_b_quant_kv_attention.get('prob_quant_qmax')}, "
+            f"fallback_to_scale_delayed_v={self.scheme_b_quant_kv_attention.get('fallback_to_scale_delayed_v')}, "
+            f"int_pv_compare_rel_l2_error={stats.get('int_pv_compare_rel_l2_error')}, "
+            f"int_pv_compare_cosine_similarity={stats.get('int_pv_compare_cosine_similarity')}, "
+            f"int_pv_compare_max_abs_error={stats.get('int_pv_compare_max_abs_error')}, "
             f"example_shapes={stats.get('example_shapes', {})}"
         )
 

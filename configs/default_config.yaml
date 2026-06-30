@@ -124,7 +124,13 @@ scheme_b_quant_kv_attention:
   value_bits: 4
   use_int_qk: True
   pv_compute_mode: "scale_delayed_v"
+  quantize_prob_bits: 8
+  prob_quant_granularity: "per_query"
+  prob_quant_unsigned: False
+  prob_quant_qmax: 127
   fallback_to_fp_attention: False
+  fallback_to_scale_delayed_v: False
+  compare_int_pv_with_fp_pv: False
   log_interval: 20
 scheme_b_activation_observer:
   enabled: False

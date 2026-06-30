@@ -36,6 +36,10 @@ _CONFIG_FOR_DOC = "MistralConfig"
 _TORCH_INT_MM_M_ALIGNMENT = 32
 
 
+class _QuantKVPVError(RuntimeError):
+    pass
+
+
 def _pad_int8_rows_to_multiple(tensor: torch.Tensor, multiple: int = _TORCH_INT_MM_M_ALIGNMENT):
     original_rows = int(tensor.size(0))
     padded_rows = ((original_rows + multiple - 1) // multiple) * multiple
@@ -44,6 +48,20 @@ def _pad_int8_rows_to_multiple(tensor: torch.Tensor, multiple: int = _TORCH_INT_
     padded = torch.zeros((padded_rows, int(tensor.size(1))), dtype=torch.int8, device=tensor.device)
     padded[:original_rows].copy_(tensor)
     return padded.contiguous(), original_rows
+
+
+def _pad_int8_2d_to_multiple(tensor: torch.Tensor, multiple: int = _TORCH_INT_MM_M_ALIGNMENT):
+    if tensor.dim() != 2:
+        raise RuntimeError(f"Expected a 2D int8 tensor to pad for torch._int_mm, got shape={tuple(tensor.shape)}.")
+    original_rows = int(tensor.size(0))
+    original_cols = int(tensor.size(1))
+    padded_rows = ((original_rows + multiple - 1) // multiple) * multiple
+    padded_cols = ((original_cols + multiple - 1) // multiple) * multiple
+    if padded_rows == original_rows and padded_cols == original_cols:
+        return tensor.contiguous(), original_rows, original_cols
+    padded = torch.zeros((padded_rows, padded_cols), dtype=torch.int8, device=tensor.device)
+    padded[:original_rows, :original_cols].copy_(tensor)
+    return padded.contiguous(), original_rows, original_cols
 
 
 class _SingleLayerKVCache:
@@ -196,6 +214,23 @@ class GOFAMistralModel(MistralModel):
             "v_unpack_time_s": 0.0,
             "pv_matmul_time_s": 0.0,
             "v_scale_apply_time_s": 0.0,
+            "prob_quant_time_s": 0.0,
+            "prob_quant_numel": 0,
+            "prob_quant_scale_min": None,
+            "prob_quant_scale_max": None,
+            "prob_quant_scale_sum": 0.0,
+            "prob_quant_scale_count": 0,
+            "prob_quant_zero_count": 0,
+            "prob_quant_saturation_count": 0,
+            "prob_quant_zero_ratio": 0.0,
+            "prob_quant_saturation_ratio": 0.0,
+            "pv_int_mm_time_s": 0.0,
+            "pv_dequant_time_s": 0.0,
+            "pv_int_mm_shape_examples": [],
+            "fallback_count_pv": 0,
+            "int_pv_compare_rel_l2_error": None,
+            "int_pv_compare_cosine_similarity": None,
+            "int_pv_compare_max_abs_error": None,
             "fallback_count": 0,
             "example_shapes": {},
         }
@@ -204,6 +239,7 @@ class GOFAMistralModel(MistralModel):
         self.quant_kv_attention_config = dict(config or {"enabled": False})
         self.quant_kv_attention_stats = self._new_quant_kv_attention_stats()
         self.quant_kv_attention_warned_fallback = False
+        self.quant_kv_attention_warned_pv_fallback = False
 
     def _make_block_causal_mask(self, query_len, key_len, past_len, dtype, device):
         mask = torch.zeros((query_len, key_len), dtype=dtype, device=device)
@@ -242,6 +278,175 @@ class GOFAMistralModel(MistralModel):
                 f"got shape={tuple(scale.shape)}."
             )
         return q.contiguous(), scale.reshape(head_dim).contiguous()
+
+    def _quant_kv_record_prob_quant_stats(self, probs_q, scale_p, qmax, elapsed):
+        stats = self.quant_kv_attention_stats
+        stats["prob_quant_time_s"] = stats.get("prob_quant_time_s", 0.0) + float(elapsed)
+        numel = int(probs_q.numel())
+        stats["prob_quant_numel"] = int(stats.get("prob_quant_numel", 0)) + numel
+        if scale_p.numel() > 0:
+            scale_min = float(scale_p.min().item())
+            scale_max = float(scale_p.max().item())
+            scale_sum = float(scale_p.sum().item())
+            scale_count = int(scale_p.numel())
+            current_min = stats.get("prob_quant_scale_min")
+            current_max = stats.get("prob_quant_scale_max")
+            stats["prob_quant_scale_min"] = scale_min if current_min is None else min(float(current_min), scale_min)
+            stats["prob_quant_scale_max"] = scale_max if current_max is None else max(float(current_max), scale_max)
+            stats["prob_quant_scale_sum"] = float(stats.get("prob_quant_scale_sum", 0.0)) + scale_sum
+            stats["prob_quant_scale_count"] = int(stats.get("prob_quant_scale_count", 0)) + scale_count
+            stats["prob_quant_scale_mean"] = (
+                stats["prob_quant_scale_sum"] / max(int(stats["prob_quant_scale_count"]), 1)
+            )
+        if numel > 0:
+            zero_count = int((probs_q == 0).sum().item())
+            saturation_count = int((probs_q == int(qmax)).sum().item())
+            stats["prob_quant_zero_count"] = int(stats.get("prob_quant_zero_count", 0)) + zero_count
+            stats["prob_quant_saturation_count"] = int(stats.get("prob_quant_saturation_count", 0)) + saturation_count
+            total = max(int(stats["prob_quant_numel"]), 1)
+            stats["prob_quant_zero_ratio"] = float(stats["prob_quant_zero_count"]) / float(total)
+            stats["prob_quant_saturation_ratio"] = float(stats["prob_quant_saturation_count"]) / float(total)
+
+    def _quant_kv_quantize_probs_int8(self, probs, cfg):
+        if int(cfg.get("quantize_prob_bits", 8)) != 8:
+            raise RuntimeError("quantized-KV int_pv currently supports only quantize_prob_bits=8.")
+        if str(cfg.get("prob_quant_granularity", "per_query")) != "per_query":
+            raise RuntimeError("quantized-KV int_pv currently supports only prob_quant_granularity=per_query.")
+        if bool(cfg.get("prob_quant_unsigned", False)):
+            raise RuntimeError("quantized-KV int_pv stores non-negative probabilities in int8; uint8 is unsupported.")
+        qmax = int(cfg.get("prob_quant_qmax", 127))
+        if qmax <= 0 or qmax > 127:
+            raise RuntimeError("quantized-KV int_pv requires 1 <= prob_quant_qmax <= 127.")
+        quant_start = time.perf_counter()
+        probs_f = probs.float()
+        scale_p = (probs_f.amax(dim=-1, keepdim=True) / float(qmax)).clamp(min=1e-12)
+        probs_q = torch.round(probs_f / scale_p).clamp(0, qmax).to(torch.int8).contiguous()
+        self._quant_kv_record_prob_quant_stats(probs_q, scale_p, qmax, time.perf_counter() - quant_start)
+        return probs_q, scale_p
+
+    def _quant_kv_scale_delayed_v_output(self, cached_probs, v_int, scale_v, num_key_value_groups, dtype, record_stats=True):
+        bsz, num_heads, q_len, text_len = cached_probs.shape
+        head_dim = int(v_int.size(-1))
+        device = cached_probs.device
+        cached_output = torch.zeros((bsz, num_heads, q_len, head_dim), dtype=dtype, device=device)
+        if text_len == 0:
+            return cached_output
+        for batch_idx in range(bsz):
+            for head_idx in range(num_heads):
+                kv_head_idx = head_idx // num_key_value_groups
+                pv_start = time.perf_counter()
+                pv = torch.matmul(cached_probs[batch_idx, head_idx], v_int[kv_head_idx].to(dtype=dtype))
+                if record_stats:
+                    self._quant_kv_stat_add("pv_matmul_time_s", time.perf_counter() - pv_start)
+
+                scale_start = time.perf_counter()
+                cached_output[batch_idx, head_idx] = (pv.float() * scale_v.reshape(1, head_dim)).to(dtype)
+                if record_stats:
+                    self._quant_kv_stat_add("v_scale_apply_time_s", time.perf_counter() - scale_start)
+        return cached_output
+
+    def _quant_kv_maybe_record_int_pv_compare(self, int_output, fp_output, cfg):
+        if not bool(cfg.get("compare_int_pv_with_fp_pv", False)):
+            return
+        diff = int_output.float() - fp_output.float()
+        ref = fp_output.float()
+        rel_l2 = (
+            torch.linalg.vector_norm(diff) /
+            torch.clamp(torch.linalg.vector_norm(ref), min=1e-12)
+        ).item()
+        cosine = torch.nn.functional.cosine_similarity(
+            int_output.float().reshape(1, -1),
+            ref.reshape(1, -1),
+            dim=-1,
+        ).item()
+        max_abs = diff.abs().max().item() if diff.numel() else 0.0
+        stats = self.quant_kv_attention_stats
+        stats["int_pv_compare_rel_l2_error"] = float(rel_l2)
+        stats["int_pv_compare_cosine_similarity"] = float(cosine)
+        stats["int_pv_compare_max_abs_error"] = float(max_abs)
+        call_count = int(stats.get("quant_kv_attention_call_count", 0))
+        interval = max(int(cfg.get("log_interval", 20)), 1)
+        if call_count <= 3 or call_count % interval == 0:
+            print(
+                "GOFA quantized-KV int_pv debug compare: "
+                f"rel_l2_error={rel_l2:.6g}, "
+                f"cosine_similarity={cosine:.6g}, "
+                f"max_abs_error={max_abs:.6g}"
+            )
+
+    def _quant_kv_int_pv_output(self, cached_probs, v_int, scale_v, num_key_value_groups, dtype, cfg):
+        bsz, num_heads, q_len, text_len = cached_probs.shape
+        head_dim = int(v_int.size(-1))
+        device = cached_probs.device
+        if text_len == 0:
+            return torch.zeros((bsz, num_heads, q_len, head_dim), dtype=dtype, device=device)
+        try:
+            if not hasattr(torch, "_int_mm"):
+                raise RuntimeError("torch._int_mm is unavailable for quantized-KV int_pv.")
+            cached_output = torch.zeros((bsz, num_heads, q_len, head_dim), dtype=dtype, device=device)
+            for batch_idx in range(bsz):
+                for head_idx in range(num_heads):
+                    kv_head_idx = head_idx // num_key_value_groups
+                    probs_q, scale_p = self._quant_kv_quantize_probs_int8(cached_probs[batch_idx, head_idx], cfg)
+                    probs_q_padded, original_m, original_k = _pad_int8_2d_to_multiple(probs_q)
+                    v_q_padded, v_original_k, original_n = _pad_int8_2d_to_multiple(v_int[kv_head_idx].contiguous())
+                    if original_k != v_original_k:
+                        raise RuntimeError(
+                            "quantized-KV int_pv K dimension mismatch after padding: "
+                            f"P={original_k}, V={v_original_k}."
+                        )
+                    pv_start = time.perf_counter()
+                    out_int = torch._int_mm(probs_q_padded, v_q_padded)
+                    out_int = out_int[:original_m, :original_n].contiguous()
+                    self._quant_kv_stat_add("pv_int_mm_time_s", time.perf_counter() - pv_start)
+
+                    dequant_start = time.perf_counter()
+                    out_fp = out_int.float() * scale_p.reshape(original_m, 1) * scale_v.reshape(1, head_dim)
+                    cached_output[batch_idx, head_idx] = out_fp.to(dtype)
+                    self._quant_kv_stat_add("pv_dequant_time_s", time.perf_counter() - dequant_start)
+
+                    shape_examples = self.quant_kv_attention_stats.setdefault("pv_int_mm_shape_examples", [])
+                    if len(shape_examples) < 3:
+                        shape_examples.append(
+                            {
+                                "p_q": tuple(probs_q.shape),
+                                "p_q_padded": tuple(probs_q_padded.shape),
+                                "v_q": tuple(v_int[kv_head_idx].shape),
+                                "v_q_padded": tuple(v_q_padded.shape),
+                                "out": tuple(out_int.shape),
+                            }
+                        )
+            if bool(cfg.get("compare_int_pv_with_fp_pv", False)):
+                fp_output = self._quant_kv_scale_delayed_v_output(
+                    cached_probs,
+                    v_int,
+                    scale_v,
+                    num_key_value_groups,
+                    dtype,
+                    record_stats=False,
+                )
+                self._quant_kv_maybe_record_int_pv_compare(cached_output, fp_output, cfg)
+            return cached_output
+        except Exception as exc:
+            if not bool(cfg.get("fallback_to_scale_delayed_v", False)):
+                raise _QuantKVPVError(
+                    "quantized-KV int_pv failed and fallback_to_scale_delayed_v=False."
+                ) from exc
+            self.quant_kv_attention_stats["fallback_count_pv"] += 1
+            if not getattr(self, "quant_kv_attention_warned_pv_fallback", False):
+                print(
+                    "GOFA quantized-KV attention warning: int_pv failed; falling back to scale_delayed_v. "
+                    f"reason={type(exc).__name__}: {exc}"
+                )
+                self.quant_kv_attention_warned_pv_fallback = True
+            return self._quant_kv_scale_delayed_v_output(
+                cached_probs,
+                v_int,
+                scale_v,
+                num_key_value_groups,
+                dtype,
+                record_stats=True,
+            )
 
     def _quant_kv_fallback_to_fp(
         self,
@@ -306,8 +511,8 @@ class GOFAMistralModel(MistralModel):
             raise RuntimeError("quantized-KV attention currently supports only quantize_query_bits=8.")
         if not bool(cfg.get("use_int_qk", True)):
             raise RuntimeError("quantized-KV attention requires use_int_qk=True.")
-        if cfg.get("pv_compute_mode") != "scale_delayed_v":
-            raise RuntimeError("quantized-KV attention supports only pv_compute_mode=scale_delayed_v.")
+        if cfg.get("pv_compute_mode") not in {"scale_delayed_v", "int_pv"}:
+            raise RuntimeError("quantized-KV attention supports pv_compute_mode=scale_delayed_v or int_pv.")
         try:
             if not hasattr(torch, "_int_mm"):
                 raise RuntimeError("torch._int_mm is unavailable.")
@@ -388,19 +593,25 @@ class GOFAMistralModel(MistralModel):
             self._quant_kv_stat_add("softmax_time_s", time.perf_counter() - softmax_start)
             attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
 
-            cached_output = torch.zeros((bsz, num_heads, q_len, head_dim), dtype=dtype, device=device)
-            if text_len > 0:
-                cached_probs = attn_weights[:, :, :, :text_len]
-                for batch_idx in range(bsz):
-                    for head_idx in range(num_heads):
-                        kv_head_idx = head_idx // num_key_value_groups
-                        pv_start = time.perf_counter()
-                        pv = torch.matmul(cached_probs[batch_idx, head_idx], v_int[kv_head_idx].to(dtype=dtype))
-                        self._quant_kv_stat_add("pv_matmul_time_s", time.perf_counter() - pv_start)
-
-                        scale_start = time.perf_counter()
-                        cached_output[batch_idx, head_idx] = (pv.float() * scale_v.reshape(1, head_dim)).to(dtype)
-                        self._quant_kv_stat_add("v_scale_apply_time_s", time.perf_counter() - scale_start)
+            cached_probs = attn_weights[:, :, :, :text_len]
+            if cfg.get("pv_compute_mode") == "int_pv":
+                cached_output = self._quant_kv_int_pv_output(
+                    cached_probs,
+                    v_int,
+                    scale_v,
+                    num_key_value_groups,
+                    dtype,
+                    cfg,
+                )
+            else:
+                cached_output = self._quant_kv_scale_delayed_v_output(
+                    cached_probs,
+                    v_int,
+                    scale_v,
+                    num_key_value_groups,
+                    dtype,
+                    record_stats=True,
+                )
             current_probs = attn_weights[:, :, :, text_len:]
             current_output = torch.matmul(current_probs, current_value_states)
             attn_output = cached_output + current_output
@@ -419,6 +630,8 @@ class GOFAMistralModel(MistralModel):
             else:
                 returned_attn_weights = attn_weights
             return attn_output, returned_attn_weights
+        except _QuantKVPVError:
+            raise
         except Exception as exc:
             return self._quant_kv_fallback_to_fp(
                 query_states,

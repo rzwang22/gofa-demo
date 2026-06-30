@@ -203,7 +203,13 @@ def main(params):
         "scheme_b_quant_kv_attention_value_bits",
         "scheme_b_quant_kv_attention_use_int_qk",
         "scheme_b_quant_kv_attention_pv_compute_mode",
+        "scheme_b_quant_kv_attention_quantize_prob_bits",
+        "scheme_b_quant_kv_attention_prob_quant_granularity",
+        "scheme_b_quant_kv_attention_prob_quant_unsigned",
+        "scheme_b_quant_kv_attention_prob_quant_qmax",
         "scheme_b_quant_kv_attention_fallback_to_fp_attention",
+        "scheme_b_quant_kv_attention_fallback_to_scale_delayed_v",
+        "scheme_b_quant_kv_attention_compare_int_pv_with_fp_pv",
         "scheme_b_quant_kv_attention_log_interval",
     ):
         if hasattr(params, field_name):
