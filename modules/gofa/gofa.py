@@ -177,6 +177,17 @@ class ModelArguments:
     scheme_b_int_gemm_fallback_to_fake_quant: Optional[bool] = field(default=None)
     scheme_b_int_gemm_log_modules: Optional[bool] = field(default=None)
     scheme_b_int_gemm_log_interval: Optional[int] = field(default=None)
+    scheme_b_quant_kv_attention: Optional[Dict[str, Any]] = field(default_factory=dict)
+    scheme_b_quant_kv_attention_enabled: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_attention_backend: Optional[str] = field(default=None)
+    scheme_b_quant_kv_attention_key_scale_fold_into_q: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_attention_quantize_query_bits: Optional[int] = field(default=None)
+    scheme_b_quant_kv_attention_key_bits: Optional[int] = field(default=None)
+    scheme_b_quant_kv_attention_value_bits: Optional[int] = field(default=None)
+    scheme_b_quant_kv_attention_use_int_qk: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_attention_pv_compute_mode: Optional[str] = field(default=None)
+    scheme_b_quant_kv_attention_fallback_to_fp_attention: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_attention_log_interval: Optional[int] = field(default=None)
     scheme_b_activation_observer: Optional[Dict[str, Any]] = field(default_factory=dict)
     scheme_b_activation_observer_enabled: Optional[bool] = field(default=None)
     scheme_b_activation_observer_output_dir: Optional[str] = field(default=None)
@@ -275,6 +286,9 @@ class GOFAMistral(torch.nn.Module):
         self.scheme_b_int_gemm_quantizer = None
         self.scheme_b_int_gemm_last_logged_call_count = -1
         self.scheme_b_int_gemm_last_logged_signature = None
+        self.scheme_b_quant_kv_attention = self._normalize_scheme_b_quant_kv_attention_config(model_args)
+        self.scheme_b_quant_kv_attention_enabled = bool(self.scheme_b_quant_kv_attention["enabled"])
+        self.scheme_b_quant_kv_attention_last_logged_signature = None
         self.scheme_b_activation_observer = self._normalize_scheme_b_activation_observer_config(model_args)
         self.scheme_b_activation_observer_enabled = bool(self.scheme_b_activation_observer["enabled"])
         self.scheme_b_activation_observer_instance = None
@@ -356,6 +370,8 @@ class GOFAMistral(torch.nn.Module):
                 self.scheme_b_int_gemm,
                 logger=print,
             )
+        if hasattr(base_model, "configure_quant_kv_attention"):
+            base_model.configure_quant_kv_attention(self.scheme_b_quant_kv_attention)
         if self.scheme_b_weight_quant_enabled:
             print(
                 "GOFA scheme-B suffix Transformer weight quantization enabled: "
@@ -441,6 +457,12 @@ class GOFAMistral(torch.nn.Module):
             if self.scheme_b_quant_enabled and self.encoder_cache_mode != "memory_kv":
                 print("GOFA scheme-B quant cache is only valid for encoder_cache_mode=memory_kv; disabling quant cache.")
                 self.scheme_b_quant_enabled = False
+            if self.scheme_b_quant_kv_attention_enabled and self.encoder_cache_mode != "memory_kv":
+                print("GOFA quantized-KV attention is only valid for encoder_cache_mode=memory_kv; disabling it.")
+                self.scheme_b_quant_kv_attention_enabled = False
+                self.scheme_b_quant_kv_attention["enabled"] = False
+                if hasattr(base_model, "configure_quant_kv_attention"):
+                    base_model.configure_quant_kv_attention(self.scheme_b_quant_kv_attention)
             if self.encoder_cache_manifest_enabled and self.encoder_cache_mode != "memory_kv":
                 print("GOFA encoder cache manifest is only valid for encoder_cache_mode=memory_kv; disabling manifest.")
                 self.encoder_cache_manifest_enabled = False
@@ -513,6 +535,43 @@ class GOFAMistral(torch.nn.Module):
                         "quant_delta_cache_path_example=<quant_cache_root>/delta/<cache_tag>/<cache_key[:2]>/<cache_key>.pt"
                     )
                     self._validate_scheme_b_quant_cache_root()
+                if self.scheme_b_quant_kv_attention_enabled:
+                    if not self.scheme_b_quant_enabled:
+                        raise ValueError(
+                            "scheme_b_quant_kv_attention.enabled=True requires scheme_b_quant.enabled=True "
+                            "for memory_kv cache payloads."
+                        )
+                    if not self.scheme_b_quant["strict"]:
+                        print(
+                            "GOFA quantized-KV attention warning: scheme_b_quant.strict=False permits fallback "
+                            "before quantized-KV attention sees payloads."
+                        )
+                    if self.scheme_b_quant["load_key_delta"] or self.scheme_b_quant["load_value_delta"]:
+                        print(
+                            "GOFA quantized-KV attention warning: first version supports base-only text-side K/V. "
+                            "If a policy selects key/value delta, reconstruct will raise unless fallback is enabled."
+                        )
+                    if int(self.scheme_b_quant["key_base_bits"]) != int(self.scheme_b_quant_kv_attention["key_bits"]):
+                        raise ValueError(
+                            "scheme_b_quant_kv_attention.key_bits must match scheme_b_quant.key_base_bits: "
+                            f"{self.scheme_b_quant_kv_attention['key_bits']} != {self.scheme_b_quant['key_base_bits']}."
+                        )
+                    if int(self.scheme_b_quant["value_base_bits"]) != int(self.scheme_b_quant_kv_attention["value_bits"]):
+                        raise ValueError(
+                            "scheme_b_quant_kv_attention.value_bits must match scheme_b_quant.value_base_bits: "
+                            f"{self.scheme_b_quant_kv_attention['value_bits']} != {self.scheme_b_quant['value_base_bits']}."
+                        )
+                    print(
+                        "GOFA quantized-KV attention enabled: "
+                        f"backend={self.scheme_b_quant_kv_attention['backend']}, "
+                        f"key_scale_fold_into_q={self.scheme_b_quant_kv_attention['key_scale_fold_into_q']}, "
+                        f"quantize_query_bits={self.scheme_b_quant_kv_attention['quantize_query_bits']}, "
+                        f"key_bits={self.scheme_b_quant_kv_attention['key_bits']}, "
+                        f"value_bits={self.scheme_b_quant_kv_attention['value_bits']}, "
+                        f"use_int_qk={self.scheme_b_quant_kv_attention['use_int_qk']}, "
+                        f"pv_compute_mode={self.scheme_b_quant_kv_attention['pv_compute_mode']}, "
+                        f"fallback_to_fp_attention={self.scheme_b_quant_kv_attention['fallback_to_fp_attention']}"
+                    )
                 if self.encoder_cache_manifest_enabled:
                     if not self.encoder_cache_manifest["output_path"]:
                         raise ValueError(
@@ -980,6 +1039,64 @@ class GOFAMistral(torch.nn.Module):
         cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
         return cfg
 
+    def _normalize_scheme_b_quant_kv_attention_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "backend": "torch_int_mm_qscale_fold",
+            "key_scale_fold_into_q": True,
+            "quantize_query_bits": 8,
+            "key_bits": 4,
+            "value_bits": 4,
+            "use_int_qk": True,
+            "pv_compute_mode": "scale_delayed_v",
+            "fallback_to_fp_attention": False,
+            "log_interval": 20,
+        }
+        nested = getattr(model_args, "scheme_b_quant_kv_attention", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "scheme_b_quant_kv_attention_enabled",
+            "backend": "scheme_b_quant_kv_attention_backend",
+            "key_scale_fold_into_q": "scheme_b_quant_kv_attention_key_scale_fold_into_q",
+            "quantize_query_bits": "scheme_b_quant_kv_attention_quantize_query_bits",
+            "key_bits": "scheme_b_quant_kv_attention_key_bits",
+            "value_bits": "scheme_b_quant_kv_attention_value_bits",
+            "use_int_qk": "scheme_b_quant_kv_attention_use_int_qk",
+            "pv_compute_mode": "scheme_b_quant_kv_attention_pv_compute_mode",
+            "fallback_to_fp_attention": "scheme_b_quant_kv_attention_fallback_to_fp_attention",
+            "log_interval": "scheme_b_quant_kv_attention_log_interval",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["backend"] = str(cfg["backend"] or "torch_int_mm_qscale_fold")
+        if cfg["backend"] != "torch_int_mm_qscale_fold":
+            raise ValueError("scheme_b_quant_kv_attention.backend currently supports only 'torch_int_mm_qscale_fold'.")
+        cfg["key_scale_fold_into_q"] = bool(cfg["key_scale_fold_into_q"])
+        if not cfg["key_scale_fold_into_q"]:
+            raise ValueError("scheme_b_quant_kv_attention.key_scale_fold_into_q must be True.")
+        cfg["quantize_query_bits"] = int(cfg["quantize_query_bits"])
+        if cfg["quantize_query_bits"] != 8:
+            raise ValueError("scheme_b_quant_kv_attention.quantize_query_bits currently supports only 8.")
+        cfg["key_bits"] = int(cfg["key_bits"])
+        cfg["value_bits"] = int(cfg["value_bits"])
+        if cfg["key_bits"] not in {2, 4}:
+            raise ValueError("scheme_b_quant_kv_attention.key_bits must be 2 or 4.")
+        if cfg["value_bits"] not in {2, 4}:
+            raise ValueError("scheme_b_quant_kv_attention.value_bits must be 2 or 4.")
+        cfg["use_int_qk"] = bool(cfg["use_int_qk"])
+        if not cfg["use_int_qk"]:
+            raise ValueError("scheme_b_quant_kv_attention.use_int_qk must be True.")
+        cfg["pv_compute_mode"] = str(cfg["pv_compute_mode"] or "scale_delayed_v")
+        if cfg["pv_compute_mode"] != "scale_delayed_v":
+            raise ValueError("scheme_b_quant_kv_attention.pv_compute_mode currently supports only 'scale_delayed_v'.")
+        cfg["fallback_to_fp_attention"] = bool(cfg["fallback_to_fp_attention"])
+        cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
+        return cfg
+
     def _normalize_scheme_b_activation_observer_config(self, model_args):
         cfg = {
             "enabled": False,
@@ -1134,6 +1251,44 @@ class GOFAMistral(torch.nn.Module):
             f"quantized_module_count={stats.get('int_gemm_quantized_module_count', 0)}, "
             f"weight_bits={stats.get('weight_bits', self.scheme_b_int_gemm.get('weight_bits'))}, "
             f"activation_bits={stats.get('activation_bits', self.scheme_b_int_gemm.get('activation_bits'))}"
+        )
+
+    def _maybe_log_scheme_b_quant_kv_attention_stats(self):
+        if not self.scheme_b_quant_kv_attention_enabled:
+            return
+        base_model = self.model.icae.get_base_model().model
+        stats = getattr(base_model, "quant_kv_attention_stats", None)
+        if not isinstance(stats, dict):
+            return
+        call_count = int(stats.get("quant_kv_attention_call_count", 0))
+        fallback_count = int(stats.get("fallback_count", 0))
+        log_signature = (call_count, fallback_count)
+        if log_signature == self.scheme_b_quant_kv_attention_last_logged_signature:
+            return
+        interval = max(int(self.scheme_b_quant_kv_attention.get("log_interval", self.profile_stage_log_interval)), 1)
+        encoder_call_idx = self.encoder_cache_calls + self.encoder_full_calls
+        if not (encoder_call_idx <= 3 or encoder_call_idx % interval == 0 or fallback_count > 0):
+            return
+        self.scheme_b_quant_kv_attention_last_logged_signature = log_signature
+        print(
+            "GOFA quantized-KV attention runtime stats: "
+            f"quant_kv_attention_call_count={call_count}, "
+            f"k_unpack_time_s={stats.get('k_unpack_time_s', 0.0):.6f}, "
+            f"q_scale_fold_time_s={stats.get('q_scale_fold_time_s', 0.0):.6f}, "
+            f"q_eff_quant_time_s={stats.get('q_eff_quant_time_s', 0.0):.6f}, "
+            f"qk_int_mm_time_s={stats.get('qk_int_mm_time_s', 0.0):.6f}, "
+            f"logits_dequant_time_s={stats.get('logits_dequant_time_s', 0.0):.6f}, "
+            f"softmax_time_s={stats.get('softmax_time_s', 0.0):.6f}, "
+            f"v_unpack_time_s={stats.get('v_unpack_time_s', 0.0):.6f}, "
+            f"pv_matmul_time_s={stats.get('pv_matmul_time_s', 0.0):.6f}, "
+            f"v_scale_apply_time_s={stats.get('v_scale_apply_time_s', 0.0):.6f}, "
+            f"fallback_count={fallback_count}, "
+            f"backend={self.scheme_b_quant_kv_attention.get('backend')}, "
+            f"key_scale_fold_into_q={self.scheme_b_quant_kv_attention.get('key_scale_fold_into_q')}, "
+            f"key_bits={self.scheme_b_quant_kv_attention.get('key_bits')}, "
+            f"value_bits={self.scheme_b_quant_kv_attention.get('value_bits')}, "
+            f"pv_compute_mode={self.scheme_b_quant_kv_attention.get('pv_compute_mode')}, "
+            f"example_shapes={stats.get('example_shapes', {})}"
         )
 
     def _maybe_log_scheme_b_activation_quant_stats(self):
@@ -2253,6 +2408,7 @@ class GOFAMistral(torch.nn.Module):
             )
             self._encoder_cache_log_timing(current_timing)
         self._maybe_log_scheme_b_int_gemm_stats()
+        self._maybe_log_scheme_b_quant_kv_attention_stats()
         self._maybe_log_scheme_b_activation_quant_stats()
 
         return final_hidden_states
@@ -2321,15 +2477,45 @@ class GOFAMistral(torch.nn.Module):
                 kept_edges.add(item_idx)
         return kept_edges
 
+    def _zero_scheme_b_tensor_or_quant_payload(self, value):
+        if value is None:
+            return False
+        if isinstance(value, torch.Tensor):
+            value.zero_()
+            return True
+        if not isinstance(value, dict):
+            return False
+        zeroed = False
+        tensor = value.get("tensor")
+        if isinstance(tensor, torch.Tensor):
+            tensor.zero_()
+            zeroed = True
+        q = value.get("q")
+        if isinstance(q, torch.Tensor):
+            q.zero_()
+            zeroed = True
+        q_packed = value.get("q_packed")
+        if isinstance(q_packed, torch.Tensor):
+            bits = int(value.get("pack_bits") or value.get("bits") or 0)
+            if bits not in {2, 4}:
+                q_packed.zero_()
+            else:
+                values_per_byte = 8 // bits
+                zero_code = 1 << (bits - 1)
+                packed_zero = 0
+                for value_idx in range(values_per_byte):
+                    packed_zero |= zero_code << (bits * value_idx)
+                q_packed.fill_(packed_zero)
+            zeroed = True
+        return zeroed
+
     def _zero_scheme_b_cache_item(self, cache_item, zero_memory_state=True, zero_text_kv=True):
         if zero_memory_state and cache_item.get("memory_state") is not None:
             cache_item["memory_state"].zero_()
         if zero_text_kv:
             for layer_kv in cache_item.get("text_kv", []):
-                if layer_kv.get("key") is not None:
-                    layer_kv["key"].zero_()
-                if layer_kv.get("value") is not None:
-                    layer_kv["value"].zero_()
+                self._zero_scheme_b_tensor_or_quant_payload(layer_kv.get("key"))
+                self._zero_scheme_b_tensor_or_quant_payload(layer_kv.get("value"))
 
     def _apply_scheme_b_quant_debug_zero_base(self, cache_items, quant_base_payloads, non_skip_item_count):
         if not (self.scheme_b_quant_enabled and self.scheme_b_quant["debug_zero_base"]):
@@ -2355,11 +2541,10 @@ class GOFAMistral(torch.nn.Module):
                 cache_item["memory_state"].zero_()
                 zeroed_memory_state_count += 1
             for layer_kv in cache_item.get("text_kv", []):
-                if layer_kv.get("key") is not None:
-                    layer_kv["key"].zero_()
-                if layer_kv.get("value") is not None:
-                    layer_kv["value"].zero_()
-                zeroed_text_kv_count += 1
+                zeroed_key = self._zero_scheme_b_tensor_or_quant_payload(layer_kv.get("key"))
+                zeroed_value = self._zero_scheme_b_tensor_or_quant_payload(layer_kv.get("value"))
+                if zeroed_key or zeroed_value:
+                    zeroed_text_kv_count += 1
         print(
             "GOFA scheme-B quant debug_zero_base:\n"
             f"  quant_cache_base_item_count={quant_base_item_count}\n"
@@ -2630,6 +2815,7 @@ class GOFAMistral(torch.nn.Module):
                         load_memory_delta=self.scheme_b_quant["load_memory_delta"],
                         load_key_delta=self.scheme_b_quant["load_key_delta"],
                         load_value_delta=self.scheme_b_quant["load_value_delta"],
+                        preserve_quantized_text_kv=self.scheme_b_quant_kv_attention_enabled,
                     )
                     current_quant_stats["quant_reconstruct_count"] += 1
                     current_timing["dequant_s"] += time.perf_counter() - dequant_start
@@ -2893,6 +3079,7 @@ class GOFAMistral(torch.nn.Module):
             self._encoder_cache_log_timing(current_timing)
         self._maybe_log_scheme_b_quant_stats(current_quant_stats)
         self._maybe_log_scheme_b_int_gemm_stats()
+        self._maybe_log_scheme_b_quant_kv_attention_stats()
         self._maybe_log_scheme_b_activation_quant_stats()
         self._maybe_dump_encoder_cache_manifest(current_batch_seen=manifest_batch_seen)
 
@@ -3007,6 +3194,7 @@ class GOFAMistral(torch.nn.Module):
                     f"cum_total={self.encoder_full_time_s:.4f}s"
                 )
             self._maybe_log_scheme_b_int_gemm_stats()
+            self._maybe_log_scheme_b_quant_kv_attention_stats()
             self._maybe_log_scheme_b_activation_quant_stats()
         self.model.icae.disable_adapter_layers()
 

@@ -25,11 +25,25 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast, )
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from .cache_quant import dequantize_tensor, quantized_tensor_int, quantized_tensor_scale
 
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "mistralai/Mistral-7B-v0.1"
 _CONFIG_FOR_DOC = "MistralConfig"
+
+
+_TORCH_INT_MM_M_ALIGNMENT = 32
+
+
+def _pad_int8_rows_to_multiple(tensor: torch.Tensor, multiple: int = _TORCH_INT_MM_M_ALIGNMENT):
+    original_rows = int(tensor.size(0))
+    padded_rows = ((original_rows + multiple - 1) // multiple) * multiple
+    if padded_rows == original_rows:
+        return tensor.contiguous(), original_rows
+    padded = torch.zeros((padded_rows, int(tensor.size(1))), dtype=torch.int8, device=tensor.device)
+    padded[:original_rows].copy_(tensor)
+    return padded.contiguous(), original_rows
 
 
 class _SingleLayerKVCache:
@@ -39,9 +53,12 @@ class _SingleLayerKVCache:
     It is used only by the encoder memory/text-KV cache path, where each item is
     run independently and the cached prefix is the item's text-side K/V.
     """
-    def __init__(self, key_states=None, value_states=None):
+    def __init__(self, key_states=None, value_states=None, key_quant_payload=None, value_quant_payload=None):
         self.key_states = key_states
         self.value_states = value_states
+        self.key_quant_payload = key_quant_payload
+        self.value_quant_payload = value_quant_payload
+        self.quantized_kv_attention = key_quant_payload is not None or value_quant_payload is not None
         self.key_cache = [] if key_states is None else [key_states]
         self.value_cache = [] if value_states is None else [value_states]
 
@@ -82,6 +99,9 @@ class GOFAMistralModel(MistralModel):
         self.gofa_config = gofa_config
         self.profile_stage_times = False
         self.profile_memory_kv_transformer_breakdown = False
+        self.quant_kv_attention_config = {"enabled": False}
+        self.quant_kv_attention_stats = self._new_quant_kv_attention_stats()
+        self.quant_kv_attention_warned_fallback = False
         self.reset_stage_profile()
 
         # self.g_layers = nn.ModuleList([GOFAGatedDecoderLayer(gofa_config, layer_idx=i) for i in range(gofa_config.num_layers)])
@@ -164,6 +184,27 @@ class GOFAMistralModel(MistralModel):
         if self._stage_profile_enabled():
             self.stage_profile[key] += 1
 
+    def _new_quant_kv_attention_stats(self):
+        return {
+            "quant_kv_attention_call_count": 0,
+            "k_unpack_time_s": 0.0,
+            "q_scale_fold_time_s": 0.0,
+            "q_eff_quant_time_s": 0.0,
+            "qk_int_mm_time_s": 0.0,
+            "logits_dequant_time_s": 0.0,
+            "softmax_time_s": 0.0,
+            "v_unpack_time_s": 0.0,
+            "pv_matmul_time_s": 0.0,
+            "v_scale_apply_time_s": 0.0,
+            "fallback_count": 0,
+            "example_shapes": {},
+        }
+
+    def configure_quant_kv_attention(self, config):
+        self.quant_kv_attention_config = dict(config or {"enabled": False})
+        self.quant_kv_attention_stats = self._new_quant_kv_attention_stats()
+        self.quant_kv_attention_warned_fallback = False
+
     def _make_block_causal_mask(self, query_len, key_len, past_len, dtype, device):
         mask = torch.zeros((query_len, key_len), dtype=dtype, device=device)
         query_positions = torch.arange(query_len, device=device).unsqueeze(1) + past_len
@@ -172,6 +213,224 @@ class GOFAMistralModel(MistralModel):
         if blocked.any():
             mask = mask.masked_fill(blocked, torch.finfo(dtype).min)
         return mask.unsqueeze(0).unsqueeze(0)
+
+    def _quant_kv_attention_enabled(self):
+        return bool(getattr(self, "quant_kv_attention_config", {}).get("enabled", False))
+
+    def _quant_kv_stat_add(self, key, elapsed):
+        self.quant_kv_attention_stats[key] = self.quant_kv_attention_stats.get(key, 0.0) + float(elapsed)
+
+    def _quant_kv_payload_to_q_scale(self, payload, expected_bits, device, name):
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"quantized-KV attention expected {name} quant payload, got {type(payload)}.")
+        if payload.get("encoding") != "symmetric_per_channel":
+            raise RuntimeError(f"quantized-KV attention expected {name} symmetric_per_channel payload.")
+        if int(payload.get("bits", -1)) != int(expected_bits):
+            raise RuntimeError(
+                f"quantized-KV attention {name} bits mismatch: payload={payload.get('bits')}, expected={expected_bits}."
+            )
+        q = quantized_tensor_int(payload, device=device)
+        scale = quantized_tensor_scale(payload, device=device)
+        if q.dim() == 4 and q.size(0) == 1:
+            q = q.squeeze(0)
+        if q.dim() != 3:
+            raise RuntimeError(f"quantized-KV attention expected {name} shape [kv_heads, seq, head_dim], got {tuple(q.shape)}.")
+        head_dim = int(q.size(-1))
+        if scale.numel() != head_dim:
+            raise RuntimeError(
+                f"quantized-KV attention expected {name} per-channel scale with {head_dim} values, "
+                f"got shape={tuple(scale.shape)}."
+            )
+        return q.contiguous(), scale.reshape(head_dim).contiguous()
+
+    def _quant_kv_fallback_to_fp(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        text_kv,
+        attention_mask,
+        attention,
+        num_key_value_groups,
+        head_dim,
+        reason=None,
+    ):
+        cfg = getattr(self, "quant_kv_attention_config", {})
+        if not bool(cfg.get("fallback_to_fp_attention", False)):
+            if reason is not None:
+                raise RuntimeError("quantized-KV attention failed and fallback_to_fp_attention=False.") from reason
+            raise RuntimeError("quantized-KV attention failed and fallback_to_fp_attention=False.")
+        self.quant_kv_attention_stats["fallback_count"] += 1
+        if not self.quant_kv_attention_warned_fallback:
+            print("GOFA quantized-KV attention warning: falling back to fp attention for unsupported payload/backend.")
+            self.quant_kv_attention_warned_fallback = True
+        cached_keys = dequantize_tensor(text_kv.key_quant_payload, dtype=key_states.dtype).unsqueeze(0).to(
+            device=key_states.device,
+            dtype=key_states.dtype,
+        )
+        cached_values = dequantize_tensor(text_kv.value_quant_payload, dtype=value_states.dtype).unsqueeze(0).to(
+            device=value_states.device,
+            dtype=value_states.dtype,
+        )
+        key_states = torch.cat([cached_keys, key_states], dim=-2)
+        value_states = torch.cat([cached_values, value_states], dim=-2)
+        key_states = repeat_kv(key_states, num_key_value_groups)
+        value_states = repeat_kv(value_states, num_key_value_groups)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+        softmax_start = time.perf_counter()
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        self._quant_kv_stat_add("softmax_time_s", time.perf_counter() - softmax_start)
+        attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
+        return torch.matmul(attn_weights, value_states), attn_weights
+
+    def _memory_kv_quantized_attention(
+        self,
+        attention,
+        query_states,
+        key_states,
+        value_states,
+        text_kv,
+        attention_mask,
+        output_attentions,
+        num_key_value_groups,
+        head_dim,
+    ):
+        cfg = getattr(self, "quant_kv_attention_config", {})
+        if cfg.get("backend") != "torch_int_mm_qscale_fold":
+            raise RuntimeError("quantized-KV attention supports only backend=torch_int_mm_qscale_fold.")
+        if not bool(cfg.get("key_scale_fold_into_q", True)):
+            raise RuntimeError("quantized-KV attention requires key_scale_fold_into_q=True.")
+        if int(cfg.get("quantize_query_bits", 8)) != 8:
+            raise RuntimeError("quantized-KV attention currently supports only quantize_query_bits=8.")
+        if not bool(cfg.get("use_int_qk", True)):
+            raise RuntimeError("quantized-KV attention requires use_int_qk=True.")
+        if cfg.get("pv_compute_mode") != "scale_delayed_v":
+            raise RuntimeError("quantized-KV attention supports only pv_compute_mode=scale_delayed_v.")
+        try:
+            if not hasattr(torch, "_int_mm"):
+                raise RuntimeError("torch._int_mm is unavailable.")
+            if query_states.device.type != "cuda":
+                raise RuntimeError("torch._int_mm quantized-KV attention requires CUDA tensors.")
+
+            stats = self.quant_kv_attention_stats
+            stats["quant_kv_attention_call_count"] += 1
+            device = query_states.device
+            dtype = query_states.dtype
+            bsz, num_heads, q_len, _ = query_states.shape
+            _, num_kv_heads, current_len, _ = key_states.shape
+            key_bits = int(cfg.get("key_bits", 4))
+            value_bits = int(cfg.get("value_bits", 4))
+
+            k_unpack_start = time.perf_counter()
+            k_int, scale_k = self._quant_kv_payload_to_q_scale(text_kv.key_quant_payload, key_bits, device, "key")
+            self._quant_kv_stat_add("k_unpack_time_s", time.perf_counter() - k_unpack_start)
+            v_unpack_start = time.perf_counter()
+            v_int, scale_v = self._quant_kv_payload_to_q_scale(text_kv.value_quant_payload, value_bits, device, "value")
+            self._quant_kv_stat_add("v_unpack_time_s", time.perf_counter() - v_unpack_start)
+
+            if k_int.size(0) != num_kv_heads or v_int.size(0) != num_kv_heads:
+                raise RuntimeError(
+                    "quantized-KV attention kv head mismatch: "
+                    f"k_heads={k_int.size(0)}, v_heads={v_int.size(0)}, expected={num_kv_heads}."
+                )
+            if k_int.size(-1) != head_dim or v_int.size(-1) != head_dim:
+                raise RuntimeError(
+                    "quantized-KV attention head_dim mismatch: "
+                    f"k={k_int.size(-1)}, v={v_int.size(-1)}, expected={head_dim}."
+                )
+            text_len = int(k_int.size(1))
+            if int(v_int.size(1)) != text_len:
+                raise RuntimeError(f"quantized-KV attention K/V seq mismatch: k={text_len}, v={v_int.size(1)}.")
+
+            current_key_states = repeat_kv(key_states, num_key_value_groups)
+            current_value_states = repeat_kv(value_states, num_key_value_groups)
+            current_logits = torch.matmul(
+                query_states.float(),
+                current_key_states.float().transpose(2, 3),
+            ) / math.sqrt(head_dim)
+            cached_logits = torch.empty((bsz, num_heads, q_len, text_len), dtype=torch.float32, device=device)
+
+            if text_len > 0:
+                for batch_idx in range(bsz):
+                    for head_idx in range(num_heads):
+                        kv_head_idx = head_idx // num_key_value_groups
+                        q_fp = query_states[batch_idx, head_idx].float()
+
+                        fold_start = time.perf_counter()
+                        q_eff = q_fp * scale_k.reshape(1, head_dim)
+                        self._quant_kv_stat_add("q_scale_fold_time_s", time.perf_counter() - fold_start)
+
+                        quant_start = time.perf_counter()
+                        scale_q_eff = (q_eff.abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-12)
+                        q_eff_int8 = torch.round(q_eff / scale_q_eff).clamp(-127, 127).to(torch.int8).contiguous()
+                        q_eff_int8, original_m = _pad_int8_rows_to_multiple(q_eff_int8)
+                        self._quant_kv_stat_add("q_eff_quant_time_s", time.perf_counter() - quant_start)
+
+                        qk_start = time.perf_counter()
+                        k_head_int8, original_n = _pad_int8_rows_to_multiple(k_int[kv_head_idx].contiguous())
+                        logits_int = torch._int_mm(q_eff_int8, k_head_int8.t().contiguous())
+                        if logits_int.size(0) != original_m or logits_int.size(1) != original_n:
+                            logits_int = logits_int[:original_m, :original_n].contiguous()
+                        self._quant_kv_stat_add("qk_int_mm_time_s", time.perf_counter() - qk_start)
+
+                        dequant_start = time.perf_counter()
+                        # scale_k is already folded into q_eff, so do not multiply scale_k here.
+                        cached_logits[batch_idx, head_idx] = logits_int.float() * scale_q_eff / math.sqrt(head_dim)
+                        self._quant_kv_stat_add("logits_dequant_time_s", time.perf_counter() - dequant_start)
+
+            attn_weights = torch.cat([cached_logits, current_logits], dim=-1)
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask[:, :, :, : text_len + current_len]
+            softmax_start = time.perf_counter()
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
+            self._quant_kv_stat_add("softmax_time_s", time.perf_counter() - softmax_start)
+            attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
+
+            cached_output = torch.zeros((bsz, num_heads, q_len, head_dim), dtype=dtype, device=device)
+            if text_len > 0:
+                cached_probs = attn_weights[:, :, :, :text_len]
+                for batch_idx in range(bsz):
+                    for head_idx in range(num_heads):
+                        kv_head_idx = head_idx // num_key_value_groups
+                        pv_start = time.perf_counter()
+                        pv = torch.matmul(cached_probs[batch_idx, head_idx], v_int[kv_head_idx].to(dtype=dtype))
+                        self._quant_kv_stat_add("pv_matmul_time_s", time.perf_counter() - pv_start)
+
+                        scale_start = time.perf_counter()
+                        cached_output[batch_idx, head_idx] = (pv.float() * scale_v.reshape(1, head_dim)).to(dtype)
+                        self._quant_kv_stat_add("v_scale_apply_time_s", time.perf_counter() - scale_start)
+            current_probs = attn_weights[:, :, :, text_len:]
+            current_output = torch.matmul(current_probs, current_value_states)
+            attn_output = cached_output + current_output
+
+            if not stats.get("example_shapes"):
+                stats["example_shapes"] = {
+                    "q": tuple(query_states.shape),
+                    "k_int": tuple(k_int.shape),
+                    "v_int": tuple(v_int.shape),
+                    "scale_k": tuple(scale_k.shape),
+                    "scale_v": tuple(scale_v.shape),
+                    "logits": tuple(attn_weights.shape),
+                }
+            if not output_attentions:
+                returned_attn_weights = None
+            else:
+                returned_attn_weights = attn_weights
+            return attn_output, returned_attn_weights
+        except Exception as exc:
+            return self._quant_kv_fallback_to_fp(
+                query_states,
+                key_states,
+                value_states,
+                text_kv,
+                attention_mask,
+                attention,
+                num_key_value_groups,
+                head_dim,
+                reason=exc,
+            )
 
     def _memory_kv_attention_breakdown(
         self,
@@ -207,22 +466,37 @@ class GOFAMistralModel(MistralModel):
         rope_start = self._stage_profile_start(query_states)
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = text_kv.update(
-            key_states, value_states, getattr(attention, "layer_idx", g_layer_idx), cache_kwargs
-        )
-        key_states = repeat_kv(key_states, num_key_value_groups)
-        value_states = repeat_kv(value_states, num_key_value_groups)
-        self._stage_profile_add("memory_kv_rope_cache_s", rope_start, key_states, g_layer_idx)
+        if getattr(text_kv, "quantized_kv_attention", False) and self._quant_kv_attention_enabled():
+            self._stage_profile_add("memory_kv_rope_cache_s", rope_start, key_states, g_layer_idx)
+            attn_start = self._stage_profile_start(query_states)
+            attn_output, attn_weights = self._memory_kv_quantized_attention(
+                attention,
+                query_states,
+                key_states,
+                value_states,
+                text_kv,
+                attention_mask,
+                output_attentions,
+                num_key_value_groups,
+                head_dim,
+            )
+        else:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = text_kv.update(
+                key_states, value_states, getattr(attention, "layer_idx", g_layer_idx), cache_kwargs
+            )
+            key_states = repeat_kv(key_states, num_key_value_groups)
+            value_states = repeat_kv(value_states, num_key_value_groups)
+            self._stage_profile_add("memory_kv_rope_cache_s", rope_start, key_states, g_layer_idx)
 
-        attn_start = self._stage_profile_start(query_states)
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
-        if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+            attn_start = self._stage_profile_start(query_states)
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+            if attention_mask is not None:
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
+            attn_output = torch.matmul(attn_weights, value_states)
         self._stage_profile_add("memory_kv_attn_scores_s", attn_start, attn_output, g_layer_idx)
 
         o_proj_start = self._stage_profile_start(attn_output)
@@ -526,15 +800,29 @@ class GOFAMistralModel(MistralModel):
                 )
                 kv = item["text_kv"][g_layer_idx]
                 kv_to_device_start = self._stage_profile_start(mem_hidden_states)
-                text_cache = _SingleLayerKVCache(
-                    kv["key"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
-                    kv["value"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
+                use_quant_kv_attention = (
+                    self._quant_kv_attention_enabled() and
+                    isinstance(kv, dict) and
+                    bool(kv.get("quantized", False))
                 )
+                if use_quant_kv_attention:
+                    text_cache = _SingleLayerKVCache(
+                        key_quant_payload=kv["key"],
+                        value_quant_payload=kv["value"],
+                    )
+                    profile_ref = mem_hidden_states
+                else:
+                    text_cache = _SingleLayerKVCache(
+                        kv["key"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
+                        kv["value"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
+                    )
+                    profile_ref = text_cache.key_states
                 self._stage_profile_add(
-                    "memory_kv_text_kv_to_device_s", kv_to_device_start, text_cache.key_states, g_layer_idx
+                    "memory_kv_text_kv_to_device_s", kv_to_device_start, profile_ref, g_layer_idx
                 )
                 position_embeddings = self.rotary_emb(mem_hidden_states, position_ids)
-                if self._stage_profile_enabled() and getattr(self, "profile_memory_kv_transformer_breakdown", False):
+                if use_quant_kv_attention or (
+                        self._stage_profile_enabled() and getattr(self, "profile_memory_kv_transformer_breakdown", False)):
                     layer_outputs = self._memory_kv_decoder_layer_breakdown(
                         decoder_layer,
                         mem_hidden_states,

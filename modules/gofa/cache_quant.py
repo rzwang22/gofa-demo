@@ -171,6 +171,35 @@ def dequantize_tensor(payload: Dict, dtype: Optional[torch.dtype] = None) -> tor
     return tensor.to(dtype=target_dtype).contiguous()
 
 
+def quantized_tensor_int(payload: Dict, device: Optional[torch.device] = None) -> torch.Tensor:
+    encoding = payload.get("encoding")
+    if encoding != "symmetric_per_channel":
+        raise ValueError(f"Expected symmetric_per_channel quant payload, got encoding={encoding}.")
+    shape = list(payload["shape"])
+    if payload.get("packed"):
+        q = _unpack_low_bit(
+            payload["q_packed"],
+            int(payload.get("pack_bits") or payload.get("bits")),
+            int(payload["numel"]),
+            shape,
+        )
+    else:
+        q = payload["q"].reshape(tuple(shape)).to(torch.int8)
+    if device is not None:
+        q = q.to(device=device, dtype=torch.int8, non_blocking=True)
+    return q.contiguous()
+
+
+def quantized_tensor_scale(payload: Dict, device: Optional[torch.device] = None) -> torch.Tensor:
+    encoding = payload.get("encoding")
+    if encoding != "symmetric_per_channel":
+        raise ValueError(f"Expected symmetric_per_channel quant payload, got encoding={encoding}.")
+    scale = payload["scale"].to(torch.float32)
+    if device is not None:
+        scale = scale.to(device=device, dtype=torch.float32, non_blocking=True)
+    return scale.contiguous()
+
+
 def quantize_base_delta_tensor(
     tensor: torch.Tensor,
     base_bits: int = 8,
@@ -308,6 +337,7 @@ def reconstruct_scheme_b_cache_item(
     load_memory_delta: bool = True,
     load_key_delta: bool = True,
     load_value_delta: bool = True,
+    preserve_quantized_text_kv: bool = False,
     dtype: Optional[torch.dtype] = None,
 ) -> Dict:
     should_load_delta = load_delta and delta_payload is not None and bool(base_payload.get("has_delta", True))
@@ -325,6 +355,20 @@ def reconstruct_scheme_b_cache_item(
         layer_delta = None
         if should_load_delta and delta_payload is not None:
             layer_delta = delta_payload["text_kv"][layer_idx]
+        if preserve_quantized_text_kv:
+            if should_load_key_delta or should_load_value_delta:
+                raise NotImplementedError(
+                    "preserve_quantized_text_kv=True currently supports base-only text-side K/V. "
+                    "Disable load_key_delta/load_value_delta or target-aware text-KV delta loading."
+                )
+            text_kv.append(
+                {
+                    "key": layer_base["key"],
+                    "value": layer_base["value"],
+                    "quantized": True,
+                }
+            )
+            continue
         text_kv.append(
             {
                 "key": reconstruct_base_delta_tensor(

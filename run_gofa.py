@@ -192,6 +192,22 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "scheme_b_quant_kv_attention"):
+        model_args.scheme_b_quant_kv_attention = params.scheme_b_quant_kv_attention
+    for field_name in (
+        "scheme_b_quant_kv_attention_enabled",
+        "scheme_b_quant_kv_attention_backend",
+        "scheme_b_quant_kv_attention_key_scale_fold_into_q",
+        "scheme_b_quant_kv_attention_quantize_query_bits",
+        "scheme_b_quant_kv_attention_key_bits",
+        "scheme_b_quant_kv_attention_value_bits",
+        "scheme_b_quant_kv_attention_use_int_qk",
+        "scheme_b_quant_kv_attention_pv_compute_mode",
+        "scheme_b_quant_kv_attention_fallback_to_fp_attention",
+        "scheme_b_quant_kv_attention_log_interval",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     if hasattr(params, "scheme_b_activation_observer"):
         model_args.scheme_b_activation_observer = params.scheme_b_activation_observer
     for field_name in (

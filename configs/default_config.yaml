@@ -115,6 +115,17 @@ scheme_b_int_gemm:
   fallback_to_fake_quant: False
   log_modules: True
   log_interval: 20
+scheme_b_quant_kv_attention:
+  enabled: False
+  backend: "torch_int_mm_qscale_fold"
+  key_scale_fold_into_q: True
+  quantize_query_bits: 8
+  key_bits: 4
+  value_bits: 4
+  use_int_qk: True
+  pv_compute_mode: "scale_delayed_v"
+  fallback_to_fp_attention: False
+  log_interval: 20
 scheme_b_activation_observer:
   enabled: False
   output_dir: ""
