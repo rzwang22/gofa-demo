@@ -21,6 +21,7 @@ from modules.gofa.weight_quant import (
 SUPPORTED_INT_GEMM_WEIGHT_BITS = {4}
 SUPPORTED_INT_GEMM_ACTIVATION_BITS = {8}
 SUPPORTED_INT_GEMM_BACKENDS = {"torch_int_mm"}
+TORCH_INT_MM_M_ALIGNMENT = 32
 
 
 @dataclass
@@ -73,6 +74,29 @@ def quantize_weight_symmetric_int4_per_output(weight: torch.Tensor) -> Tuple[tor
     scale_w = (weight_f.abs().amax(dim=1, keepdim=True) / float(qmax)).clamp(min=1e-12).to(torch.float32)
     q_weight = torch.round(weight_f / scale_w).clamp(-qmax, qmax).to(torch.int8).contiguous()
     return q_weight.cpu(), scale_w.cpu()
+
+
+def pad_int8_rows_to_multiple(
+        tensor: torch.Tensor,
+        multiple: int = TORCH_INT_MM_M_ALIGNMENT) -> Tuple[torch.Tensor, int]:
+    if tensor.dim() != 2:
+        raise ValueError(f"Expected a 2D int8 tensor, got shape={tuple(tensor.shape)}.")
+    if tensor.dtype != torch.int8:
+        raise ValueError(f"Expected an int8 tensor, got dtype={tensor.dtype}.")
+    multiple = int(multiple)
+    if multiple <= 0:
+        raise ValueError("Row padding multiple must be positive.")
+    original_rows = int(tensor.size(0))
+    padded_rows = ((original_rows + multiple - 1) // multiple) * multiple
+    if padded_rows == original_rows:
+        return tensor.contiguous(), original_rows
+    padded = torch.zeros(
+        (padded_rows, int(tensor.size(1))),
+        dtype=torch.int8,
+        device=tensor.device,
+    )
+    padded[:original_rows].copy_(tensor)
+    return padded.contiguous(), original_rows
 
 
 def _fake_quant_activation_symmetric_a8(activation: torch.Tensor) -> torch.Tensor:
@@ -267,11 +291,14 @@ class SuffixTransformerIntGemmQuantizer:
         q_x = torch.round(x_f / scale_x).clamp(-qmax, qmax).to(torch.int8).contiguous()
         q_w, scale_w = self._device_payload(item, input_tensor.device)
         q_w_t = q_w.t().contiguous()
+        q_x_for_mm, original_m = pad_int8_rows_to_multiple(q_x, TORCH_INT_MM_M_ALIGNMENT)
         quant_elapsed = time.perf_counter() - quant_start
 
         int_mm_start = time.perf_counter()
         try:
-            y_int = torch._int_mm(q_x, q_w_t)
+            y_int = torch._int_mm(q_x_for_mm, q_w_t)
+            if y_int.size(0) != original_m:
+                y_int = y_int[:original_m].contiguous()
         except Exception as exc:
             if not self.fallback_to_fake_quant:
                 raise RuntimeError(
