@@ -228,6 +228,7 @@ class GOFAMistralModel(MistralModel):
             "pv_dequant_time_s": 0.0,
             "pv_int_mm_shape_examples": [],
             "fallback_count_pv": 0,
+            "kv_empty_count": 0,
             "int_pv_compare_rel_l2_error": None,
             "int_pv_compare_cosine_similarity": None,
             "int_pv_compare_max_abs_error": None,
@@ -997,6 +998,7 @@ class GOFAMistralModel(MistralModel):
             next_memory_states = []
             for item_idx, item in enumerate(mapped_items):
                 text_len = item["text_len"]
+                text_kv_len = int(item.get("kv_text_len", text_len))
                 mem_hidden_states = memory_states[item_idx:item_idx + 1]
                 cache_position = torch.arange(
                     text_len,
@@ -1006,8 +1008,8 @@ class GOFAMistralModel(MistralModel):
                 position_ids = cache_position.unsqueeze(0)
                 causal_mask = self._make_block_causal_mask(
                     self.gofa_config.mem_token,
-                    text_len + self.gofa_config.mem_token,
-                    text_len,
+                    text_kv_len + self.gofa_config.mem_token,
+                    text_kv_len,
                     mem_hidden_states.dtype,
                     mem_hidden_states.device,
                 )
@@ -1030,6 +1032,10 @@ class GOFAMistralModel(MistralModel):
                         kv["value"].unsqueeze(0).to(device=mem_hidden_states.device, dtype=mem_hidden_states.dtype),
                     )
                     profile_ref = text_cache.key_states
+                if text_kv_len == 0:
+                    self.quant_kv_attention_stats["kv_empty_count"] = (
+                        int(self.quant_kv_attention_stats.get("kv_empty_count", 0)) + 1
+                    )
                 self._stage_profile_add(
                     "memory_kv_text_kv_to_device_s", kv_to_device_start, profile_ref, g_layer_idx
                 )

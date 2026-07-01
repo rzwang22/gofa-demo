@@ -131,6 +131,13 @@ class ModelArguments:
     scheme_b_quant_fake_quant: Optional[bool] = field(default=None)
     scheme_b_quant_debug_zero_base: Optional[bool] = field(default=None)
     scheme_b_quant_strict: Optional[bool] = field(default=None)
+    scheme_b_quant_load_key_base: Optional[bool] = field(default=None)
+    scheme_b_quant_load_value_base: Optional[bool] = field(default=None)
+    scheme_b_quant_kv_base_load_policy: Optional[str] = field(default=None)
+    scheme_b_quant_kv_base_target_hops: Optional[int] = field(default=None)
+    scheme_b_quant_kv_base_local_degree_top_ratio: Optional[float] = field(default=None)
+    scheme_b_quant_kv_base_local_degree_threshold: Optional[Any] = field(default=None)
+    scheme_b_quant_kv_base_keep_target_edges: Optional[bool] = field(default=None)
     scheme_b_quant_load_memory_delta: Optional[bool] = field(default=None)
     scheme_b_quant_load_key_delta: Optional[bool] = field(default=None)
     scheme_b_quant_load_value_delta: Optional[bool] = field(default=None)
@@ -527,7 +534,14 @@ class GOFAMistral(torch.nn.Module):
                         f"load_value_delta={self.scheme_b_quant['load_value_delta']}, "
                         f"fake_quant={self.scheme_b_quant['fake_quant']}, "
                         f"debug_zero_base={self.scheme_b_quant['debug_zero_base']}, "
-                        f"strict={self.scheme_b_quant['strict']}"
+                        f"strict={self.scheme_b_quant['strict']}, "
+                        f"load_key_base={self.scheme_b_quant['load_key_base']}, "
+                        f"load_value_base={self.scheme_b_quant['load_value_base']}, "
+                        f"kv_base_load_policy={self.scheme_b_quant['kv_base_load_policy']}, "
+                        f"kv_base_target_hops={self.scheme_b_quant['kv_base_target_hops']}, "
+                        f"kv_base_local_degree_top_ratio={self.scheme_b_quant['kv_base_local_degree_top_ratio']}, "
+                        f"kv_base_local_degree_threshold={self.scheme_b_quant['kv_base_local_degree_threshold']}, "
+                        f"kv_base_keep_target_edges={self.scheme_b_quant['kv_base_keep_target_edges']}"
                     )
                     print(
                         "GOFA scheme-B quant cache path roots: "
@@ -707,6 +721,13 @@ class GOFAMistral(torch.nn.Module):
             "fake_quant": True,
             "debug_zero_base": False,
             "strict": True,
+            "load_key_base": True,
+            "load_value_base": True,
+            "kv_base_load_policy": "all",
+            "kv_base_target_hops": 1,
+            "kv_base_local_degree_top_ratio": 0.0,
+            "kv_base_local_degree_threshold": None,
+            "kv_base_keep_target_edges": True,
             "load_memory_delta": True,
             "load_key_delta": True,
             "load_value_delta": True,
@@ -737,6 +758,13 @@ class GOFAMistral(torch.nn.Module):
             "fake_quant": "scheme_b_quant_fake_quant",
             "debug_zero_base": "scheme_b_quant_debug_zero_base",
             "strict": "scheme_b_quant_strict",
+            "load_key_base": "scheme_b_quant_load_key_base",
+            "load_value_base": "scheme_b_quant_load_value_base",
+            "kv_base_load_policy": "scheme_b_quant_kv_base_load_policy",
+            "kv_base_target_hops": "scheme_b_quant_kv_base_target_hops",
+            "kv_base_local_degree_top_ratio": "scheme_b_quant_kv_base_local_degree_top_ratio",
+            "kv_base_local_degree_threshold": "scheme_b_quant_kv_base_local_degree_threshold",
+            "kv_base_keep_target_edges": "scheme_b_quant_kv_base_keep_target_edges",
             "load_memory_delta": "scheme_b_quant_load_memory_delta",
             "load_key_delta": "scheme_b_quant_load_key_delta",
             "load_value_delta": "scheme_b_quant_load_value_delta",
@@ -792,6 +820,28 @@ class GOFAMistral(torch.nn.Module):
         cfg["fake_quant"] = bool(cfg["fake_quant"])
         cfg["debug_zero_base"] = bool(cfg["debug_zero_base"])
         cfg["strict"] = bool(cfg["strict"])
+        cfg["load_key_base"] = bool(cfg["load_key_base"])
+        cfg["load_value_base"] = bool(cfg["load_value_base"])
+        cfg["kv_base_load_policy"] = str(cfg["kv_base_load_policy"] or "all")
+        if cfg["kv_base_load_policy"] not in {
+            "all",
+            "none",
+            "target_only",
+            "target_1hop",
+            "local_degree_top",
+            "target_1hop_local_degree",
+        }:
+            raise ValueError(
+                "scheme_b_quant.kv_base_load_policy must be one of all, none, target_only, "
+                "target_1hop, local_degree_top, target_1hop_local_degree."
+            )
+        cfg["kv_base_target_hops"] = max(int(cfg["kv_base_target_hops"]), 0)
+        cfg["kv_base_local_degree_top_ratio"] = max(float(cfg["kv_base_local_degree_top_ratio"]), 0.0)
+        if isinstance(cfg["kv_base_local_degree_threshold"], str) and cfg["kv_base_local_degree_threshold"].strip().lower() in {"", "none", "null"}:
+            cfg["kv_base_local_degree_threshold"] = None
+        if cfg["kv_base_local_degree_threshold"] is not None:
+            cfg["kv_base_local_degree_threshold"] = float(cfg["kv_base_local_degree_threshold"])
+        cfg["kv_base_keep_target_edges"] = bool(cfg["kv_base_keep_target_edges"])
         cfg["load_memory_delta"] = bool(cfg["load_memory_delta"])
         cfg["load_key_delta"] = bool(cfg["load_key_delta"])
         cfg["load_value_delta"] = bool(cfg["load_value_delta"])
@@ -1333,6 +1383,7 @@ class GOFAMistral(torch.nn.Module):
             f"pv_int_mm_shape_examples={stats.get('pv_int_mm_shape_examples', [])}, "
             f"fallback_count={fallback_count}, "
             f"fallback_count_pv={fallback_count_pv}, "
+            f"kv_empty_count={stats.get('kv_empty_count', 0)}, "
             f"backend={self.scheme_b_quant_kv_attention.get('backend')}, "
             f"key_scale_fold_into_q={self.scheme_b_quant_kv_attention.get('key_scale_fold_into_q')}, "
             f"key_bits={self.scheme_b_quant_kv_attention.get('key_bits')}, "
@@ -2091,6 +2142,14 @@ class GOFAMistral(torch.nn.Module):
             "online_compute_count_under_quant": 0,
             "quant_base_loaded_bytes": 0,
             "quant_delta_loaded_bytes": 0,
+            "memory_base_loaded_bytes": 0,
+            "key_base_loaded_bytes": 0,
+            "value_base_loaded_bytes": 0,
+            "key_base_selected_item_count": 0,
+            "value_base_selected_item_count": 0,
+            "key_base_skipped_item_count": 0,
+            "value_base_skipped_item_count": 0,
+            "kv_empty_count": 0,
             "memory_delta_load_count": 0,
             "key_delta_load_count": 0,
             "value_delta_load_count": 0,
@@ -2101,6 +2160,24 @@ class GOFAMistral(torch.nn.Module):
 
     def _scheme_b_quant_bytes_from_bits(self, bit_count):
         return (int(bit_count) + 7) // 8
+
+    def _scheme_b_quant_base_component_bytes(self, base_payload):
+        component_bytes = {"memory": 0, "key": 0, "value": 0}
+        if not isinstance(base_payload, dict):
+            return component_bytes
+        component_bytes["memory"] = self._scheme_b_quant_bytes_from_bits(
+            estimate_quantized_tensor_bits(base_payload.get("memory_state"))
+        )
+        for layer_base in base_payload.get("text_kv", []):
+            if not isinstance(layer_base, dict):
+                continue
+            component_bytes["key"] += self._scheme_b_quant_bytes_from_bits(
+                estimate_quantized_tensor_bits(layer_base.get("key"))
+            )
+            component_bytes["value"] += self._scheme_b_quant_bytes_from_bits(
+                estimate_quantized_tensor_bits(layer_base.get("value"))
+            )
+        return component_bytes
 
     def _scheme_b_quant_delta_component_bytes(self, delta_payload):
         component_bytes = {"memory": 0, "key": 0, "value": 0}
@@ -2485,6 +2562,124 @@ class GOFAMistral(torch.nn.Module):
             self.scheme_b_ablation["mode"] == "target_only_zero_others"
         )
 
+    def _build_scheme_b_kv_base_load_masks(self, graph, num_items, eligible_indices):
+        cfg = self.scheme_b_quant
+        eligible = {int(idx) for idx in eligible_indices if 0 <= int(idx) < int(num_items)}
+        policy = str(cfg["kv_base_load_policy"] or "all")
+        num_node_feat = int(getattr(graph, "num_node_feat", num_items)) if graph is not None else int(num_items)
+        num_node_feat = min(num_node_feat, int(num_items))
+        target_nodes = set(self._scheme_b_target_local_indices(graph))
+        selected_target_nodes = set()
+        selected_hop_nodes = set()
+        selected_local_degree_nodes = set()
+        selected_edges = set()
+
+        if policy == "all":
+            selected_items = set(eligible)
+            selected_target_nodes = {idx for idx in target_nodes if idx in selected_items}
+            hop_distances = local_neighbors_by_hop(
+                graph,
+                target_nodes,
+                max_hops=int(cfg["kv_base_target_hops"]),
+            ) if graph is not None else {}
+            selected_hop_nodes = {
+                idx for idx, distance in hop_distances.items()
+                if idx in selected_items and distance is not None and distance <= int(cfg["kv_base_target_hops"])
+            }
+            selected_edges = {idx for idx in selected_items if idx >= num_node_feat}
+        elif policy == "none":
+            selected_items = set()
+        else:
+            load_policy, details = build_scheme_b_load_policy(
+                graph,
+                static_tiers=None,
+                num_items=int(num_items),
+                target_aware_delta=True,
+                target_aware_policy=policy,
+                target_delta_hops=cfg["kv_base_target_hops"],
+                keep_target_edges=cfg["kv_base_keep_target_edges"],
+                local_degree_top_ratio=cfg["kv_base_local_degree_top_ratio"],
+                local_degree_threshold=cfg["kv_base_local_degree_threshold"],
+                max_delta_items_per_batch=None,
+                return_details=True,
+            )
+            selected_items = {idx for idx, item_policy in enumerate(load_policy) if item_policy == BASE_DELTA}
+            selected_items &= eligible
+            selected_target_nodes = set(details.get("target_node_indices", [])) & selected_items
+            selected_hop_nodes = set(details.get("target_or_hop_node_indices", [])) & selected_items
+            selected_local_degree_nodes = set(details.get("local_degree_node_indices", [])) & selected_items
+            selected_edges = set(details.get("edge_item_indices", [])) & selected_items
+
+        key_selected = set(selected_items) if cfg["load_key_base"] else set()
+        value_selected = set(selected_items) if cfg["load_value_base"] else set()
+        complete_kv_selected = key_selected & value_selected
+        key_masks = [idx in key_selected for idx in range(int(num_items))]
+        value_masks = [idx in value_selected for idx in range(int(num_items))]
+        complete_masks = [idx in complete_kv_selected for idx in range(int(num_items))]
+        details = {
+            "kv_base_load_policy": policy,
+            "load_key_base": bool(cfg["load_key_base"]),
+            "load_value_base": bool(cfg["load_value_base"]),
+            "total_cache_items": len(eligible),
+            "key_base_selected_item_count": len(key_selected),
+            "value_base_selected_item_count": len(value_selected),
+            "key_base_skipped_item_count": len(eligible - key_selected),
+            "value_base_skipped_item_count": len(eligible - value_selected),
+            "complete_kv_selected_item_count": len(complete_kv_selected),
+            "selected_target_item_count": len(selected_target_nodes),
+            "selected_1hop_item_count": len(selected_hop_nodes - selected_target_nodes),
+            "selected_local_degree_item_count": len(selected_local_degree_nodes),
+            "selected_edge_item_count": len(selected_edges),
+            "selected_target_item_indices": sorted(selected_target_nodes),
+            "selected_1hop_item_indices": sorted(selected_hop_nodes - selected_target_nodes),
+            "selected_local_degree_item_indices": sorted(selected_local_degree_nodes),
+            "selected_edge_item_indices": sorted(selected_edges),
+            "kv_base_load_ratio": (len(complete_kv_selected) / len(eligible)) if eligible else 0.0,
+        }
+        return key_masks, value_masks, complete_masks, details
+
+    def _empty_scheme_b_tensor_like_text_kv(self, tensor):
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        shape = list(tensor.shape)
+        if len(shape) >= 2:
+            shape[-2] = 0
+        return torch.empty(tuple(shape), dtype=tensor.dtype, device=tensor.device)
+
+    def _apply_scheme_b_kv_base_policy_to_loaded_cache_item(self, cache_item, keep_key_base, keep_value_base):
+        if cache_item is None or (keep_key_base and keep_value_base):
+            if cache_item is not None:
+                cache_item.setdefault("kv_text_len", cache_item.get("text_len", 0))
+                cache_item.setdefault("text_kv_loaded", True)
+            return
+        for layer_kv in cache_item.get("text_kv", []):
+            key = layer_kv.get("key")
+            value = layer_kv.get("value")
+            empty_key = self._empty_scheme_b_tensor_like_text_kv(key)
+            empty_value = self._empty_scheme_b_tensor_like_text_kv(value)
+            if empty_key is not None:
+                layer_kv["key"] = empty_key
+            if empty_value is not None:
+                layer_kv["value"] = empty_value
+            layer_kv["quantized"] = False
+            layer_kv["kv_loaded"] = False
+        cache_item["kv_text_len"] = 0
+        cache_item["text_kv_loaded"] = False
+
+    def _validate_scheme_b_selected_kv_base_payload(self, base_payload, load_key_base, load_value_base):
+        if not (load_key_base and load_value_base):
+            return
+        text_kv = base_payload.get("text_kv")
+        if not isinstance(text_kv, list):
+            raise RuntimeError("selected Scheme-B KV base payload has invalid text_kv structure.")
+        for layer_idx, layer_base in enumerate(text_kv):
+            if not isinstance(layer_base, dict):
+                raise RuntimeError(f"selected Scheme-B KV base payload layer {layer_idx} is not a dict.")
+            if layer_base.get("key") is None:
+                raise RuntimeError(f"selected Scheme-B KV base payload layer {layer_idx} is missing key base.")
+            if layer_base.get("value") is None:
+                raise RuntimeError(f"selected Scheme-B KV base payload layer {layer_idx} is missing value base.")
+
     def _scheme_b_int_list(self, value):
         if value is None:
             return []
@@ -2806,6 +3001,34 @@ class GOFAMistral(torch.nn.Module):
                 f"cache_tag={self.encoder_cache_namespace}"
             )
 
+        kv_base_eligible_indices = [
+            idx for idx in range(len(token_ids))
+            if idx not in skip_cache_indices and (quant_base_payloads[idx] is not None or cache_items[idx] is not None)
+        ]
+        key_base_load_mask, value_base_load_mask, complete_kv_base_load_mask, kv_base_policy_details = (
+            self._build_scheme_b_kv_base_load_masks(graph, len(token_ids), kv_base_eligible_indices)
+            if self.scheme_b_quant_enabled else
+            ([True] * len(token_ids), [True] * len(token_ids), [True] * len(token_ids), {})
+        )
+        if self.scheme_b_quant_enabled:
+            current_quant_stats["key_base_selected_item_count"] += kv_base_policy_details.get("key_base_selected_item_count", 0)
+            current_quant_stats["value_base_selected_item_count"] += kv_base_policy_details.get("value_base_selected_item_count", 0)
+            current_quant_stats["key_base_skipped_item_count"] += kv_base_policy_details.get("key_base_skipped_item_count", 0)
+            current_quant_stats["value_base_skipped_item_count"] += kv_base_policy_details.get("value_base_skipped_item_count", 0)
+            current_quant_stats["kv_empty_count"] += (
+                kv_base_policy_details.get("total_cache_items", 0) -
+                kv_base_policy_details.get("complete_kv_selected_item_count", 0)
+            )
+            for payload_idx, base_payload in enumerate(quant_base_payloads):
+                if base_payload is None:
+                    continue
+                component_bytes = self._scheme_b_quant_base_component_bytes(base_payload)
+                current_quant_stats["memory_base_loaded_bytes"] += component_bytes["memory"]
+                if key_base_load_mask[payload_idx] and complete_kv_base_load_mask[payload_idx]:
+                    current_quant_stats["key_base_loaded_bytes"] += component_bytes["key"]
+                if value_base_load_mask[payload_idx] and complete_kv_base_load_mask[payload_idx]:
+                    current_quant_stats["value_base_loaded_bytes"] += component_bytes["value"]
+
         if self.scheme_b_quant_enabled and any(payload is not None for payload in quant_base_payloads):
             load_policy, policy_details = build_scheme_b_load_policy(
                 graph,
@@ -2833,8 +3056,8 @@ class GOFAMistral(torch.nn.Module):
                     base_payload.get("has_delta", True) and
                     (
                         self.scheme_b_quant["load_memory_delta"] or
-                        self.scheme_b_quant["load_key_delta"] or
-                        self.scheme_b_quant["load_value_delta"]
+                        (self.scheme_b_quant["load_key_delta"] and complete_kv_base_load_mask[i]) or
+                        (self.scheme_b_quant["load_value_delta"] and complete_kv_base_load_mask[i])
                     )
                 )
                 if should_load_selected_delta:
@@ -2849,10 +3072,10 @@ class GOFAMistral(torch.nn.Module):
                         if self.scheme_b_quant["load_memory_delta"] and component_bytes["memory"] > 0:
                             current_quant_stats["memory_delta_load_count"] += 1
                             current_quant_stats["memory_delta_loaded_bytes"] += component_bytes["memory"]
-                        if self.scheme_b_quant["load_key_delta"] and component_bytes["key"] > 0:
+                        if self.scheme_b_quant["load_key_delta"] and complete_kv_base_load_mask[i] and component_bytes["key"] > 0:
                             current_quant_stats["key_delta_load_count"] += 1
                             current_quant_stats["key_delta_loaded_bytes"] += component_bytes["key"]
-                        if self.scheme_b_quant["load_value_delta"] and component_bytes["value"] > 0:
+                        if self.scheme_b_quant["load_value_delta"] and complete_kv_base_load_mask[i] and component_bytes["value"] > 0:
                             current_quant_stats["value_delta_load_count"] += 1
                             current_quant_stats["value_delta_loaded_bytes"] += component_bytes["value"]
                     else:
@@ -2866,13 +3089,20 @@ class GOFAMistral(torch.nn.Module):
                             )
                 dequant_start = time.perf_counter()
                 try:
+                    self._validate_scheme_b_selected_kv_base_payload(
+                        base_payload,
+                        key_base_load_mask[i],
+                        value_base_load_mask[i],
+                    )
                     cache_items[i] = reconstruct_scheme_b_cache_item(
                         base_payload,
                         delta_payload=delta_payload,
                         load_delta=load_policy[i] == BASE_DELTA,
                         load_memory_delta=self.scheme_b_quant["load_memory_delta"],
-                        load_key_delta=self.scheme_b_quant["load_key_delta"],
-                        load_value_delta=self.scheme_b_quant["load_value_delta"],
+                        load_key_delta=self.scheme_b_quant["load_key_delta"] and complete_kv_base_load_mask[i],
+                        load_value_delta=self.scheme_b_quant["load_value_delta"] and complete_kv_base_load_mask[i],
+                        load_key_base=key_base_load_mask[i] and complete_kv_base_load_mask[i],
+                        load_value_base=value_base_load_mask[i] and complete_kv_base_load_mask[i],
                         preserve_quantized_text_kv=self.scheme_b_quant_kv_attention_enabled,
                     )
                     current_quant_stats["quant_reconstruct_count"] += 1
@@ -2906,6 +3136,7 @@ class GOFAMistral(torch.nn.Module):
                             manifest_batch_seen += 1
             quant_log_interval = max(int(self.profile_stage_log_interval), 1)
             if self.encoder_cache_calls < 3 or (self.encoder_cache_calls + 1) % quant_log_interval == 0:
+                quant_kv_stats = getattr(base_model, "quant_kv_attention_stats", {})
                 print(
                     "GOFA scheme-B quant policy: "
                     f"policy={self.scheme_b_quant['target_aware_policy']}, "
@@ -2925,7 +3156,26 @@ class GOFAMistral(torch.nn.Module):
                     f"value_delta_load_count={current_quant_stats['value_delta_load_count']}, "
                     f"memory_delta_loaded_bytes={current_quant_stats['memory_delta_loaded_bytes']}, "
                     f"key_delta_loaded_bytes={current_quant_stats['key_delta_loaded_bytes']}, "
-                    f"value_delta_loaded_bytes={current_quant_stats['value_delta_loaded_bytes']}"
+                    f"value_delta_loaded_bytes={current_quant_stats['value_delta_loaded_bytes']}, "
+                    f"kv_base_load_policy={kv_base_policy_details.get('kv_base_load_policy')}, "
+                    f"load_key_base={kv_base_policy_details.get('load_key_base')}, "
+                    f"load_value_base={kv_base_policy_details.get('load_value_base')}, "
+                    f"total_cache_items={kv_base_policy_details.get('total_cache_items')}, "
+                    f"key_base_selected_item_count={kv_base_policy_details.get('key_base_selected_item_count')}, "
+                    f"value_base_selected_item_count={kv_base_policy_details.get('value_base_selected_item_count')}, "
+                    f"key_base_skipped_item_count={kv_base_policy_details.get('key_base_skipped_item_count')}, "
+                    f"value_base_skipped_item_count={kv_base_policy_details.get('value_base_skipped_item_count')}, "
+                    f"selected_target_item_count={kv_base_policy_details.get('selected_target_item_count')}, "
+                    f"selected_1hop_item_count={kv_base_policy_details.get('selected_1hop_item_count')}, "
+                    f"selected_local_degree_item_count={kv_base_policy_details.get('selected_local_degree_item_count')}, "
+                    f"selected_edge_item_count={kv_base_policy_details.get('selected_edge_item_count')}, "
+                    f"key_base_loaded_bytes={current_quant_stats['key_base_loaded_bytes']}, "
+                    f"value_base_loaded_bytes={current_quant_stats['value_base_loaded_bytes']}, "
+                    f"kv_base_load_ratio={kv_base_policy_details.get('kv_base_load_ratio', 0.0):.2%}, "
+                    f"kv_empty_count={current_quant_stats['kv_empty_count']}, "
+                    f"quant_kv_attention_call_count={quant_kv_stats.get('quant_kv_attention_call_count', 0)}, "
+                    f"fallback_count={quant_kv_stats.get('fallback_count', 0)}, "
+                    f"fallback_count_pv={quant_kv_stats.get('fallback_count_pv', 0)}"
                 )
 
         if self.scheme_b_quant_enabled:
@@ -2990,6 +3240,16 @@ class GOFAMistral(torch.nn.Module):
                         )
                         manifest_batch_seen += 1
             current_timing["save_s"] = time.perf_counter() - save_start
+
+        if self.scheme_b_quant_enabled:
+            for item_idx, cache_item in enumerate(cache_items):
+                if cache_item is None or item_idx in skip_cache_indices:
+                    continue
+                self._apply_scheme_b_kv_base_policy_to_loaded_cache_item(
+                    cache_item,
+                    key_base_load_mask[item_idx] and complete_kv_base_load_mask[item_idx],
+                    value_base_load_mask[item_idx] and complete_kv_base_load_mask[item_idx],
+                )
 
         self._apply_scheme_b_quant_debug_zero_base(cache_items, quant_base_payloads, non_skip_item_count)
         self._apply_scheme_b_ablation(cache_items, graph, skip_cache_indices=skip_cache_indices)

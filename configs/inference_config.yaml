@@ -36,6 +36,13 @@ scheme_b_quant:
   fake_quant: True
   debug_zero_base: False
   strict: True
+  load_key_base: True
+  load_value_base: True
+  kv_base_load_policy: "all"
+  kv_base_target_hops: 1
+  kv_base_local_degree_top_ratio: 0.0
+  kv_base_local_degree_threshold:
+  kv_base_keep_target_edges: True
   load_memory_delta: True
   load_key_delta: True
   load_value_delta: True

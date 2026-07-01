@@ -880,6 +880,101 @@ fallback_count_pv=0
 pv_compute_mode=int_pv
 ```
 
+## Text-Side KV Base Loading Policy
+
+Use these runtime policies to reuse an existing m4k4v4d4 or m4k2v2d4 quant cache while testing how much cached text-side K/V matters. Memory base remains loaded; unselected text K/V is not assembled into attention.
+
+m4k0v0 runtime equivalent, memory 4-bit with no cached text-side K/V:
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_strict True \
+  scheme_b_quant_memory_base_bits 4 \
+  scheme_b_quant_key_base_bits 4 \
+  scheme_b_quant_value_base_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v4d4 \
+  scheme_b_quant_load_key_base False \
+  scheme_b_quant_load_value_base False \
+  scheme_b_quant_kv_base_load_policy none
+```
+
+Target plus 1-hop K/V:
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_strict True \
+  scheme_b_quant_memory_base_bits 4 \
+  scheme_b_quant_key_base_bits 4 \
+  scheme_b_quant_value_base_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v4d4 \
+  scheme_b_quant_load_key_base True \
+  scheme_b_quant_load_value_base True \
+  scheme_b_quant_kv_base_load_policy target_1hop \
+  scheme_b_quant_kv_base_target_hops 1
+```
+
+Target plus 1-hop plus local degree top 10%:
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_strict True \
+  scheme_b_quant_memory_base_bits 4 \
+  scheme_b_quant_key_base_bits 4 \
+  scheme_b_quant_value_base_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v4d4 \
+  scheme_b_quant_load_key_base True \
+  scheme_b_quant_load_value_base True \
+  scheme_b_quant_kv_base_load_policy target_1hop_local_degree \
+  scheme_b_quant_kv_base_target_hops 1 \
+  scheme_b_quant_kv_base_local_degree_top_ratio 0.1
+```
+
+Target plus 1-hop plus local degree top 20%:
+
+```bash
+python run_gofa.py \
+  --override ./configs/inference_config.yaml \
+  use_encoder_cache True \
+  encoder_cache_mode memory_kv \
+  encoder_cache_skip_nog True \
+  scheme_b_quant_enabled True \
+  scheme_b_quant_strict True \
+  scheme_b_quant_memory_base_bits 4 \
+  scheme_b_quant_key_base_bits 4 \
+  scheme_b_quant_value_base_bits 4 \
+  scheme_b_quant_cache_dir /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/quant/cora_link_m4k4v4d4 \
+  scheme_b_quant_load_key_base True \
+  scheme_b_quant_load_value_base True \
+  scheme_b_quant_kv_base_load_policy target_1hop_local_degree \
+  scheme_b_quant_kv_base_target_hops 1 \
+  scheme_b_quant_kv_base_local_degree_top_ratio 0.2
+```
+
+Expected log checks:
+
+```text
+kv_base_load_policy=...
+key_base_loaded_bytes=0 and value_base_loaded_bytes=0 for m4k0v0
+target_1hop kv_base_load_ratio < all
+top20 kv_base_load_ratio > top10
+kv_empty_count>0 when K/V is skipped
+```
+
 ## Scheme-B Cache Tensor Visualization
 
 Inspect sampled full/quantized Scheme-B cache tensors offline. This analyzes `memory_state` and suffix text-side KV cache tensors without changing inference.

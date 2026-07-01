@@ -230,6 +230,19 @@ def reconstruct_base_delta_tensor(
     return base.to(dtype=original_dtype).contiguous()
 
 
+def _empty_text_kv_tensor_from_payload(payload: Dict, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    shape = list(payload.get("shape", []))
+    if not shape:
+        tensor = payload.get("tensor")
+        if isinstance(tensor, torch.Tensor):
+            shape = list(tensor.shape)
+    if len(shape) < 2:
+        raise ValueError(f"Cannot infer empty text-KV shape from payload with shape={shape}.")
+    shape[-2] = 0
+    target_dtype = dtype or _dtype_from_name(payload.get("dtype"))
+    return torch.empty(tuple(shape), dtype=target_dtype)
+
+
 def _quantize_kv_list(
     text_kv,
     key_base_bits: int,
@@ -337,13 +350,16 @@ def reconstruct_scheme_b_cache_item(
     load_memory_delta: bool = True,
     load_key_delta: bool = True,
     load_value_delta: bool = True,
+    load_key_base: bool = True,
+    load_value_base: bool = True,
     preserve_quantized_text_kv: bool = False,
     dtype: Optional[torch.dtype] = None,
 ) -> Dict:
     should_load_delta = load_delta and delta_payload is not None and bool(base_payload.get("has_delta", True))
     should_load_memory_delta = should_load_delta and bool(load_memory_delta)
-    should_load_key_delta = should_load_delta and bool(load_key_delta)
-    should_load_value_delta = should_load_delta and bool(load_value_delta)
+    should_load_text_kv_base = bool(load_key_base) and bool(load_value_base)
+    should_load_key_delta = should_load_delta and should_load_text_kv_base and bool(load_key_delta)
+    should_load_value_delta = should_load_delta and should_load_text_kv_base and bool(load_value_delta)
     memory_state = reconstruct_base_delta_tensor(
         base_payload["memory_state"],
         None if not should_load_memory_delta else delta_payload.get("memory_state"),
@@ -355,6 +371,16 @@ def reconstruct_scheme_b_cache_item(
         layer_delta = None
         if should_load_delta and delta_payload is not None:
             layer_delta = delta_payload["text_kv"][layer_idx]
+        if not should_load_text_kv_base:
+            text_kv.append(
+                {
+                    "key": _empty_text_kv_tensor_from_payload(layer_base["key"], dtype=dtype),
+                    "value": _empty_text_kv_tensor_from_payload(layer_base["value"], dtype=dtype),
+                    "quantized": False,
+                    "kv_loaded": False,
+                }
+            )
+            continue
         if preserve_quantized_text_kv:
             if should_load_key_delta or should_load_value_delta:
                 raise NotImplementedError(
@@ -366,6 +392,7 @@ def reconstruct_scheme_b_cache_item(
                     "key": layer_base["key"],
                     "value": layer_base["value"],
                     "quantized": True,
+                    "kv_loaded": True,
                 }
             )
             continue
@@ -383,10 +410,13 @@ def reconstruct_scheme_b_cache_item(
                     load_delta=should_load_value_delta,
                     dtype=dtype,
                 ),
+                "kv_loaded": True,
             }
         )
     return {
         "text_len": base_payload["text_len"],
+        "kv_text_len": base_payload["text_len"] if should_load_text_kv_base else 0,
+        "text_kv_loaded": should_load_text_kv_base,
         "memory_state": memory_state,
         "text_kv": text_kv,
         "static_tier": base_payload.get("static_tier", "low"),
