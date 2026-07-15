@@ -3,7 +3,7 @@ num_epochs: 0
 mode: generate
 model_name_or_path: /home/rzwang/data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2
 checkpoint_dir: /home/rzwang/data/GOFA/cache_data/model
-load_dir: /home/rzwang/data/GOFA/cache_data/model/nb_instruct.pth
+load_dir: /home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth
 load_model: True
 batch_size: 1
 use_encoder_cache: False

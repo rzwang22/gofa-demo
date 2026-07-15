@@ -23,6 +23,42 @@ import torch
 from types import SimpleNamespace
 
 
+def _first_config_value(value, field_name):
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError(f"Configuration field {field_name!r} must not be empty")
+        return value[0]
+    return value
+
+
+def _resolve_train_sampling_config(params):
+    """Resolve train sampling fields, using inference equivalents when absent."""
+    fallbacks = {
+        "hops": ("inf_hops",),
+        "train_max_nodes_per_hops": ("max_nodes_per_hop", "inf_max_nodes_per_hops"),
+        "instructs": ("inf_instructs",),
+        "selections": ("inf_selections",),
+    }
+    resolved = {}
+    for field_name, fallback_names in fallbacks.items():
+        value = getattr(params, field_name, None)
+        source_name = field_name
+        if value is None:
+            for fallback_name in fallback_names:
+                fallback_value = getattr(params, fallback_name, None)
+                if fallback_value is not None:
+                    value = fallback_value
+                    source_name = fallback_name
+                    break
+        if value is None:
+            fallback_text = ", ".join(repr(name) for name in fallback_names)
+            raise AttributeError(
+                f"Missing configuration field {field_name!r}; expected it directly or via {fallback_text}"
+            )
+        resolved[field_name] = _first_config_value(value, source_name)
+    return resolved
+
+
 def main(params):
     ##################################################################
     #                    Configuration                               #
@@ -333,6 +369,7 @@ def main(params):
     else:
         train_tasks = params.train_task_names
         eval_tasks = params.eval_task_names
+        train_sampling = _resolve_train_sampling_config(params)
 
         if params.run_mode == "ft":
             ######################################################################################################
@@ -346,11 +383,13 @@ def main(params):
             ######################################################################################################
             filter_func = lambda x: x
 
-        train_task = GOFAFineTuneTaskWrapper(train_tasks, root=params.data_root_path, split="train", hop=params.hops,
-                                             max_nodes_per_hop=params.train_max_nodes_per_hops,
+        train_task = GOFAFineTuneTaskWrapper(train_tasks, root=params.data_root_path, split="train",
+                                             hop=train_sampling["hops"],
+                                             max_nodes_per_hop=train_sampling["train_max_nodes_per_hops"],
                                              sample_size=params.sample_size_per_task, filter_func=filter_func,
                                              way=params.ways, num_workers=params.num_workers,
-                                             instruction=params.instructs, selection=params.selections, save_data=True,
+                                             instruction=train_sampling["instructs"],
+                                             selection=train_sampling["selections"], save_data=True,
                                              from_saved=True, fast_data_load=True)
 
         n_steps = int(len(train_task) * params.num_epochs / (params.grad_acc_step * int(torch.cuda.device_count())))

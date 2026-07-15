@@ -13,7 +13,7 @@ cd /home/rzwang/data/GOFA/gofa-demo
 
 export GOFA_DATA_ROOT=/home/rzwang/data/GOFA/TAGDataset
 export GOFA_MODEL_DIR=/home/rzwang/data/GOFA/cache_data/model
-export GOFA_LOAD_DIR=/home/rzwang/data/GOFA/cache_data/model/nb_instruct.pth
+export GOFA_LOAD_DIR=/home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth
 export GOFA_CACHE_EXP=/home/rzwang/data/GOFA/cache_data/gofa_cache_exp
 ```
 
@@ -31,7 +31,7 @@ data_root_path: "/home/rzwang/data/GOFA/TAGDataset"
 model_name_or_path: "/home/rzwang/data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2"
 checkpoint_dir: "/home/rzwang/data/GOFA/cache_data/model"
 load_model: true
-load_dir: "/home/rzwang/data/GOFA/cache_data/model/nb_instruct.pth"
+load_dir: "/home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth"
 seed: 1
 batch_size: 1
 num_workers: 0
@@ -45,7 +45,11 @@ eval_sample_size: -1
 sample_size_per_task: 1
 eval_task_names: ["cora_node"]
 train_task_names: ["cora_node"]
+hops: 3
+train_max_nodes_per_hops: 5
 ways: 2
+instructs: true
+selections: true
 inf_sample_size_per_task: [1]
 inf_hops: [3]
 inf_max_nodes_per_hops: [10]
@@ -101,7 +105,7 @@ data_root_path: "/home/rzwang/data/GOFA/TAGDataset"
 model_name_or_path: "/home/rzwang/data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2"
 checkpoint_dir: "/home/rzwang/data/GOFA/cache_data/model"
 load_model: true
-load_dir: "/home/rzwang/data/GOFA/cache_data/model/nb_instruct.pth"
+load_dir: "/home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth"
 seed: 1
 batch_size: 1
 num_workers: 0
@@ -115,7 +119,11 @@ eval_sample_size: -1
 sample_size_per_task: 1
 eval_task_names: ["cora_link"]
 train_task_names: ["cora_link"]
+hops: 3
+train_max_nodes_per_hops: 5
 ways: 2
+instructs: true
+selections: true
 inf_sample_size_per_task: [1]
 inf_hops: [3]
 inf_max_nodes_per_hops: [10]
