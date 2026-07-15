@@ -235,7 +235,9 @@ python3 run_gofa.py --override /tmp/gofa_trace_audit_cora_node_bs2.yaml \
   gofa_trace_source_audit_include_full_arrays True \
   gofa_trace_source_audit_flush_interval 1 \
   gofa_trace_source_audit_rank_zero_only True \
-  gofa_trace_source_audit_strict True
+  gofa_trace_source_audit_strict True \
+  gofa_trace_source_audit_dump_pre_cache_snapshot True \
+  gofa_trace_source_audit_dump_cache_miss_snapshot True
 ```
 
 ### cora_link, batch size 2
@@ -256,7 +258,17 @@ python3 run_gofa.py --override /tmp/gofa_trace_audit_cora_link_bs2.yaml \
   gofa_trace_source_audit_include_full_arrays True \
   gofa_trace_source_audit_flush_interval 1 \
   gofa_trace_source_audit_rank_zero_only True \
-  gofa_trace_source_audit_strict True
+  gofa_trace_source_audit_strict True \
+  gofa_trace_source_audit_dump_pre_cache_snapshot True \
+  gofa_trace_source_audit_dump_cache_miss_snapshot True
+```
+
+After the expected strict miss, classify the missing item and check whether both batched NOG items
+were resolved into the skip set:
+
+```bash
+python3 scripts/analyze_gofa_bs2_cache_miss.py \
+  --input /home/rzwang/data/GOFA/cache_data/gofa_cache_exp/trace_audit/cora_node_bs2/cache_miss_000000.json
 ```
 
 ## K-Only and V-Only Audit Stress Tests

@@ -38,6 +38,8 @@ gofa_trace_source_audit:
   flush_interval: 1
   rank_zero_only: true
   strict: false
+  dump_pre_cache_snapshot: false
+  dump_cache_miss_snapshot: true
 ```
 
 Flat CLI fields are also supported:
@@ -50,7 +52,13 @@ gofa_trace_source_audit_include_full_arrays
 gofa_trace_source_audit_flush_interval
 gofa_trace_source_audit_rank_zero_only
 gofa_trace_source_audit_strict
+gofa_trace_source_audit_dump_pre_cache_snapshot
+gofa_trace_source_audit_dump_cache_miss_snapshot
 ```
+
+When enabled, `dump_pre_cache_snapshot` writes the item mapping before any cache lookup. On a strict
+quant cache miss, `dump_cache_miss_snapshot` atomically writes `cache_miss_*.json` before preserving
+the original `RuntimeError`. Both diagnostics are metadata-only and do not export cache tensors.
 
 Code evidence:
 

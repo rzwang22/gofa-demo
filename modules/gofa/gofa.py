@@ -104,6 +104,8 @@ class ModelArguments:
     gofa_trace_source_audit_flush_interval: Optional[int] = field(default=None)
     gofa_trace_source_audit_rank_zero_only: Optional[bool] = field(default=None)
     gofa_trace_source_audit_strict: Optional[bool] = field(default=None)
+    gofa_trace_source_audit_dump_pre_cache_snapshot: Optional[bool] = field(default=None)
+    gofa_trace_source_audit_dump_cache_miss_snapshot: Optional[bool] = field(default=None)
     encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
     encoder_cache_verify_tolerance: float = field(default=1e-3, metadata={"help": "Strict max-absolute tolerance for exact verification reporting"})
     encoder_cache_verify_mean_tolerance: float = field(default=3e-2)
@@ -330,6 +332,8 @@ class GOFAMistral(torch.nn.Module):
             bool(self.gofa_trace_source_audit["enabled"]) and self._trace_source_audit_rank_allowed()
         )
         self.gofa_trace_source_audit_queries_written = 0
+        self.gofa_trace_source_audit_pre_cache_snapshots_written = 0
+        self.gofa_trace_source_audit_cache_miss_snapshots_written = 0
         self.gofa_trace_source_audit_metadata_written = False
         self.scheme_b_ablation = self._normalize_scheme_b_ablation_config(model_args)
         self.scheme_b_ablation_enabled = bool(self.scheme_b_ablation["enabled"])
@@ -640,7 +644,9 @@ class GOFAMistral(torch.nn.Module):
                         f"include_full_arrays={self.gofa_trace_source_audit['include_full_arrays']}, "
                         f"flush_interval={self.gofa_trace_source_audit['flush_interval']}, "
                         f"rank_zero_only={self.gofa_trace_source_audit['rank_zero_only']}, "
-                        f"strict={self.gofa_trace_source_audit['strict']}"
+                        f"strict={self.gofa_trace_source_audit['strict']}, "
+                        f"dump_pre_cache_snapshot={self.gofa_trace_source_audit['dump_pre_cache_snapshot']}, "
+                        f"dump_cache_miss_snapshot={self.gofa_trace_source_audit['dump_cache_miss_snapshot']}"
                     )
                 if self.scheme_b_ablation_enabled:
                     print(
@@ -920,6 +926,8 @@ class GOFAMistral(torch.nn.Module):
             "flush_interval": 1,
             "rank_zero_only": True,
             "strict": False,
+            "dump_pre_cache_snapshot": False,
+            "dump_cache_miss_snapshot": True,
         }
         nested = getattr(model_args, "gofa_trace_source_audit", None)
         if isinstance(nested, dict):
@@ -932,6 +940,8 @@ class GOFAMistral(torch.nn.Module):
             "flush_interval": "gofa_trace_source_audit_flush_interval",
             "rank_zero_only": "gofa_trace_source_audit_rank_zero_only",
             "strict": "gofa_trace_source_audit_strict",
+            "dump_pre_cache_snapshot": "gofa_trace_source_audit_dump_pre_cache_snapshot",
+            "dump_cache_miss_snapshot": "gofa_trace_source_audit_dump_cache_miss_snapshot",
         }
         for cfg_key, field_name in direct_fields.items():
             value = getattr(model_args, field_name, None)
@@ -944,6 +954,8 @@ class GOFAMistral(torch.nn.Module):
         cfg["flush_interval"] = max(int(cfg["flush_interval"]), 1)
         cfg["rank_zero_only"] = bool(cfg["rank_zero_only"])
         cfg["strict"] = bool(cfg["strict"])
+        cfg["dump_pre_cache_snapshot"] = bool(cfg["dump_pre_cache_snapshot"])
+        cfg["dump_cache_miss_snapshot"] = bool(cfg["dump_cache_miss_snapshot"])
         if cfg["enabled"] and not cfg["output_dir"]:
             raise ValueError("gofa_trace_source_audit.output_dir must be set when audit is enabled.")
         return cfg
@@ -1857,6 +1869,262 @@ class GOFAMistral(torch.nn.Module):
             return self._scheme_b_int_list(value)
         except Exception:
             return []
+
+    def _audit_full_raw_field(self, value):
+        field = self._audit_tensor_field(value)
+        if value is not None:
+            field["raw"] = self._audit_jsonify(value)
+        return field
+
+    def _audit_inferred_batch_size(self, graph):
+        if graph is None:
+            return None, "graph_missing"
+        num_graphs = getattr(graph, "num_graphs", None)
+        if num_graphs is not None:
+            try:
+                return int(num_graphs), "graph.num_graphs"
+            except (TypeError, ValueError):
+                pass
+        ptr_values = self._audit_int_list(getattr(graph, "ptr", None))
+        if ptr_values:
+            return max(len(ptr_values) - 1, 0), "graph.ptr"
+        batch_values = self._audit_int_list(getattr(graph, "batch", None))
+        if batch_values:
+            return max(batch_values) + 1, "graph.batch"
+        return None, "unresolved"
+
+    def _audit_cache_item_text_preview(self, token_ids):
+        text_len = max(int(len(token_ids)) - int(self.mem_size), 0)
+        text_token_ids = self._audit_int_list(token_ids)[:text_len]
+        try:
+            preview = self.model.tokenizer.decode(text_token_ids, skip_special_tokens=False)
+        except Exception as exc:
+            return f"<decode failed: {type(exc).__name__}>"[:120]
+        return str(preview)[:120]
+
+    def _audit_cache_item_type(self, item_index, graph, num_items):
+        if graph is None or getattr(graph, "num_node_feat", None) is None:
+            return "unknown"
+        num_node_feat = int(graph.num_node_feat)
+        if 0 <= int(item_index) < min(num_node_feat, num_items):
+            return "node"
+        if num_node_feat <= int(item_index) < num_items:
+            return "edge"
+        return "unknown"
+
+    def _audit_question_nog_candidates(self, graph, skip_cache_indices):
+        question_indices = self._audit_int_list(
+            getattr(graph, "question_index", None) if graph is not None else None
+        )
+        node_map = getattr(graph, "node_map", None) if graph is not None else None
+        mapped_values = self._audit_sequence_values(node_map, question_indices).get("values") or []
+        skip_set = set(int(idx) for idx in skip_cache_indices)
+        candidates = []
+        for position, question_local_index in enumerate(question_indices):
+            node_map_value = mapped_values[position] if position < len(mapped_values) else None
+            if isinstance(node_map_value, (int, np.integer)):
+                node_map_value = int(node_map_value)
+            candidates.append({
+                "question_position": int(position),
+                "question_local_index": int(question_local_index),
+                "node_map_value": node_map_value,
+                "is_in_skip_cache_indices": node_map_value in skip_set,
+            })
+        return candidates
+
+    def _audit_cache_item_inverse_mappings(self, item_index, graph, num_items):
+        node_map_values = self._audit_int_list(
+            getattr(graph, "node_map", None) if graph is not None else None
+        )
+        node_map_inverse = [
+            int(local_index)
+            for local_index, mapped_item in enumerate(node_map_values)
+            if int(mapped_item) == int(item_index)
+        ]
+        structural_edge_positions = []
+        if graph is not None and getattr(graph, "num_node_feat", None) is not None:
+            num_node_feat = int(graph.num_node_feat)
+            if num_node_feat <= int(item_index) < num_items:
+                edge_item_offset = int(item_index) - num_node_feat
+                edge_map_values = self._audit_int_list(getattr(graph, "edge_map", None))
+                structural_edge_positions = [
+                    int(edge_position)
+                    for edge_position, mapped_edge_item in enumerate(edge_map_values)
+                    if int(mapped_edge_item) == edge_item_offset
+                ]
+        return node_map_inverse, structural_edge_positions
+
+    def _build_pre_cache_audit_snapshot(
+            self,
+            graph,
+            token_ids,
+            skip_cache_indices,
+            all_cache_keys,
+            snapshot_kind,
+            missing_item_indices=None,
+            missing_reason=None,
+            strict_error=None):
+        num_items = len(token_ids)
+        skip_cache_indices = sorted(set(int(idx) for idx in (skip_cache_indices or [])))
+        skip_set = set(skip_cache_indices)
+        eligible_item_indices = [idx for idx in range(num_items) if idx not in skip_set]
+        question_candidates = self._audit_question_nog_candidates(graph, skip_cache_indices)
+        mapped_question_items = {
+            int(candidate["node_map_value"])
+            for candidate in question_candidates
+            if isinstance(candidate.get("node_map_value"), int)
+        }
+        batch_size_inferred, batch_size_source = self._audit_inferred_batch_size(graph)
+        num_node_feat = (
+            int(getattr(graph, "num_node_feat", num_items)) if graph is not None else int(num_items)
+        )
+
+        all_items = []
+        for item_index, ids in enumerate(token_ids):
+            cache_key = all_cache_keys[item_index]
+            item_type = self._audit_cache_item_type(item_index, graph, num_items)
+            all_items.append({
+                "item_index": int(item_index),
+                "cache_key": cache_key,
+                "item_type": item_type,
+                "is_skip_cache_item": item_index in skip_set,
+                "is_question_or_nog_candidate": item_index in mapped_question_items,
+                "seq_len": int(len(ids)),
+                "text_len": max(int(len(ids)) - int(self.mem_size), 0),
+                "text_preview": self._audit_cache_item_text_preview(ids),
+                "full_cache_path": self._encoder_cache_path(cache_key),
+                "full_cache_exists": os.path.exists(self._encoder_cache_path(cache_key)),
+                "quant_base_cache_path": self._encoder_quant_cache_path(cache_key, delta=False),
+                "quant_base_cache_exists": os.path.exists(self._encoder_quant_cache_path(cache_key, delta=False)),
+                "quant_delta_cache_path": self._encoder_quant_cache_path(cache_key, delta=True),
+                "quant_delta_cache_exists": os.path.exists(self._encoder_quant_cache_path(cache_key, delta=True)),
+            })
+
+        missing_items = []
+        for item_index in sorted(set(int(idx) for idx in (missing_item_indices or []))):
+            if not 0 <= item_index < num_items:
+                continue
+            node_map_inverse, structural_edge_positions = self._audit_cache_item_inverse_mappings(
+                item_index, graph, num_items
+            )
+            item = all_items[item_index]
+            missing_items.append({
+                "item_index": item_index,
+                "cache_key": item["cache_key"],
+                "item_type": item["item_type"],
+                "is_skip_cache_item": item["is_skip_cache_item"],
+                "is_question_or_nog_candidate": item["is_question_or_nog_candidate"],
+                "node_map_inverse_local_indices": node_map_inverse,
+                "structural_edge_positions": structural_edge_positions,
+                "missing_reason": missing_reason,
+                "full_cache_exists": item["full_cache_exists"],
+                "quant_base_cache_exists": item["quant_base_cache_exists"],
+                "quant_delta_cache_exists": item["quant_delta_cache_exists"],
+            })
+
+        target_index = getattr(graph, "target_index", None) if graph is not None else None
+        question_index = getattr(graph, "question_index", None) if graph is not None else None
+        node_map = getattr(graph, "node_map", None) if graph is not None else None
+        edge_index = getattr(graph, "edge_index", None) if graph is not None else None
+        edge_map = getattr(graph, "edge_map", None) if graph is not None else None
+        batch = getattr(graph, "batch", None) if graph is not None else None
+        ptr = getattr(graph, "ptr", None) if graph is not None else None
+        return {
+            "audit_format": "gofa_pre_cache_diagnostic_v1",
+            "snapshot_kind": snapshot_kind,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "repository_commit_sha": self._trace_source_audit_repo_commit(),
+            "cache_mode": self.encoder_cache_mode,
+            "cache_tag": self.encoder_cache_namespace,
+            "strict_quant": bool(self.scheme_b_quant_enabled and self.scheme_b_quant["strict"]),
+            "missing_reason": missing_reason,
+            "strict_error": strict_error,
+            "batch_size_inferred": batch_size_inferred,
+            "batch_size_inference_source": batch_size_source,
+            "num_node_feat": num_node_feat,
+            "token_item_count": int(num_items),
+            "target_index": self._audit_full_raw_field(target_index),
+            "question_index": self._audit_full_raw_field(question_index),
+            "node_map": self._audit_full_raw_field(node_map),
+            "edge_index": self._audit_full_raw_field(edge_index),
+            "edge_map": self._audit_full_raw_field(edge_map),
+            "batch": self._audit_full_raw_field(batch),
+            "ptr": self._audit_full_raw_field(ptr),
+            "question_index_raw": self._audit_jsonify(question_index),
+            "node_map_at_each_question_index": [
+                {
+                    "question_local_index": candidate["question_local_index"],
+                    "node_map_value": candidate["node_map_value"],
+                }
+                for candidate in question_candidates
+            ],
+            "resolved_skip_cache_indices": skip_cache_indices,
+            "skip_cache_indices": skip_cache_indices,
+            "eligible_item_indices": eligible_item_indices,
+            "question_nog_candidates": question_candidates,
+            "question_nog_candidate_count": len(question_candidates),
+            "distinct_mapped_question_item_count": len(mapped_question_items),
+            "all_item_cache_keys": all_items,
+            "missing_items": missing_items,
+        }
+
+    def _maybe_dump_pre_cache_audit_snapshot(
+            self,
+            snapshot_kind,
+            graph,
+            token_ids,
+            skip_cache_indices,
+            all_cache_keys,
+            missing_item_indices=None,
+            missing_reason=None,
+            strict_error=None):
+        if not self.gofa_trace_source_audit_enabled:
+            return None
+        if snapshot_kind == "pre_cache":
+            if not self.gofa_trace_source_audit.get("dump_pre_cache_snapshot", False):
+                return None
+            counter_name = "gofa_trace_source_audit_pre_cache_snapshots_written"
+            if getattr(self, counter_name) >= int(self.gofa_trace_source_audit["max_queries"]):
+                return None
+            filename_prefix = "pre_cache"
+        elif snapshot_kind == "cache_miss":
+            if not self.gofa_trace_source_audit.get("dump_cache_miss_snapshot", True):
+                return None
+            counter_name = "gofa_trace_source_audit_cache_miss_snapshots_written"
+            filename_prefix = "cache_miss"
+        else:
+            raise ValueError(f"unsupported pre-cache audit snapshot kind: {snapshot_kind}")
+
+        snapshot_id = int(getattr(self, counter_name))
+        output_path = os.path.join(
+            self.gofa_trace_source_audit["output_dir"],
+            f"{filename_prefix}_{snapshot_id:06d}.json",
+        )
+        try:
+            self._write_trace_source_audit_metadata()
+            snapshot = self._build_pre_cache_audit_snapshot(
+                graph=graph,
+                token_ids=token_ids,
+                skip_cache_indices=skip_cache_indices,
+                all_cache_keys=all_cache_keys,
+                snapshot_kind=snapshot_kind,
+                missing_item_indices=missing_item_indices,
+                missing_reason=missing_reason,
+                strict_error=strict_error,
+            )
+            self._trace_source_audit_write_json(output_path, snapshot)
+            setattr(self, counter_name, snapshot_id + 1)
+            self._trace_source_audit_log(
+                f"{snapshot_kind}_written path={os.path.basename(output_path)} "
+                f"missing_items={len(snapshot.get('missing_items', []))}"
+            )
+            print(f"GOFA trace source audit {snapshot_kind} snapshot: {output_path}")
+            return output_path
+        except Exception as exc:
+            message = f"GOFA trace source audit {snapshot_kind} diagnostic failed: {exc}"
+            self._trace_source_audit_log(message)
+            print(message)
+            return None
 
     def _audit_sequence_values(self, sequence, indices):
         if sequence is None:
@@ -3596,6 +3864,23 @@ class GOFAMistral(torch.nn.Module):
             self.encoder_cache_manifest_samples += 1
 
         skip_cache_indices = set(skip_cache_indices or [])
+        diagnostic_requested = (
+            self.gofa_trace_source_audit_enabled and
+            (
+                self.gofa_trace_source_audit.get("dump_pre_cache_snapshot", False) or
+                self.gofa_trace_source_audit.get("dump_cache_miss_snapshot", True)
+            )
+        )
+        all_cache_keys = (
+            [self._encoder_cache_key(ids) for ids in token_ids] if diagnostic_requested else None
+        )
+        self._maybe_dump_pre_cache_audit_snapshot(
+            snapshot_kind="pre_cache",
+            graph=graph,
+            token_ids=token_ids,
+            skip_cache_indices=skip_cache_indices,
+            all_cache_keys=all_cache_keys,
+        )
         cache_items = [None] * len(token_ids)
         quant_base_payloads = [None] * len(token_ids)
         quant_cache_keys = [None] * len(token_ids)
@@ -3620,13 +3905,26 @@ class GOFAMistral(torch.nn.Module):
                 skipped.append(i)
                 continue
             if self.scheme_b_quant_enabled:
-                cache_key = self._encoder_cache_key(ids)
+                cache_key = all_cache_keys[i] if all_cache_keys is not None else self._encoder_cache_key(ids)
                 self._maybe_log_scheme_b_quant_path_example(cache_key)
                 quant_start = time.perf_counter()
-                base_payload, cache_key, cache_size, quant_status = self._load_encoder_quant_memory_kv_base_payload(
-                    ids,
-                    strict=strict_quant,
-                )
+                try:
+                    base_payload, cache_key, cache_size, quant_status = (
+                        self._load_encoder_quant_memory_kv_base_payload(ids, strict=strict_quant)
+                    )
+                except RuntimeError as exc:
+                    if strict_quant and not os.path.exists(self._encoder_quant_cache_path(cache_key, delta=False)):
+                        self._maybe_dump_pre_cache_audit_snapshot(
+                            snapshot_kind="cache_miss",
+                            graph=graph,
+                            token_ids=token_ids,
+                            skip_cache_indices=skip_cache_indices,
+                            all_cache_keys=all_cache_keys,
+                            missing_item_indices=[i],
+                            missing_reason="quant_base_cache_missing",
+                            strict_error=str(exc),
+                        )
+                    raise
                 current_timing["quant_load_s"] += time.perf_counter() - quant_start
                 if quant_status == "hit":
                     current_quant_stats["quant_base_cache_hit"] += 1
@@ -3675,6 +3973,19 @@ class GOFAMistral(torch.nn.Module):
 
         non_skip_item_count = len(token_ids) - len(skipped)
         if strict_quant and non_skip_item_count > 0 and current_quant_stats["quant_base_cache_hit"] == 0:
+            zero_hit_missing_indices = [
+                idx for idx in range(len(token_ids))
+                if idx not in skip_cache_indices and quant_base_payloads[idx] is None
+            ]
+            self._maybe_dump_pre_cache_audit_snapshot(
+                snapshot_kind="cache_miss",
+                graph=graph,
+                token_ids=token_ids,
+                skip_cache_indices=skip_cache_indices,
+                all_cache_keys=all_cache_keys,
+                missing_item_indices=zero_hit_missing_indices,
+                missing_reason="quant_base_zero_hit",
+            )
             raise RuntimeError(
                 "GOFA scheme-B quant strict mode loaded zero quant base cache items for a non-empty batch: "
                 f"non_skip_item_count={non_skip_item_count}, quant_cache_root={self._encoder_quant_cache_root()}, "
@@ -3761,6 +4072,15 @@ class GOFAMistral(torch.nn.Module):
                     else:
                         current_quant_stats["quant_delta_cache_missing"] += 1
                         if strict_quant:
+                            self._maybe_dump_pre_cache_audit_snapshot(
+                                snapshot_kind="cache_miss",
+                                graph=graph,
+                                token_ids=token_ids,
+                                skip_cache_indices=skip_cache_indices,
+                                all_cache_keys=all_cache_keys,
+                                missing_item_indices=[i],
+                                missing_reason="selected_quant_delta_cache_missing",
+                            )
                             raise RuntimeError(
                                 "GOFA scheme-B quant strict mode missing selected delta cache: "
                                 f"index={i}, cache_key={quant_cache_keys[i]}, "
@@ -3867,6 +4187,16 @@ class GOFAMistral(torch.nn.Module):
                     f"fallback_to_full_cache_count={current_quant_stats['fallback_to_full_cache_count']}"
                 )
             if strict_quant and online_under_quant > 0:
+                online_missing_indices = [idx for idx in missing if idx not in skip_cache_indices]
+                self._maybe_dump_pre_cache_audit_snapshot(
+                    snapshot_kind="cache_miss",
+                    graph=graph,
+                    token_ids=token_ids,
+                    skip_cache_indices=skip_cache_indices,
+                    all_cache_keys=all_cache_keys,
+                    missing_item_indices=online_missing_indices,
+                    missing_reason="online_compute_under_quant",
+                )
                 raise RuntimeError(
                     "GOFA scheme-B quant strict mode would execute online cache miss compute: "
                     f"online_compute_count_under_quant={online_under_quant}, missing_indices={missing}"

@@ -120,6 +120,8 @@ def main(params):
         "gofa_trace_source_audit_flush_interval",
         "gofa_trace_source_audit_rank_zero_only",
         "gofa_trace_source_audit_strict",
+        "gofa_trace_source_audit_dump_pre_cache_snapshot",
+        "gofa_trace_source_audit_dump_cache_miss_snapshot",
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))

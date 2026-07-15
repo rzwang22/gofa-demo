@@ -21,6 +21,8 @@ gofa_trace_source_audit:
   flush_interval: 1
   rank_zero_only: True
   strict: False
+  dump_pre_cache_snapshot: False
+  dump_cache_miss_snapshot: True
 scheme_b_quant:
   enabled: False
   base_bits: 8

@@ -43,6 +43,8 @@ gofa_trace_source_audit:
   flush_interval: 1
   rank_zero_only: True
   strict: False
+  dump_pre_cache_snapshot: False
+  dump_cache_miss_snapshot: True
 encoder_cache_verify: False  # when using memory_kv, compare final memory slots against the full encoder path
 encoder_cache_verify_tolerance: 0.001  # strict max-absolute threshold; reported as exact_passed
 encoder_cache_verify_mean_tolerance: 0.03  # practical verification threshold for mean absolute drift
