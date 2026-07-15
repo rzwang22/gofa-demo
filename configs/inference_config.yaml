@@ -13,6 +13,14 @@ encoder_cache_manifest:
   output_path: ""
   append: False
   log_interval: 20
+gofa_trace_source_audit:
+  enabled: False
+  output_dir: ""
+  max_queries: 1
+  include_full_arrays: True
+  flush_interval: 1
+  rank_zero_only: True
+  strict: False
 scheme_b_quant:
   enabled: False
   base_bits: 8

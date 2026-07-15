@@ -35,6 +35,14 @@ encoder_cache_manifest:
   output_path: ""
   append: False
   log_interval: 20
+gofa_trace_source_audit:
+  enabled: False
+  output_dir: ""
+  max_queries: 1
+  include_full_arrays: True
+  flush_interval: 1
+  rank_zero_only: True
+  strict: False
 encoder_cache_verify: False  # when using memory_kv, compare final memory slots against the full encoder path
 encoder_cache_verify_tolerance: 0.001  # strict max-absolute threshold; reported as exact_passed
 encoder_cache_verify_mean_tolerance: 0.03  # practical verification threshold for mean absolute drift

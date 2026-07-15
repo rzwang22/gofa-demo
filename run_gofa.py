@@ -74,6 +74,19 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "gofa_trace_source_audit"):
+        model_args.gofa_trace_source_audit = params.gofa_trace_source_audit
+    for field_name in (
+        "gofa_trace_source_audit_enabled",
+        "gofa_trace_source_audit_output_dir",
+        "gofa_trace_source_audit_max_queries",
+        "gofa_trace_source_audit_include_full_arrays",
+        "gofa_trace_source_audit_flush_interval",
+        "gofa_trace_source_audit_rank_zero_only",
+        "gofa_trace_source_audit_strict",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     for field_name in (
         "eval_task_names",
         "train_task_names",

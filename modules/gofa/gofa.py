@@ -5,7 +5,9 @@ from typing import Any, Dict, Optional
 
 import hashlib
 import json
+import math
 import os
+import subprocess
 import time
 import numpy as np
 import torch
@@ -94,6 +96,14 @@ class ModelArguments:
     encoder_cache_manifest_output_path: Optional[str] = field(default=None)
     encoder_cache_manifest_append: Optional[bool] = field(default=None)
     encoder_cache_manifest_log_interval: Optional[int] = field(default=None)
+    gofa_trace_source_audit: Optional[Dict[str, Any]] = field(default_factory=dict)
+    gofa_trace_source_audit_enabled: Optional[bool] = field(default=None)
+    gofa_trace_source_audit_output_dir: Optional[str] = field(default=None)
+    gofa_trace_source_audit_max_queries: Optional[int] = field(default=None)
+    gofa_trace_source_audit_include_full_arrays: Optional[bool] = field(default=None)
+    gofa_trace_source_audit_flush_interval: Optional[int] = field(default=None)
+    gofa_trace_source_audit_rank_zero_only: Optional[bool] = field(default=None)
+    gofa_trace_source_audit_strict: Optional[bool] = field(default=None)
     encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
     encoder_cache_verify_tolerance: float = field(default=1e-3, metadata={"help": "Strict max-absolute tolerance for exact verification reporting"})
     encoder_cache_verify_mean_tolerance: float = field(default=3e-2)
@@ -315,6 +325,12 @@ class GOFAMistral(torch.nn.Module):
         self.encoder_cache_manifest_existing_items = OrderedDict()
         self.encoder_cache_manifest_existing_skip_items = OrderedDict()
         self.encoder_cache_manifest_existing_total_samples = 0
+        self.gofa_trace_source_audit = self._normalize_gofa_trace_source_audit_config(model_args)
+        self.gofa_trace_source_audit_enabled = (
+            bool(self.gofa_trace_source_audit["enabled"]) and self._trace_source_audit_rank_allowed()
+        )
+        self.gofa_trace_source_audit_queries_written = 0
+        self.gofa_trace_source_audit_metadata_written = False
         self.scheme_b_ablation = self._normalize_scheme_b_ablation_config(model_args)
         self.scheme_b_ablation_enabled = bool(self.scheme_b_ablation["enabled"])
         self.scheme_b_ablation_calls = 0
@@ -612,6 +628,20 @@ class GOFAMistral(torch.nn.Module):
                         f"full_cache_root={os.path.abspath(self.encoder_cache_dir)}"
                     )
                     atexit.register(self._maybe_dump_encoder_cache_manifest, current_batch_seen=0, force=True)
+                if self.gofa_trace_source_audit_enabled:
+                    if not self.gofa_trace_source_audit["output_dir"]:
+                        raise ValueError("gofa_trace_source_audit.enabled=True requires gofa_trace_source_audit.output_dir.")
+                    os.makedirs(self.gofa_trace_source_audit["output_dir"], exist_ok=True)
+                    self._write_trace_source_audit_metadata()
+                    print(
+                        "GOFA trace source audit enabled: "
+                        f"output_dir={self.gofa_trace_source_audit['output_dir']}, "
+                        f"max_queries={self.gofa_trace_source_audit['max_queries']}, "
+                        f"include_full_arrays={self.gofa_trace_source_audit['include_full_arrays']}, "
+                        f"flush_interval={self.gofa_trace_source_audit['flush_interval']}, "
+                        f"rank_zero_only={self.gofa_trace_source_audit['rank_zero_only']}, "
+                        f"strict={self.gofa_trace_source_audit['strict']}"
+                    )
                 if self.scheme_b_ablation_enabled:
                     print(
                         "GOFA scheme-B cache ablation enabled: "
@@ -622,6 +652,14 @@ class GOFAMistral(torch.nn.Module):
                         f"keep_target_edges={self.scheme_b_ablation['keep_target_edges']}, "
                         f"log_interval={self.scheme_b_ablation['log_interval']}"
                     )
+        if self.gofa_trace_source_audit_enabled and not self.gofa_trace_source_audit_metadata_written:
+            os.makedirs(self.gofa_trace_source_audit["output_dir"], exist_ok=True)
+            self._write_trace_source_audit_metadata()
+            print(
+                "GOFA trace source audit enabled outside active Scheme-B memory_kv cache path; "
+                "metadata was written, but query snapshots require use_encoder_cache=True and "
+                "encoder_cache_mode=memory_kv."
+            )
         if self.profile_stage_times:
             print(
                 "GOFA stage profiler enabled: "
@@ -871,6 +909,43 @@ class GOFAMistral(torch.nn.Module):
         cfg["output_path"] = str(cfg["output_path"] or "")
         cfg["append"] = bool(cfg["append"])
         cfg["log_interval"] = max(int(cfg["log_interval"]), 1)
+        return cfg
+
+    def _normalize_gofa_trace_source_audit_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "output_dir": "",
+            "max_queries": 1,
+            "include_full_arrays": True,
+            "flush_interval": 1,
+            "rank_zero_only": True,
+            "strict": False,
+        }
+        nested = getattr(model_args, "gofa_trace_source_audit", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "gofa_trace_source_audit_enabled",
+            "output_dir": "gofa_trace_source_audit_output_dir",
+            "max_queries": "gofa_trace_source_audit_max_queries",
+            "include_full_arrays": "gofa_trace_source_audit_include_full_arrays",
+            "flush_interval": "gofa_trace_source_audit_flush_interval",
+            "rank_zero_only": "gofa_trace_source_audit_rank_zero_only",
+            "strict": "gofa_trace_source_audit_strict",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["output_dir"] = str(cfg["output_dir"] or "")
+        cfg["max_queries"] = max(int(cfg["max_queries"]), 0)
+        cfg["include_full_arrays"] = bool(cfg["include_full_arrays"])
+        cfg["flush_interval"] = max(int(cfg["flush_interval"]), 1)
+        cfg["rank_zero_only"] = bool(cfg["rank_zero_only"])
+        cfg["strict"] = bool(cfg["strict"])
+        if cfg["enabled"] and not cfg["output_dir"]:
+            raise ValueError("gofa_trace_source_audit.output_dir must be set when audit is enabled.")
         return cfg
 
     def _normalize_scheme_b_weight_quant_config(self, model_args):
@@ -1603,6 +1678,611 @@ class GOFAMistral(torch.nn.Module):
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return str(value)
+
+    def _trace_source_audit_rank_allowed(self):
+        if not self.gofa_trace_source_audit.get("rank_zero_only", True):
+            return True
+        for env_name in ("RANK", "LOCAL_RANK", "SLURM_PROCID"):
+            value = os.environ.get(env_name)
+            if value not in (None, "", "0"):
+                return False
+        return True
+
+    def _trace_source_audit_active(self):
+        return (
+            bool(getattr(self, "gofa_trace_source_audit_enabled", False)) and
+            self.gofa_trace_source_audit_queries_written < int(self.gofa_trace_source_audit["max_queries"])
+        )
+
+    def _trace_source_audit_repo_commit(self):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=os.getcwd(),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            return None
+        return None
+
+    def _trace_source_audit_log(self, message):
+        if not self.gofa_trace_source_audit_enabled:
+            return
+        output_dir = self.gofa_trace_source_audit["output_dir"]
+        if not output_dir:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        line = f"{datetime.now().isoformat(timespec='seconds')} {message}\n"
+        with open(os.path.join(output_dir, "audit.log"), "a") as f:
+            f.write(line)
+
+    def _trace_source_audit_write_json(self, path, payload):
+        output_dir = os.path.dirname(os.path.abspath(path))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True, allow_nan=False)
+            f.write("\n")
+        os.replace(tmp_path, path)
+
+    def _write_trace_source_audit_metadata(self):
+        if self.gofa_trace_source_audit_metadata_written or not self.gofa_trace_source_audit_enabled:
+            return
+        output_dir = self.gofa_trace_source_audit["output_dir"]
+        base_model = self.model.icae.get_base_model().model
+        metadata = {
+            "audit_format": "gofa_trace_source_audit_metadata_v1",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "repository_commit_sha": self._trace_source_audit_repo_commit(),
+            "agent_runtime_warning": (
+                "Agent did not execute GOFA on the target datasets. Runtime semantics marked as "
+                "RUNTIME_VALIDATION_REQUIRED must be confirmed using generated audit commands."
+            ),
+            "task_names": self._encoder_cache_manifest_task_names(),
+            "eval_task_names": self._audit_jsonify(getattr(self.model_args, "eval_task_names", None)),
+            "train_task_names": self._audit_jsonify(getattr(self.model_args, "train_task_names", None)),
+            "run_mode": self._audit_jsonify(getattr(self.model_args, "run_mode", None)),
+            "encoder_cache_enabled": bool(self.encoder_cache_enabled),
+            "encoder_cache_mode": self.encoder_cache_mode,
+            "encoder_cache_namespace": self.encoder_cache_namespace,
+            "full_cache_root": os.path.abspath(self.encoder_cache_dir),
+            "quant_cache_root": os.path.abspath(self._encoder_quant_cache_root()),
+            "scheme_b_quant_enabled": bool(self.scheme_b_quant_enabled),
+            "scheme_b_quant": self._audit_jsonify(self.scheme_b_quant),
+            "scheme_b_quant_kv_attention_enabled": bool(self.scheme_b_quant_kv_attention_enabled),
+            "scheme_b_quant_kv_attention": self._audit_jsonify(self.scheme_b_quant_kv_attention),
+            "model_dimensions": {
+                "mem_size": int(self.mem_size),
+                "hidden_size": int(getattr(base_model.config, "hidden_size", self.model.dim)),
+                "num_hidden_layers": int(getattr(base_model.config, "num_hidden_layers", 0)),
+                "gnn_start_layer": int(getattr(base_model, "gnn_start_layer", 0)),
+                "suffix_layer_count": int(getattr(base_model.gofa_config, "num_layers", 0)),
+            },
+            "probe_config": self._audit_jsonify(self.gofa_trace_source_audit),
+            "scope": (
+                "This is a minimal source-semantics audit snapshot, not the formal GOFA workload trace exporter."
+            ),
+        }
+        self._trace_source_audit_write_json(os.path.join(output_dir, "audit_metadata.json"), metadata)
+        self.gofa_trace_source_audit_metadata_written = True
+        self._trace_source_audit_log("metadata_written path=audit_metadata.json")
+
+    def _audit_jsonify(self, value):
+        if isinstance(value, torch.Tensor):
+            return self._audit_jsonify(value.detach().cpu().tolist())
+        if isinstance(value, np.ndarray):
+            return self._audit_jsonify(value.tolist())
+        if isinstance(value, np.generic):
+            item = value.item()
+            if isinstance(item, float):
+                return item if math.isfinite(item) else None
+            return item
+        if isinstance(value, dict):
+            return {str(key): self._audit_jsonify(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._audit_jsonify(item) for item in value]
+        if isinstance(value, set):
+            return [self._audit_jsonify(item) for item in sorted(value, key=lambda item: str(item))]
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, (str, int, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _audit_missing(self, reason="missing"):
+        return {"status": "missing", "reason": reason, "raw": None, "shape": None, "dtype": None}
+
+    def _audit_tensor_field(self, value, include_raw=True):
+        if value is None:
+            return self._audit_missing()
+        include_full_arrays = bool(self.gofa_trace_source_audit.get("include_full_arrays", True))
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().cpu()
+            flat = tensor.reshape(-1)
+            raw = tensor.tolist() if include_raw and include_full_arrays else flat[:32].tolist()
+            result = {
+                "status": "present",
+                "raw": self._audit_jsonify(raw),
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "numel": int(tensor.numel()),
+            }
+            if tensor.numel() > 0 and tensor.dtype != torch.bool:
+                try:
+                    result["min"] = self._audit_jsonify(flat.min().item())
+                    result["max"] = self._audit_jsonify(flat.max().item())
+                except Exception:
+                    pass
+            return result
+        if isinstance(value, np.ndarray):
+            flat = value.reshape(-1)
+            raw = value.tolist() if include_raw and include_full_arrays else flat[:32].tolist()
+            result = {
+                "status": "present",
+                "raw": self._audit_jsonify(raw),
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "numel": int(value.size),
+            }
+            if value.size > 0 and value.dtype != np.bool_:
+                result["min"] = self._audit_jsonify(np.min(flat).item())
+                result["max"] = self._audit_jsonify(np.max(flat).item())
+            return result
+        if isinstance(value, (list, tuple)):
+            flat = self._scheme_b_int_list(value) if value else []
+            return {
+                "status": "present",
+                "raw": self._audit_jsonify(value if include_raw and include_full_arrays else flat[:32]),
+                "shape": [len(value)],
+                "dtype": type(value).__name__,
+                "numel": len(flat),
+                "min": min(flat) if flat else None,
+                "max": max(flat) if flat else None,
+            }
+        return {
+            "status": "present",
+            "raw": self._audit_jsonify(value),
+            "shape": [],
+            "dtype": type(value).__name__,
+            "numel": 1,
+        }
+
+    def _audit_int_list(self, value):
+        try:
+            return self._scheme_b_int_list(value)
+        except Exception:
+            return []
+
+    def _audit_sequence_values(self, sequence, indices):
+        if sequence is None:
+            return {"status": "missing", "values": None}
+        values = []
+        try:
+            if isinstance(sequence, torch.Tensor):
+                flat = sequence.detach().cpu().reshape(-1)
+                for idx in indices:
+                    values.append(int(flat[int(idx)].item()) if 0 <= int(idx) < flat.numel() else None)
+            elif isinstance(sequence, np.ndarray):
+                flat = sequence.reshape(-1)
+                for idx in indices:
+                    values.append(self._audit_jsonify(flat[int(idx)]) if 0 <= int(idx) < flat.shape[0] else None)
+            elif isinstance(sequence, (list, tuple)):
+                for idx in indices:
+                    values.append(self._audit_jsonify(sequence[int(idx)]) if 0 <= int(idx) < len(sequence) else None)
+            else:
+                return {"status": "unsupported", "values": None}
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc), "values": None}
+        return {"status": "present", "values": values}
+
+    def _audit_values_in_range(self, values, upper_bound):
+        if upper_bound is None:
+            return None
+        try:
+            upper_bound = int(upper_bound)
+            return all(0 <= int(value) < upper_bound for value in values)
+        except Exception:
+            return None
+
+    def _audit_is_permutation(self, values, count):
+        try:
+            count = int(count)
+            return sorted(int(value) for value in values) == list(range(count))
+        except Exception:
+            return None
+
+    def _audit_tensor_shape(self, value):
+        if isinstance(value, torch.Tensor):
+            return list(value.shape)
+        if isinstance(value, np.ndarray):
+            return list(value.shape)
+        if isinstance(value, (list, tuple)):
+            return [len(value)]
+        return None
+
+    def _audit_text_kv_component_has_tokens(self, layer_kv, component):
+        if not isinstance(layer_kv, dict):
+            return False
+        value = layer_kv.get(component)
+        if value is None:
+            return False
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return False
+            shape = list(value.shape)
+            return len(shape) < 2 or int(shape[-2]) > 0
+        if isinstance(value, dict):
+            for shape_key in ("orig_shape", "shape", "tensor_shape"):
+                shape = value.get(shape_key)
+                if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+                    return int(shape[-2]) > 0
+            for tensor_key in ("tensor", "q", "q_packed"):
+                tensor = value.get(tensor_key)
+                if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                    return True
+        return False
+
+    def _audit_effective_kv_indices_by_layer(self, cache_items, component):
+        base_model = self.model.icae.get_base_model().model
+        suffix_layer_ids = list(range(base_model.gnn_start_layer, base_model.config.num_hidden_layers))
+        result = {str(layer_id): [] for layer_id in suffix_layer_ids}
+        for item_idx, cache_item in enumerate(cache_items):
+            if not isinstance(cache_item, dict):
+                continue
+            text_kv = cache_item.get("text_kv")
+            if not isinstance(text_kv, list):
+                continue
+            for layer_offset, layer_id in enumerate(suffix_layer_ids):
+                if layer_offset < len(text_kv) and self._audit_text_kv_component_has_tokens(text_kv[layer_offset], component):
+                    result[str(layer_id)].append(int(item_idx))
+        return result
+
+    def _audit_edge_map_summary(self, graph, num_items):
+        edge_map = getattr(graph, "edge_map", None) if graph is not None else None
+        edge_index = getattr(graph, "edge_index", None) if graph is not None else None
+        if edge_map is None:
+            return self._audit_missing()
+        edge_values = self._audit_int_list(edge_map)
+        num_node_feat = int(getattr(graph, "num_node_feat", 0)) if graph is not None else 0
+        edge_text_item_count = max(int(num_items) - num_node_feat, 0)
+        counts = {}
+        for value in edge_values:
+            counts[int(value)] = counts.get(int(value), 0) + 1
+        multiplicity_histogram = {}
+        for count in counts.values():
+            multiplicity_histogram[str(count)] = multiplicity_histogram.get(str(count), 0) + 1
+        num_structural_edges = int(edge_index.size(1)) if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 else None
+        return {
+            "status": "present",
+            "raw": self._audit_tensor_field(edge_map).get("raw"),
+            "shape": self._audit_tensor_shape(edge_map),
+            "num_structural_edges": num_structural_edges,
+            "edge_map_length": len(edge_values),
+            "edge_map_unique_count": len(counts),
+            "min": min(edge_values) if edge_values else None,
+            "max": max(edge_values) if edge_values else None,
+            "edge_text_item_count": edge_text_item_count,
+            "len_matches_num_structural_edges": (len(edge_values) == num_structural_edges) if num_structural_edges is not None else None,
+            "valid_as_edge_text_item_index": all(0 <= int(value) < edge_text_item_count for value in edge_values) if edge_values else True,
+            "multiple_structural_edges_share_one_edge_item": any(count > 1 for count in counts.values()),
+            "multiplicity_histogram": multiplicity_histogram,
+        }
+
+    def _audit_node_map_summary(self, graph, target_indices, question_indices, num_items):
+        node_map = getattr(graph, "node_map", None) if graph is not None else None
+        if node_map is None:
+            return self._audit_missing()
+        node_values = self._audit_int_list(node_map)
+        num_node_feat = int(getattr(graph, "num_node_feat", 0)) if graph is not None else None
+        return {
+            "status": "present",
+            "raw": self._audit_tensor_field(node_map).get("raw"),
+            "shape": self._audit_tensor_shape(node_map),
+            "dtype": str(node_map.dtype) if isinstance(node_map, torch.Tensor) else type(node_map).__name__,
+            "min": min(node_values) if node_values else None,
+            "max": max(node_values) if node_values else None,
+            "num_node_feat": num_node_feat,
+            "is_permutation_0_to_num_node_feat_minus_1": self._audit_is_permutation(node_values, num_node_feat),
+            "is_valid_encoder_item_index": all(0 <= int(value) < int(num_items) for value in node_values) if node_values else True,
+            "is_unique": len(set(node_values)) == len(node_values),
+            "values_at_target_index": self._audit_sequence_values(node_map, target_indices),
+            "values_at_question_index": self._audit_sequence_values(node_map, question_indices),
+        }
+
+    def _audit_target_summary(self, graph):
+        target_index = getattr(graph, "target_index", None) if graph is not None else None
+        question_index = getattr(graph, "question_index", None) if graph is not None else None
+        node_map = getattr(graph, "node_map", None) if graph is not None else None
+        target_values = self._audit_int_list(target_index)
+        num_node_feat = int(getattr(graph, "num_node_feat", 0)) if graph is not None else None
+        return {
+            "status": "present" if target_index is not None else "missing",
+            "raw": self._audit_tensor_field(target_index).get("raw") if target_index is not None else None,
+            "shape": self._audit_tensor_shape(target_index),
+            "dtype": str(target_index.dtype) if isinstance(target_index, torch.Tensor) else type(target_index).__name__ if target_index is not None else None,
+            "num_node_feat": num_node_feat,
+            "all_values_in_num_node_feat_range": self._audit_values_in_range(target_values, num_node_feat),
+            "node_map_at_target_index": self._audit_sequence_values(node_map, target_values),
+            "question_index_raw": self._audit_tensor_field(question_index).get("raw") if question_index is not None else None,
+            "candidate_nog_local_index": self._audit_int_list(question_index),
+        }
+
+    def _audit_incident_edge_counts(self, edge_index, local_indices):
+        if not isinstance(edge_index, torch.Tensor) or edge_index.numel() == 0:
+            return {"incident": 0, "incoming": 0, "outgoing": 0}
+        local_set = set(int(idx) for idx in local_indices)
+        incident = incoming = outgoing = 0
+        for src, dst in edge_index.detach().cpu().t().tolist():
+            src = int(src)
+            dst = int(dst)
+            if src in local_set or dst in local_set:
+                incident += 1
+            if dst in local_set:
+                incoming += 1
+            if src in local_set:
+                outgoing += 1
+        return {"incident": incident, "incoming": incoming, "outgoing": outgoing}
+
+    def _audit_nog_summary(self, graph, skip_cache_indices, eligible_item_indices):
+        if graph is None:
+            return {"present": False, "status": "missing"}
+        question_index = getattr(graph, "question_index", None)
+        node_map = getattr(graph, "node_map", None)
+        question_values = self._audit_int_list(question_index)
+        node_map_at_question = self._audit_sequence_values(node_map, question_values)
+        mapped_question_items = [
+            int(value) for value in (node_map_at_question.get("values") or [])
+            if isinstance(value, (int, np.integer))
+        ]
+        num_node_feat = int(getattr(graph, "num_node_feat", 0))
+        edge_counts = self._audit_incident_edge_counts(getattr(graph, "edge_index", None), question_values)
+        eligible_set = set(int(item) for item in eligible_item_indices)
+        return {
+            "present": bool(question_values),
+            "question_index_raw": self._audit_tensor_field(question_index).get("raw") if question_index is not None else None,
+            "candidate_local_graph_node_indices": question_values,
+            "node_map_values_at_question_index": node_map_at_question,
+            "skip_cache_indices": sorted(int(idx) for idx in skip_cache_indices),
+            "persistent_cache_eligible": {
+                str(idx): (idx not in skip_cache_indices and 0 <= idx < num_node_feat)
+                for idx in mapped_question_items
+            },
+            "graph_num_nodes": int(getattr(graph, "num_nodes", 0)) if getattr(graph, "num_nodes", None) is not None else None,
+            "num_node_feat": num_node_feat,
+            "node_map_length": int(node_map.numel()) if isinstance(node_map, torch.Tensor) else len(node_map) if isinstance(node_map, (list, tuple)) else None,
+            "incident_structural_edge_count": edge_counts["incident"],
+            "incoming_edge_count": edge_counts["incoming"],
+            "outgoing_edge_count": edge_counts["outgoing"],
+            "included_in_kv_eligible_indices": {str(idx): idx in eligible_set for idx in mapped_question_items},
+            "participates_in_gnn_input": any(0 <= int(idx) < num_node_feat for idx in question_values),
+        }
+
+    def _audit_edge_text_items_summary(self, graph, cache_items, selected_edge_items):
+        num_items = len(cache_items)
+        num_node_feat = int(getattr(graph, "num_node_feat", num_items)) if graph is not None else num_items
+        edge_item_start = min(num_node_feat, num_items)
+        edge_item_indices = list(range(edge_item_start, num_items))
+        suffix_layer_ids = list(range(
+            self.model.icae.get_base_model().model.gnn_start_layer,
+            self.model.icae.get_base_model().model.config.num_hidden_layers,
+        ))
+        per_item_layers = []
+        for item_idx in edge_item_indices:
+            item = cache_items[item_idx]
+            text_kv = item.get("text_kv") if isinstance(item, dict) else None
+            per_item_layers.append(len(text_kv) if isinstance(text_kv, list) else None)
+        edge_map_summary = self._audit_edge_map_summary(graph, num_items)
+        return {
+            "item_count": len(edge_item_indices),
+            "item_index_range": [edge_item_start, num_items],
+            "per_item_suffix_kv_layer_count": per_item_layers,
+            "suffix_layer_ids": suffix_layer_ids,
+            "selected_edge_item_indices": sorted(int(idx) for idx in selected_edge_items),
+            "edge_map_reuse_count": edge_map_summary.get("multiplicity_histogram") if isinstance(edge_map_summary, dict) else None,
+        }
+
+    def _audit_degree_samples(self, graph, target_indices):
+        if graph is None:
+            return []
+        num_node_feat = int(getattr(graph, "num_node_feat", 0))
+        local_degrees = local_node_degrees(graph, num_nodes=num_node_feat)
+        sample_indices = []
+        for idx in target_indices:
+            if 0 <= int(idx) < num_node_feat and int(idx) not in sample_indices:
+                sample_indices.append(int(idx))
+        for idx in range(num_node_feat):
+            if len(sample_indices) >= 3:
+                break
+            if idx not in sample_indices:
+                sample_indices.append(idx)
+        node_map = getattr(graph, "node_map", None)
+        samples = []
+        for idx in sample_indices[:3]:
+            candidate_global = self._audit_sequence_values(node_map, [idx]).get("values")
+            candidate_global_id = candidate_global[0] if candidate_global else None
+            global_degree = self._manifest_node_global_degree(graph, idx)
+            samples.append({
+                "local_node_index": int(idx),
+                "candidate_global_id": candidate_global_id,
+                "candidate_global_id_status": "UNRESOLVED",
+                "sampled_local_degree": int(local_degrees[idx]) if idx < len(local_degrees) else None,
+                "global_graph_degree": global_degree,
+                "global_graph_degree_status": "UNRESOLVED" if global_degree is None else "RUNTIME_VALIDATION_REQUIRED",
+            })
+        return samples
+
+    def _audit_batched_graph_summary(self, graph):
+        if graph is None:
+            return {}
+        return {
+            "batch_size": int(getattr(graph, "num_graphs", 0)) if getattr(graph, "num_graphs", None) is not None else None,
+            "target_index": self._audit_tensor_field(getattr(graph, "target_index", None)),
+            "question_index": self._audit_tensor_field(getattr(graph, "question_index", None)),
+            "node_map": self._audit_tensor_field(getattr(graph, "node_map", None)),
+            "edge_index": self._audit_tensor_field(getattr(graph, "edge_index", None)),
+            "edge_map": self._audit_tensor_field(getattr(graph, "edge_map", None)),
+            "num_node_feat": int(getattr(graph, "num_node_feat", 0)) if getattr(graph, "num_node_feat", None) is not None else None,
+            "batch_vector": self._audit_tensor_field(getattr(graph, "batch", None)),
+            "ptr": self._audit_tensor_field(getattr(graph, "ptr", None)),
+        }
+
+    def _audit_trace_source_snapshot(
+            self,
+            graph,
+            token_ids,
+            cache_items,
+            skip_cache_indices,
+            eligible_item_indices,
+            key_base_load_mask,
+            value_base_load_mask,
+            complete_kv_base_load_mask,
+            kv_base_policy_details,
+            quant_base_payloads=None,
+            quant_cache_keys=None,
+            current_quant_stats=None):
+        if not self._trace_source_audit_active():
+            return
+        try:
+            self._write_trace_source_audit_metadata()
+            query_id = int(self.gofa_trace_source_audit_queries_written)
+            num_items = len(token_ids)
+            skip_cache_indices = sorted(int(idx) for idx in (skip_cache_indices or []))
+            eligible_item_indices = sorted(int(idx) for idx in (eligible_item_indices or []))
+            target_indices = self._audit_int_list(getattr(graph, "target_index", None) if graph is not None else None)
+            question_indices = self._audit_int_list(getattr(graph, "question_index", None) if graph is not None else None)
+            key_policy_selected = [idx for idx, keep in enumerate(key_base_load_mask or []) if keep]
+            value_policy_selected = [idx for idx, keep in enumerate(value_base_load_mask or []) if keep]
+            complete_policy_selected = [idx for idx, keep in enumerate(complete_kv_base_load_mask or []) if keep]
+            effective_key_by_layer = self._audit_effective_kv_indices_by_layer(cache_items, "key")
+            effective_value_by_layer = self._audit_effective_kv_indices_by_layer(cache_items, "value")
+            effective_key_items = sorted(set().union(*[set(v) for v in effective_key_by_layer.values()])) if effective_key_by_layer else []
+            effective_value_items = sorted(set().union(*[set(v) for v in effective_value_by_layer.values()])) if effective_value_by_layer else []
+            complete_effective = sorted(set(effective_key_items) & set(effective_value_items))
+            suffix_layer_ids = list(range(
+                self.model.icae.get_base_model().model.gnn_start_layer,
+                self.model.icae.get_base_model().model.config.num_hidden_layers,
+            ))
+            num_node_feat = int(getattr(graph, "num_node_feat", num_items)) if graph is not None else num_items
+            item_order = None
+            if graph is not None and hasattr(graph, "node_map"):
+                item_order = self._audit_int_list(graph.node_map) + list(range(min(num_node_feat, num_items), num_items))
+            selected_edge_items = set(kv_base_policy_details.get("selected_edge_item_indices", [])) if isinstance(kv_base_policy_details, dict) else set()
+            payload_hit_indices = [idx for idx, payload in enumerate(quant_base_payloads or []) if payload is not None]
+            snapshot = {
+                "audit_format": "gofa_trace_source_audit_query_snapshot_v1",
+                "query_id": query_id,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "repository_commit_sha": self._trace_source_audit_repo_commit(),
+                "agent_runtime_warning": (
+                    "Agent did not execute GOFA on the target datasets. This file is produced only when the "
+                    "user runs GOFA with gofa_trace_source_audit.enabled=True."
+                ),
+                "cache_mode": self.encoder_cache_mode,
+                "cache_tag": self.encoder_cache_namespace,
+                "token_item_count": int(num_items),
+                "token_item_seq_lens": [int(len(ids)) for ids in token_ids],
+                "target_index": self._audit_target_summary(graph),
+                "node_map": self._audit_node_map_summary(graph, target_indices, question_indices, num_items),
+                "edge_map": self._audit_edge_map_summary(graph, num_items),
+                "nog": self._audit_nog_summary(graph, set(skip_cache_indices), eligible_item_indices),
+                "edge_text_items": self._audit_edge_text_items_summary(graph, cache_items, selected_edge_items),
+                "selective_kv": {
+                    "policy_name": kv_base_policy_details.get("kv_base_load_policy") if isinstance(kv_base_policy_details, dict) else None,
+                    "legacy_load_key_base": kv_base_policy_details.get("load_key_base") if isinstance(kv_base_policy_details, dict) else None,
+                    "legacy_load_value_base": kv_base_policy_details.get("load_value_base") if isinstance(kv_base_policy_details, dict) else None,
+                    "policy_selected_key_item_indices": key_policy_selected,
+                    "policy_selected_value_item_indices": value_policy_selected,
+                    "complete_policy_selected_item_indices": complete_policy_selected,
+                    "effective_consumed_key_item_indices": effective_key_items,
+                    "effective_consumed_value_item_indices": effective_value_items,
+                    "complete_kv_item_indices": complete_effective,
+                    "k_only_item_indices": sorted(set(effective_key_items) - set(effective_value_items)),
+                    "v_only_item_indices": sorted(set(effective_value_items) - set(effective_key_items)),
+                    "eligible_item_indices": eligible_item_indices,
+                    "skip_cache_indices": skip_cache_indices,
+                },
+                "layer_selection": {
+                    "suffix_layer_ids": suffix_layer_ids,
+                    "selection_is_shared_across_suffix_layers": (
+                        len({tuple(v) for v in effective_key_by_layer.values()}) <= 1 and
+                        len({tuple(v) for v in effective_value_by_layer.values()}) <= 1
+                    ),
+                    "effective_key_items_by_layer": effective_key_by_layer,
+                    "effective_value_items_by_layer": effective_value_by_layer,
+                },
+                "degree_samples": self._audit_degree_samples(graph, target_indices),
+                "batching": self._audit_batched_graph_summary(graph),
+                "cache_access": {
+                    "skip_cache_indices": skip_cache_indices,
+                    "quant_base_payload_hit_indices": payload_hit_indices,
+                    "quant_cache_keys": self._audit_jsonify(quant_cache_keys or []),
+                    "current_quant_stats": self._audit_jsonify(current_quant_stats or {}),
+                },
+                "stages": {
+                    "dataset_sample_or_pre_batch": {
+                        "status": "UNRESOLVED",
+                        "reason": "The minimal probe is inserted in model runtime and does not intercept dataset __getitem__ before batching.",
+                    },
+                    "model_encoder_entry": {
+                        "target_index": self._audit_tensor_field(getattr(graph, "target_index", None) if graph is not None else None),
+                        "question_index": self._audit_tensor_field(getattr(graph, "question_index", None) if graph is not None else None),
+                        "node_map": self._audit_tensor_field(getattr(graph, "node_map", None) if graph is not None else None),
+                        "edge_index": self._audit_tensor_field(getattr(graph, "edge_index", None) if graph is not None else None),
+                        "edge_map": self._audit_tensor_field(getattr(graph, "edge_map", None) if graph is not None else None),
+                        "num_node_feat": int(getattr(graph, "num_node_feat", 0)) if graph is not None else None,
+                        "token_item_count": int(num_items),
+                    },
+                    "after_skip_nog_resolution": {
+                        "skip_cache_indices": skip_cache_indices,
+                    },
+                    "after_selective_kv_policy": {
+                        "eligible_item_indices": eligible_item_indices,
+                        "key_policy_mask": [bool(x) for x in (key_base_load_mask or [])],
+                        "value_policy_mask": [bool(x) for x in (value_base_load_mask or [])],
+                        "complete_kv_policy_mask": [bool(x) for x in (complete_kv_base_load_mask or [])],
+                        "policy_details": self._audit_jsonify(kv_base_policy_details),
+                    },
+                    "before_forward_memory_with_text_kv": {
+                        "effective_key_item_indices": effective_key_items,
+                        "effective_value_item_indices": effective_value_items,
+                        "complete_kv_item_indices": complete_effective,
+                        "cache_item_count": len(cache_items),
+                        "cache_item_memory_shapes": [
+                            self._audit_tensor_shape(item.get("memory_state")) if isinstance(item, dict) else None
+                            for item in cache_items
+                        ],
+                    },
+                    "after_map_node_reorder": {
+                        "item_order": item_order,
+                        "mapped_node_item_order": self._audit_tensor_field(getattr(graph, "node_map", None) if graph is not None else None),
+                        "edge_item_range": [min(num_node_feat, num_items), num_items],
+                        "mapped_items_count": len(item_order) if item_order is not None else None,
+                    },
+                },
+            }
+            output_dir = self.gofa_trace_source_audit["output_dir"]
+            output_path = os.path.join(output_dir, f"query_{query_id:06d}.json")
+            self._trace_source_audit_write_json(output_path, snapshot)
+            self.gofa_trace_source_audit_queries_written += 1
+            if (
+                self.gofa_trace_source_audit_queries_written <= 3 or
+                self.gofa_trace_source_audit_queries_written % int(self.gofa_trace_source_audit["flush_interval"]) == 0
+            ):
+                self._trace_source_audit_log(
+                    f"query_written query_id={query_id} path={os.path.basename(output_path)} "
+                    f"token_item_count={num_items} eligible_items={len(eligible_item_indices)}"
+                )
+        except Exception as exc:
+            message = f"GOFA trace source audit failed: {exc}"
+            self._trace_source_audit_log(message)
+            if self.gofa_trace_source_audit.get("strict", False):
+                raise RuntimeError(message) from exc
+            print(message)
 
     def _encoder_cache_manifest_task_names(self):
         eval_task_names = getattr(self.model_args, "eval_task_names", None)
@@ -3250,6 +3930,21 @@ class GOFAMistral(torch.nn.Module):
                     key_base_load_mask[item_idx] and complete_kv_base_load_mask[item_idx],
                     value_base_load_mask[item_idx] and complete_kv_base_load_mask[item_idx],
                 )
+
+        self._audit_trace_source_snapshot(
+            graph=graph,
+            token_ids=token_ids,
+            cache_items=cache_items,
+            skip_cache_indices=skip_cache_indices,
+            eligible_item_indices=kv_base_eligible_indices,
+            key_base_load_mask=key_base_load_mask,
+            value_base_load_mask=value_base_load_mask,
+            complete_kv_base_load_mask=complete_kv_base_load_mask,
+            kv_base_policy_details=kv_base_policy_details,
+            quant_base_payloads=quant_base_payloads,
+            quant_cache_keys=quant_cache_keys,
+            current_quant_stats=current_quant_stats,
+        )
 
         self._apply_scheme_b_quant_debug_zero_base(cache_items, quant_base_payloads, non_skip_item_count)
         self._apply_scheme_b_ablation(cache_items, graph, skip_cache_indices=skip_cache_indices)
