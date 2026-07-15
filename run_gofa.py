@@ -125,6 +125,19 @@ def main(params):
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "gofa_query_trace"):
+        model_args.gofa_query_trace = params.gofa_query_trace
+    for field_name in (
+        "gofa_query_trace_enabled",
+        "gofa_query_trace_output_dir",
+        "gofa_query_trace_max_queries",
+        "gofa_query_trace_include_token_ids",
+        "gofa_query_trace_include_text_preview",
+        "gofa_query_trace_rank_zero_only",
+        "gofa_query_trace_strict",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
     for field_name in (
         "eval_task_names",
         "train_task_names",

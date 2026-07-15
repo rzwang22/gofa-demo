@@ -120,6 +120,7 @@ class GOFAMistralModel(MistralModel):
         self.quant_kv_attention_config = {"enabled": False}
         self.quant_kv_attention_stats = self._new_quant_kv_attention_stats()
         self.quant_kv_attention_warned_fallback = False
+        self.query_trace_shape_capture = None
         self.reset_stage_profile()
 
         # self.g_layers = nn.ModuleList([GOFAGatedDecoderLayer(gofa_config, layer_idx=i) for i in range(gofa_config.num_layers)])
@@ -201,6 +202,81 @@ class GOFAMistralModel(MistralModel):
     def _stage_profile_increment(self, key):
         if self._stage_profile_enabled():
             self.stage_profile[key] += 1
+
+    def begin_query_trace_shape_capture(self):
+        self.query_trace_shape_capture = {
+            "item_order": [],
+            "layers": OrderedDict(),
+        }
+
+    def query_trace_shape_capture_enabled(self):
+        return self.query_trace_shape_capture is not None
+
+    def _query_trace_shape(self, tensor):
+        return None if tensor is None else [int(dim) for dim in tensor.shape]
+
+    def _query_trace_layer_record(self, layer_id):
+        if not self.query_trace_shape_capture_enabled() or layer_id is None:
+            return None
+        layer_id = int(layer_id)
+        layers = self.query_trace_shape_capture["layers"]
+        if layer_id not in layers:
+            layers[layer_id] = {
+                "layer_id": layer_id,
+                "items": OrderedDict(),
+                "gnn": None,
+            }
+        return layers[layer_id]
+
+    def _record_query_trace_gnn_shapes(self, layer_id, node_input, node_output, edge_input):
+        layer = self._query_trace_layer_record(layer_id)
+        if layer is None:
+            return
+        layer["gnn"] = {
+            "node_input_shape": self._query_trace_shape(node_input),
+            "node_output_shape": self._query_trace_shape(node_output),
+            "edge_input_shape": self._query_trace_shape(edge_input),
+            "edge_output_shape": None,
+            "edge_output_status": "not_produced_by_gofa_gnn_layer",
+        }
+
+    def _record_query_trace_item_shapes(
+        self,
+        layer_id,
+        runtime_item_index,
+        source_item_index,
+        **shapes,
+    ):
+        layer = self._query_trace_layer_record(layer_id)
+        if layer is None:
+            return
+        runtime_item_index = int(runtime_item_index)
+        item = layer["items"].setdefault(
+            runtime_item_index,
+            {
+                "runtime_item_index": runtime_item_index,
+                "item_index": int(source_item_index),
+            },
+        )
+        for name, tensor in shapes.items():
+            item[name] = self._query_trace_shape(tensor)
+
+    def end_query_trace_shape_capture(self):
+        capture = self.query_trace_shape_capture
+        self.query_trace_shape_capture = None
+        if capture is None:
+            return {"item_order": [], "layers": []}
+        layers = []
+        for layer in capture["layers"].values():
+            layers.append({
+                "layer_id": layer["layer_id"],
+                "items": list(layer["items"].values()),
+                "gnn": layer["gnn"],
+            })
+        return {
+            "item_order": list(capture["item_order"]),
+            "layers": layers,
+        }
 
     def _new_quant_kv_attention_stats(self):
         return {
@@ -502,6 +578,9 @@ class GOFAMistralModel(MistralModel):
         output_attentions,
         num_key_value_groups,
         head_dim,
+        trace_layer_id=None,
+        trace_runtime_item_index=None,
+        trace_source_item_index=None,
     ):
         cfg = getattr(self, "quant_kv_attention_config", {})
         if cfg.get("backend") != "torch_int_mm_qscale_fold":
@@ -589,9 +668,21 @@ class GOFAMistralModel(MistralModel):
             attn_weights = torch.cat([cached_logits, current_logits], dim=-1)
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask[:, :, :, : text_len + current_len]
+            self._record_query_trace_item_shapes(
+                trace_layer_id,
+                trace_runtime_item_index,
+                trace_source_item_index,
+                qk_shape=attn_weights,
+            )
             softmax_start = time.perf_counter()
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
             self._quant_kv_stat_add("softmax_time_s", time.perf_counter() - softmax_start)
+            self._record_query_trace_item_shapes(
+                trace_layer_id,
+                trace_runtime_item_index,
+                trace_source_item_index,
+                softmax_probability_shape=attn_weights,
+            )
             attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
 
             cached_probs = attn_weights[:, :, :, :text_len]
@@ -616,6 +707,12 @@ class GOFAMistralModel(MistralModel):
             current_probs = attn_weights[:, :, :, text_len:]
             current_output = torch.matmul(current_probs, current_value_states)
             attn_output = cached_output + current_output
+            self._record_query_trace_item_shapes(
+                trace_layer_id,
+                trace_runtime_item_index,
+                trace_source_item_index,
+                pv_shape=attn_output,
+            )
 
             if not stats.get("example_shapes"):
                 stats["example_shapes"] = {
@@ -657,6 +754,9 @@ class GOFAMistralModel(MistralModel):
         cache_position,
         position_embeddings,
         g_layer_idx,
+        trace_layer_id=None,
+        trace_runtime_item_index=None,
+        trace_source_item_index=None,
     ):
         bsz, q_len, _ = hidden_states.size()
         attention_config = attention.config
@@ -671,6 +771,13 @@ class GOFAMistralModel(MistralModel):
         query_states = attention.q_proj(hidden_states)
         key_states = attention.k_proj(hidden_states)
         value_states = attention.v_proj(hidden_states)
+        self._record_query_trace_item_shapes(
+            trace_layer_id,
+            trace_runtime_item_index,
+            trace_source_item_index,
+            q_projection_input_shape=hidden_states,
+            q_projection_output_shape=query_states,
+        )
 
         query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
@@ -693,6 +800,9 @@ class GOFAMistralModel(MistralModel):
                 output_attentions,
                 num_key_value_groups,
                 head_dim,
+                trace_layer_id=trace_layer_id,
+                trace_runtime_item_index=trace_runtime_item_index,
+                trace_source_item_index=trace_source_item_index,
             )
         else:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -708,15 +818,39 @@ class GOFAMistralModel(MistralModel):
             if attention_mask is not None:
                 causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
                 attn_weights = attn_weights + causal_mask
+            self._record_query_trace_item_shapes(
+                trace_layer_id,
+                trace_runtime_item_index,
+                trace_source_item_index,
+                qk_shape=attn_weights,
+            )
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            self._record_query_trace_item_shapes(
+                trace_layer_id,
+                trace_runtime_item_index,
+                trace_source_item_index,
+                softmax_probability_shape=attn_weights,
+            )
             attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
             attn_output = torch.matmul(attn_weights, value_states)
+            self._record_query_trace_item_shapes(
+                trace_layer_id,
+                trace_runtime_item_index,
+                trace_source_item_index,
+                pv_shape=attn_output,
+            )
         self._stage_profile_add("memory_kv_attn_scores_s", attn_start, attn_output, g_layer_idx)
 
         o_proj_start = self._stage_profile_start(attn_output)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = attention.o_proj(attn_output)
+        self._record_query_trace_item_shapes(
+            trace_layer_id,
+            trace_runtime_item_index,
+            trace_source_item_index,
+            attention_output_shape=attn_output,
+        )
         self._stage_profile_add("memory_kv_o_proj_s", o_proj_start, attn_output, g_layer_idx)
 
         if not output_attentions:
@@ -835,6 +969,9 @@ class GOFAMistralModel(MistralModel):
         cache_position,
         position_embeddings,
         g_layer_idx,
+        trace_layer_id=None,
+        trace_runtime_item_index=None,
+        trace_source_item_index=None,
     ):
         residual = hidden_states
 
@@ -852,6 +989,9 @@ class GOFAMistralModel(MistralModel):
             cache_position,
             position_embeddings,
             g_layer_idx,
+            trace_layer_id=trace_layer_id,
+            trace_runtime_item_index=trace_runtime_item_index,
+            trace_source_item_index=trace_source_item_index,
         )
         hidden_states = residual + attn_output
 
@@ -861,7 +1001,15 @@ class GOFAMistralModel(MistralModel):
         self._stage_profile_add("memory_kv_post_attn_norm_s", post_norm_start, hidden_states, g_layer_idx)
 
         mlp_start = self._stage_profile_start(hidden_states)
+        mlp_input = hidden_states
         hidden_states = decoder_layer.mlp(hidden_states)
+        self._record_query_trace_item_shapes(
+            trace_layer_id,
+            trace_runtime_item_index,
+            trace_source_item_index,
+            mlp_input_shape=mlp_input,
+            mlp_output_shape=hidden_states,
+        )
         self._stage_profile_add("memory_kv_mlp_s", mlp_start, hidden_states, g_layer_idx)
         hidden_states = residual + hidden_states
 
@@ -974,12 +1122,15 @@ class GOFAMistralModel(MistralModel):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         cur_node_size = graph.num_node_feat if graph is not None else 0
         mapped_items = list(text_kv_items)
+        item_order = list(range(len(mapped_items)))
 
         if graph is not None and map_node:
             item_order = graph.node_map.detach().cpu().tolist() + list(range(cur_node_size, len(mapped_items)))
             memory_states = memory_states[item_order]
             mapped_items = [mapped_items[i] for i in item_order]
             cur_node_size = len(graph.node_map)
+        if self.query_trace_shape_capture_enabled():
+            self.query_trace_shape_capture["item_order"] = [int(item_index) for item_index in item_order]
 
         self._stage_profile_increment("encoder_suffix_calls")
         for i, decoder_layer in enumerate(self.layers[self.gnn_start_layer:self.config.num_hidden_layers],
@@ -990,6 +1141,7 @@ class GOFAMistralModel(MistralModel):
                 gnn_input = memory_states[:cur_node_size]
                 gnn_edge_input = memory_states[cur_node_size:][graph.edge_map]
                 output = self.g_layers[g_layer_idx](gnn_input, graph.edge_index, gnn_edge_input)
+                self._record_query_trace_gnn_shapes(i, gnn_input, output, gnn_edge_input)
                 memory_states = torch.cat([output, memory_states[cur_node_size:]], dim=0)
                 memory_states = memory_states.to(self.gofa_config.llama_dtype)
                 self._stage_profile_add("encoder_gnn_layer_s", gnn_start, memory_states, g_layer_idx)
@@ -1041,7 +1193,8 @@ class GOFAMistralModel(MistralModel):
                 )
                 position_embeddings = self.rotary_emb(mem_hidden_states, position_ids)
                 if use_quant_kv_attention or (
-                        self._stage_profile_enabled() and getattr(self, "profile_memory_kv_transformer_breakdown", False)):
+                        self._stage_profile_enabled() and getattr(self, "profile_memory_kv_transformer_breakdown", False)
+                ) or self.query_trace_shape_capture_enabled():
                     layer_outputs = self._memory_kv_decoder_layer_breakdown(
                         decoder_layer,
                         mem_hidden_states,
@@ -1052,6 +1205,9 @@ class GOFAMistralModel(MistralModel):
                         cache_position,
                         position_embeddings,
                         g_layer_idx,
+                        trace_layer_id=i,
+                        trace_runtime_item_index=item_idx,
+                        trace_source_item_index=item_order[item_idx],
                     )
                 else:
                     layer_outputs = self.llm_forward(

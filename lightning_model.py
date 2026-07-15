@@ -33,6 +33,25 @@ class GraphTextPredLightning(BaseTemplate):
         # print(batch)
         return self.model(batch)
 
+    def compute_results(self, batch, batch_idx, step_name, log_loss=True, *args):
+        llm_model = getattr(self.model, "llm_model", None)
+        if hasattr(llm_model, "set_gofa_query_trace_context"):
+            state_name = str(step_name)
+            task_name = state_name
+            split = None
+            for suffix, resolved_split in (("_val", "val"), ("_test", "test"), ("_train", "train")):
+                if state_name.endswith(suffix):
+                    task_name = state_name[:-len(suffix)]
+                    split = resolved_split
+                    break
+            llm_model.set_gofa_query_trace_context(
+                task_name=task_name,
+                dataset_name=task_name,
+                split=split,
+                runtime_query_index=batch_idx,
+            )
+        return super().compute_results(batch, batch_idx, step_name, log_loss, *args)
+
     def on_train_start(self) -> None:
         torch.cuda.empty_cache()
         self.optimizers().param_groups[0]['lr'] = self.exp_config.lr

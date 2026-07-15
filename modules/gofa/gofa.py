@@ -48,6 +48,7 @@ from modules.gofa.int_gemm_quant import (
     int_gemm_context,
     maybe_create_suffix_transformer_int_gemm_quantizer,
 )
+from modules.gofa.query_trace import GOFAQueryTraceExporter
 
 ###################################################################
 #                 Configurations                                  #
@@ -106,6 +107,14 @@ class ModelArguments:
     gofa_trace_source_audit_strict: Optional[bool] = field(default=None)
     gofa_trace_source_audit_dump_pre_cache_snapshot: Optional[bool] = field(default=None)
     gofa_trace_source_audit_dump_cache_miss_snapshot: Optional[bool] = field(default=None)
+    gofa_query_trace: Optional[Dict[str, Any]] = field(default_factory=dict)
+    gofa_query_trace_enabled: Optional[bool] = field(default=None)
+    gofa_query_trace_output_dir: Optional[str] = field(default=None)
+    gofa_query_trace_max_queries: Optional[int] = field(default=None)
+    gofa_query_trace_include_token_ids: Optional[bool] = field(default=None)
+    gofa_query_trace_include_text_preview: Optional[bool] = field(default=None)
+    gofa_query_trace_rank_zero_only: Optional[bool] = field(default=None)
+    gofa_query_trace_strict: Optional[bool] = field(default=None)
     encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
     encoder_cache_verify_tolerance: float = field(default=1e-3, metadata={"help": "Strict max-absolute tolerance for exact verification reporting"})
     encoder_cache_verify_mean_tolerance: float = field(default=3e-2)
@@ -335,6 +344,11 @@ class GOFAMistral(torch.nn.Module):
         self.gofa_trace_source_audit_pre_cache_snapshots_written = 0
         self.gofa_trace_source_audit_cache_miss_snapshots_written = 0
         self.gofa_trace_source_audit_metadata_written = False
+        self.gofa_query_trace = self._normalize_gofa_query_trace_config(model_args)
+        self.gofa_query_trace_enabled = (
+            bool(self.gofa_query_trace["enabled"]) and self._gofa_query_trace_rank_allowed()
+        )
+        self.gofa_query_trace_exporter = None
         self.scheme_b_ablation = self._normalize_scheme_b_ablation_config(model_args)
         self.scheme_b_ablation_enabled = bool(self.scheme_b_ablation["enabled"])
         self.scheme_b_ablation_calls = 0
@@ -658,6 +672,23 @@ class GOFAMistral(torch.nn.Module):
                         f"keep_target_edges={self.scheme_b_ablation['keep_target_edges']}, "
                         f"log_interval={self.scheme_b_ablation['log_interval']}"
                     )
+        if self.gofa_query_trace_enabled:
+            self.gofa_query_trace_exporter = GOFAQueryTraceExporter(
+                self,
+                self.gofa_query_trace,
+                enabled=True,
+            )
+            self.gofa_query_trace_exporter.validate_setup()
+            print(
+                "GOFA formal query trace enabled: "
+                f"output_dir={self.gofa_query_trace['output_dir']}, "
+                f"max_queries={self.gofa_query_trace['max_queries']}, "
+                f"include_token_ids={self.gofa_query_trace['include_token_ids']}, "
+                f"include_text_preview={self.gofa_query_trace['include_text_preview']}, "
+                f"rank_zero_only={self.gofa_query_trace['rank_zero_only']}, "
+                f"strict={self.gofa_query_trace['strict']}, "
+                "batch_size=1, cache_precision=M4K2V2"
+            )
         if self.gofa_trace_source_audit_enabled and not self.gofa_trace_source_audit_metadata_written:
             os.makedirs(self.gofa_trace_source_audit["output_dir"], exist_ok=True)
             self._write_trace_source_audit_metadata()
@@ -958,6 +989,43 @@ class GOFAMistral(torch.nn.Module):
         cfg["dump_cache_miss_snapshot"] = bool(cfg["dump_cache_miss_snapshot"])
         if cfg["enabled"] and not cfg["output_dir"]:
             raise ValueError("gofa_trace_source_audit.output_dir must be set when audit is enabled.")
+        return cfg
+
+    def _normalize_gofa_query_trace_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "output_dir": "",
+            "max_queries": 0,
+            "include_token_ids": False,
+            "include_text_preview": True,
+            "rank_zero_only": True,
+            "strict": True,
+        }
+        nested = getattr(model_args, "gofa_query_trace", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "gofa_query_trace_enabled",
+            "output_dir": "gofa_query_trace_output_dir",
+            "max_queries": "gofa_query_trace_max_queries",
+            "include_token_ids": "gofa_query_trace_include_token_ids",
+            "include_text_preview": "gofa_query_trace_include_text_preview",
+            "rank_zero_only": "gofa_query_trace_rank_zero_only",
+            "strict": "gofa_query_trace_strict",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["output_dir"] = str(cfg["output_dir"] or "")
+        cfg["max_queries"] = max(int(cfg["max_queries"]), 0)
+        cfg["include_token_ids"] = bool(cfg["include_token_ids"])
+        cfg["include_text_preview"] = bool(cfg["include_text_preview"])
+        cfg["rank_zero_only"] = bool(cfg["rank_zero_only"])
+        cfg["strict"] = bool(cfg["strict"])
+        if cfg["enabled"] and not cfg["output_dir"]:
+            raise ValueError("gofa_query_trace.output_dir must be set when query trace export is enabled.")
         return cfg
 
     def _normalize_scheme_b_weight_quant_config(self, model_args):
@@ -1699,6 +1767,30 @@ class GOFAMistral(torch.nn.Module):
             if value not in (None, "", "0"):
                 return False
         return True
+
+    def _gofa_query_trace_rank_allowed(self):
+        if not self.gofa_query_trace.get("rank_zero_only", True):
+            return True
+        for env_name in ("RANK", "LOCAL_RANK", "SLURM_PROCID"):
+            value = os.environ.get(env_name)
+            if value not in (None, "", "0"):
+                return False
+        return True
+
+    def set_gofa_query_trace_context(
+        self,
+        task_name=None,
+        dataset_name=None,
+        split=None,
+        runtime_query_index=None,
+    ):
+        if self.gofa_query_trace_exporter is not None:
+            self.gofa_query_trace_exporter.set_context(
+                task_name=task_name,
+                dataset_name=dataset_name,
+                split=split,
+                runtime_query_index=runtime_query_index,
+            )
 
     def _trace_source_audit_active(self):
         return (
@@ -4303,13 +4395,23 @@ class GOFAMistral(torch.nn.Module):
 
         self._sync_encoder_cache_timer(device)
         suffix_start = time.perf_counter()
-        with self._encoder_suffix_quant_context():
-            final_memory_states, mapped_items = base_model.forward_memory_with_text_kv(
-                memory_states=memory_states,
-                text_kv_items=cache_items,
-                graph=graph,
-                map_node=True,
-            )
+        query_trace_active = (
+            self.gofa_query_trace_exporter is not None and self.gofa_query_trace_exporter.active()
+        )
+        runtime_operation_shapes = {"item_order": [], "layers": []}
+        if query_trace_active:
+            base_model.begin_query_trace_shape_capture()
+        try:
+            with self._encoder_suffix_quant_context():
+                final_memory_states, mapped_items = base_model.forward_memory_with_text_kv(
+                    memory_states=memory_states,
+                    text_kv_items=cache_items,
+                    graph=graph,
+                    map_node=True,
+                )
+        finally:
+            if query_trace_active:
+                runtime_operation_shapes = base_model.end_query_trace_shape_capture()
         final_hidden_states = torch.zeros(
             (len(mapped_items), padded_token_ids.size(1), final_memory_states.size(-1)),
             dtype=final_memory_states.dtype,
@@ -4319,6 +4421,19 @@ class GOFAMistral(torch.nn.Module):
         final_hidden_states[mapped_mem_mask] = final_memory_states.reshape(-1, final_memory_states.size(-1))
         self._sync_encoder_cache_timer(device)
         current_timing["suffix_compute_s"] = time.perf_counter() - suffix_start
+
+        if query_trace_active:
+            self.gofa_query_trace_exporter.write_query(
+                graph=graph,
+                token_ids=token_ids,
+                cache_items=cache_items,
+                skip_cache_indices=skip_cache_indices,
+                eligible_item_indices=kv_base_eligible_indices,
+                kv_base_policy_details=kv_base_policy_details,
+                quant_base_payloads=quant_base_payloads,
+                quant_cache_keys=quant_cache_keys,
+                runtime_operation_shapes=runtime_operation_shapes,
+            )
 
         if self.encoder_cache_verify:
             previous_profile_state = getattr(base_model, "profile_stage_times", False)
@@ -4472,6 +4587,8 @@ class GOFAMistral(torch.nn.Module):
 
     def encode(self, data, graph=None, partial_grad=None):
         cur_device = self.model.memory_token_embed.weight.device
+        if self.gofa_query_trace_exporter is not None:
+            self.gofa_query_trace_exporter.validate_graph(graph)
         batch_size = len(data)
         text_output = \
         self.model.tokenizer(data, truncation=True, max_length=self.model.training_args.model_max_length, padding=False,

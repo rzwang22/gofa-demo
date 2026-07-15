@@ -23,6 +23,14 @@ gofa_trace_source_audit:
   strict: False
   dump_pre_cache_snapshot: False
   dump_cache_miss_snapshot: True
+gofa_query_trace:
+  enabled: False
+  output_dir: ""
+  max_queries: 0
+  include_token_ids: False
+  include_text_preview: True
+  rank_zero_only: True
+  strict: True
 scheme_b_quant:
   enabled: False
   base_bits: 8
