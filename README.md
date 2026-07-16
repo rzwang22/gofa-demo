@@ -39,6 +39,9 @@ We provide both the pre-trained and instruction-tuned checkpoints in the [Huggin
 ## Overview
 `run_gofa.py` is the main entry point to train the GOFA model. The architecture of GOFA is depicted below.
 
+For the isolated pure-LLM baseline (`model_type=llm_n`, zero-shot or LoRA SFT),
+see [README_LLM_N.md](README_LLM_N.md). The default GOFA path is unchanged.
+
 ![alt text](figures/model.png)
 
 `./configs` includes configuration for different settings. `default_config.yaml` is the base configuration, which can be overriden by specifying `--override {override_config dir}`.
@@ -115,4 +118,3 @@ GOFA generates interesting behavior on questions it has never seen, as shown bel
   year={2024}
 }
 ```
-
