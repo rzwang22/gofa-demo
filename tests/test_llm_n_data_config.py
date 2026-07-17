@@ -185,6 +185,7 @@ def test_train_and_inference_configs_keep_llm_n_baseline_defaults() -> None:
     assert train["hops"] == 3
     assert train["max_nodes_per_hop"] == 5
     assert train["gofa_size_filter"] is True
+    assert train["resume_from_checkpoint"] is None
     assert train["lora_r"] > 0
     assert train["lora_alpha"] > 0
     assert 0.0 <= train["lora_dropout"] < 1.0

@@ -296,8 +296,10 @@ class LLMNPredictor:
         if not torch.cuda.is_available() and torch_dtype in (torch.float16, torch.bfloat16):
             torch_dtype = torch.float32
 
+        resume_checkpoint = _cfg(config, "_resolved_resume_checkpoint", None)
+        tokenizer_source = resume_checkpoint if for_training and resume_checkpoint else model_name
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
+            tokenizer_source,
             use_fast=bool(_cfg(config, "use_fast_tokenizer", True)),
             trust_remote_code=bool(_cfg(config, "trust_remote_code", False)),
         )
@@ -339,33 +341,53 @@ class LLMNPredictor:
 
         adapter_path = _cfg(config, "adapter_path", None)
         if for_training:
-            from peft import LoraConfig, get_peft_model
-
             if adapter_path:
-                raise ValueError("adapter_path is for inference/resume; start SFT without a graph checkpoint")
+                raise ValueError(
+                    "adapter_path is inference-only; use resume_from_checkpoint for trainable LoRA recovery"
+                )
             if load_in_4bit:
                 from peft import prepare_model_for_kbit_training
 
                 model = prepare_model_for_kbit_training(model)
-            target_modules = _cfg(
-                config,
-                "lora_target_modules",
-                ["q_proj", "k_proj", "v_proj", "o_proj"],
-            )
-            lora_config = LoraConfig(
-                r=int(_cfg(config, "lora_r", 16)),
-                lora_alpha=int(_cfg(config, "lora_alpha", 32)),
-                lora_dropout=float(_cfg(config, "lora_dropout", 0.05)),
-                bias="none",
-                task_type="CAUSAL_LM",
-                target_modules=list(target_modules),
-            )
-            model = get_peft_model(model, lora_config)
+            if resume_checkpoint:
+                from peft import PeftModel
+
+                model = PeftModel.from_pretrained(
+                    model,
+                    resume_checkpoint,
+                    is_trainable=True,
+                )
+            else:
+                from peft import LoraConfig, get_peft_model
+
+                target_modules = _cfg(
+                    config,
+                    "lora_target_modules",
+                    ["q_proj", "k_proj", "v_proj", "o_proj"],
+                )
+                lora_config = LoraConfig(
+                    r=int(_cfg(config, "lora_r", 16)),
+                    lora_alpha=int(_cfg(config, "lora_alpha", 32)),
+                    lora_dropout=float(_cfg(config, "lora_dropout", 0.05)),
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                    target_modules=list(target_modules),
+                )
+                model = get_peft_model(model, lora_config)
             if bool(_cfg(config, "gradient_checkpointing", True)):
                 model.gradient_checkpointing_enable()
                 if hasattr(model, "enable_input_require_grads"):
                     model.enable_input_require_grads()
             model.config.use_cache = False
+            trainable_names = [
+                name for name, parameter in model.named_parameters() if parameter.requires_grad
+            ]
+            if not trainable_names or any("lora_" not in name for name in trainable_names):
+                raise RuntimeError(
+                    "Training model must expose only LoRA parameters as trainable; got: "
+                    + ", ".join(trainable_names)
+                )
+            model.train()
             model.print_trainable_parameters()
         elif adapter_path:
             from peft import PeftModel

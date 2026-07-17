@@ -46,10 +46,12 @@ commit；正式对比时必须记录所用 TAGLAS commit，并确保其 PyTorch/
 
 ## 训练
 
-七任务联合 LoRA SFT（默认 `hops=3`、`max_nodes_per_hop=5`、batch size 1）：
+七任务联合 LoRA SFT（默认 `hops=3`、`max_nodes_per_hop=5`、batch size 1）。正式长任务建议从
+一开始就固定 `run_name` 及 scheduler horizon；若使用 `max_steps`，首次启动时必须写最终目标值：
 
 ```bash
-python run_llm_n.py --config configs/llm_n_train_config.yaml
+python run_llm_n.py --config configs/llm_n_train_config.yaml \
+  run_name llm_n_7task_seed1 num_epochs 1 max_steps -1
 ```
 
 仅训练一个或若干任务：
@@ -64,6 +66,67 @@ python run_llm_n.py --config configs/llm_n_train_config.yaml \
 ```bash
 python run_gofa.py --override configs/llm_n_train_config.yaml
 ```
+
+### 断点续训
+
+从明确 checkpoint 恢复：
+
+```bash
+python run_llm_n.py --config configs/llm_n_train_config.yaml \
+  --resume-from-checkpoint \
+  outputs/llm_n_train/llm_n_7task_seed1/trainer/checkpoint-5000 \
+  run_name llm_n_7task_seed1 num_epochs 1 max_steps -1
+```
+
+在指定 run 中自动选择 global step 最大的完整 checkpoint：
+
+```bash
+python run_llm_n.py --config configs/llm_n_train_config.yaml \
+  --resume-from-checkpoint latest \
+  --output-dir outputs/llm_n_train \
+  run_name llm_n_7task_seed1 num_epochs 1 max_steps -1
+```
+
+也可在 YAML 中设置 `resume_from_checkpoint: /path/to/checkpoint` 或
+`resume_from_checkpoint: latest`。恢复默认继续使用 checkpoint 所属的 `<run>`，不会创建新的 UTC
+run id；`training_metrics.json`、`training_context_events.jsonl`、`trainer/checkpoint-*` 和
+`adapter/` 都继续在原目录中更新。
+
+恢复会先加载原始 Mistral，再以 `is_trainable=True` 加载 checkpoint 中的 PEFT adapter；随后恢复
+optimizer、原 scheduler、FP16 GradScaler（如适用）、累计 loss/样本数、全部 RNG 状态及 sampler
+cursor。sampler 的每个 epoch permutation 仅由 `seed + epoch` 决定，checkpoint cursor 指向下一个
+尚未读取的样本，因此 `batch_size > 1`、`grad_acc_step > 1` 和 epoch 边界均不会重复或遗漏样本。
+
+以下配置必须与 checkpoint 完全一致，否则程序会逐字段列出冲突并退出：base model、训练任务及
+顺序、每任务 sample size、data root、seed、batch size、gradient accumulation、epoch/max steps、
+hops/max nodes、全部 LoRA 参数、scheduler/warmup、precision、truncate mode，以及由这些配置解析
+出的 dataset size 和 scheduler total steps。仅允许改变 `output_dir`、`run_name`、`logging_steps`、
+`save_steps` 和 `save_total_limit`。特别地，不允许先按 `max_steps=2` 把 cosine scheduler 训练到 0，
+再把同一 checkpoint 改为 `max_steps=100`。
+
+### 推荐的正式训练命令
+
+这里的“六任务”指七任务集合中去掉知识图谱任务 `wn18rr`，即 arXiv/Cora/PubMed/WikiCS 六项。
+六任务：
+
+```bash
+python run_llm_n.py --config configs/llm_n_train_config.yaml \
+  --tasks arxiv cora_node cora_link pubmed_node pubmed_link wikics \
+  run_name llm_n_6task_seed1 \
+  sample_size_per_task '[16000,1200,15000,1300,20000,8000]' \
+  num_epochs 1 max_steps -1
+```
+
+七任务：
+
+```bash
+python run_llm_n.py --config configs/llm_n_train_config.yaml \
+  run_name llm_n_7task_seed1 num_epochs 1 max_steps -1
+```
+
+以上命令按一个完整 epoch 训练，scheduler horizon 由首次解析出的数据集大小、batch size 和
+gradient accumulation 决定。若改用正数 `max_steps`，正式实验应在首次启动前确定最终值，恢复命令
+必须原样复用；`num_epochs` 和 `max_steps` 在两种方案下均不得在恢复时改变。
 
 ## 推理
 
@@ -121,12 +184,33 @@ python scripts/smoke_test_llm_n.py \
   --output-dir outputs/llm_n_real_smoke
 ```
 
+真实 Cora-node 断点恢复 smoke 从一开始设置 `max_steps=4`，使用 32 个训练样本，在原子完成
+`checkpoint-2` 后中断，随后恢复到 step 4，并用最终 adapter 完成 20 个 test sample 推理：
+
+```bash
+python scripts/smoke_test_llm_n_resume.py \
+  --output-dir outputs/llm_n_cora_resume_smoke
+```
+
+只检查当前环境是否具备 CUDA、TAGLAS、Transformers 和 PEFT：
+
+```bash
+python scripts/smoke_test_llm_n_resume.py --check-environment
+```
+
+无需 Mistral/TAGLAS 的恢复单元测试使用 tiny causal LM 和 synthetic dataset：
+
+```bash
+pytest -q tests/test_llm_n_resume.py
+```
+
 显存不足时，功能 smoke 可显式加 `--load-in-4bit`；量化 smoke 结果不能作为默认 BF16
 公平对比结果。
 
 ## 输出格式
 
-每次运行在 `output_dir/<UTC run id>/` 下保存 resolved config。推理目录为：
+新运行在 `output_dir/<run_name 或 UTC run id>/` 下保存 resolved config；恢复运行始终复用 checkpoint
+所属 run。推理目录为：
 
 ```text
 <run>/
@@ -137,7 +221,24 @@ python scripts/smoke_test_llm_n.py \
 ```
 
 训练另外保存 `training_metrics.json`、最终 `adapter/` 和按配置保留的
-`trainer/checkpoint-<step>/`。显式截断会逐样本写入 `training_context_events.jsonl`；默认
+`trainer/checkpoint-<step>/`。checkpoint 的结构为：
+
+```text
+<run>/trainer/checkpoint-<step>/
+  adapter_config.json
+  adapter_model.safetensors       # 或 PEFT 所选的 adapter 权重格式
+  tokenizer_config.json / tokenizer files
+  training_state.pt               # optimizer/scheduler/scaler、cursor、累计量和 RNG
+  training_config.json            # resolved config、关键配置和 SHA-256 fingerprint
+  _SUCCESS                        # 仅完整 checkpoint 才存在
+```
+
+保存时先完整写入同级 `checkpoint-<step>.tmp/`，最后以 rename 提交为
+`checkpoint-<step>/`；`latest` 只识别具有 `_SUCCESS`、state 和 config 的标准目录，忽略 `.tmp` 和
+不完整目录。checkpoint 只会在 optimizer、scheduler step 和 `zero_grad` 完成后的 accumulation
+边界生成。
+
+显式截断会逐样本写入 `training_context_events.jsonl`；默认
 `truncate_mode=none` 遇到超长训练样本时会先写入该文件和 `training_failure.json`，再终止训练。
 
 `predictions.jsonl` 每行包含：
@@ -361,7 +462,7 @@ Answer:
   `environment.yml`。不要在未验证的版本组合间比较结果。
 - 当前 runner 的性能统计按单样本 greedy decode 实现；尚未提供 batched latency benchmark 或
   sampling/beam search。
-- LoRA SFT 使用单进程 PyTorch loop；目前不支持从中间 optimizer checkpoint 恢复，也未提供
-  FSDP/DeepSpeed。完成后的 PEFT adapter 可以正常加载推理。
+- LoRA SFT 使用可确定性恢复的单进程 PyTorch loop；目前未提供分布式 sampler、FSDP 或
+  DeepSpeed checkpoint 恢复。
 - 公平 latency benchmark 应让模型完整放在一张 GPU 上。`device_map=auto` 可用于功能推理，但若
   它把模型真正切到多张 GPU，当前以输入设备 CUDA Event 记录的 latency 不应作为跨模型公平数据。

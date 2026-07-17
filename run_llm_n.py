@@ -40,6 +40,10 @@ def main() -> None:
     parser.add_argument("--mode", choices=["llm_n_zero_shot", "llm_n_sft"])
     parser.add_argument("--run-mode", choices=["train", "inference"])
     parser.add_argument("--adapter-path")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        help="Complete checkpoint directory or 'latest' for resumable LoRA SFT",
+    )
     parser.add_argument("--output-dir")
     parser.add_argument("opts", nargs=argparse.REMAINDER, help="Additional KEY VALUE overrides")
     args = parser.parse_args()
@@ -51,6 +55,8 @@ def main() -> None:
         config["run_mode"] = args.run_mode
     if args.adapter_path:
         config["adapter_path"] = args.adapter_path
+    if args.resume_from_checkpoint:
+        config["resume_from_checkpoint"] = args.resume_from_checkpoint
     if args.output_dir:
         config["output_dir"] = args.output_dir
     if args.tasks:
