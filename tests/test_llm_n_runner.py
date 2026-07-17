@@ -487,7 +487,8 @@ def test_isolated_sft_loop_updates_parameters_and_saves_adapter(
     assert metrics["train_metrics"]["global_steps"] == 2
     assert metrics["train_metrics"]["train_samples_seen"] == 3
     assert metrics["train_metrics"]["truncation_count"] == 0
-    assert not torch.equal(model.lora_weight.detach(), initial_weight)
+    updated_weight = model.lora_weight.detach().to(initial_weight.device)
+    assert not torch.equal(updated_weight, initial_weight)
     assert (adapter_dir / "adapter_model.bin").is_file()
     assert (adapter_dir / "tokenizer_config.json").is_file()
     assert [path.name for path in (run_root / "trainer").glob("checkpoint-*")] == [
