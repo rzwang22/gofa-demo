@@ -121,6 +121,7 @@ class GOFAMistralModel(MistralModel):
         self.quant_kv_attention_stats = self._new_quant_kv_attention_stats()
         self.quant_kv_attention_warned_fallback = False
         self.query_trace_shape_capture = None
+        self.per_query_latency_capture = None
         self.reset_stage_profile()
 
         # self.g_layers = nn.ModuleList([GOFAGatedDecoderLayer(gofa_config, layer_idx=i) for i in range(gofa_config.num_layers)])
@@ -202,6 +203,48 @@ class GOFAMistralModel(MistralModel):
     def _stage_profile_increment(self, key):
         if self._stage_profile_enabled():
             self.stage_profile[key] += 1
+
+    def begin_per_query_latency_capture(self, export_gpu_time=True):
+        if self.per_query_latency_capture is not None:
+            raise RuntimeError("GOFA suffix per-query latency capture is already active.")
+        self.per_query_latency_capture = {
+            "export_gpu_time": bool(export_gpu_time),
+            "gnn": [],
+            "transformer": [],
+        }
+
+    def _per_query_latency_event_start(self, ref_tensor):
+        capture = self.per_query_latency_capture
+        if (
+            capture is None
+            or not capture["export_gpu_time"]
+            or ref_tensor is None
+            or ref_tensor.device.type != "cuda"
+        ):
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(torch.cuda.current_stream(ref_tensor.device))
+        return event
+
+    def _per_query_latency_event_end(self, category, start_event, ref_tensor):
+        if start_event is None or self.per_query_latency_capture is None:
+            return
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record(torch.cuda.current_stream(ref_tensor.device))
+        self.per_query_latency_capture[category].append((start_event, end_event))
+
+    def end_per_query_latency_capture(self):
+        capture = self.per_query_latency_capture
+        self.per_query_latency_capture = None
+        if capture is None:
+            return {"gnn": [], "transformer": []}
+        return {
+            "gnn": list(capture["gnn"]),
+            "transformer": list(capture["transformer"]),
+        }
+
+    def abort_per_query_latency_capture(self):
+        self.per_query_latency_capture = None
 
     def begin_query_trace_shape_capture(self):
         self.query_trace_shape_capture = {
@@ -1138,6 +1181,7 @@ class GOFAMistralModel(MistralModel):
             g_layer_idx = i - self.gnn_start_layer
             if graph is not None:
                 gnn_start = self._stage_profile_start(memory_states)
+                gnn_latency_event = self._per_query_latency_event_start(memory_states)
                 gnn_input = memory_states[:cur_node_size]
                 gnn_edge_input = memory_states[cur_node_size:][graph.edge_map]
                 output = self.g_layers[g_layer_idx](gnn_input, graph.edge_index, gnn_edge_input)
@@ -1145,8 +1189,10 @@ class GOFAMistralModel(MistralModel):
                 memory_states = torch.cat([output, memory_states[cur_node_size:]], dim=0)
                 memory_states = memory_states.to(self.gofa_config.llama_dtype)
                 self._stage_profile_add("encoder_gnn_layer_s", gnn_start, memory_states, g_layer_idx)
+                self._per_query_latency_event_end("gnn", gnn_latency_event, memory_states)
 
             llm_start = self._stage_profile_start(memory_states)
+            transformer_latency_event = self._per_query_latency_event_start(memory_states)
             next_memory_states = []
             for item_idx, item in enumerate(mapped_items):
                 text_len = item["text_len"]
@@ -1225,6 +1271,7 @@ class GOFAMistralModel(MistralModel):
                 next_memory_states.append(layer_outputs[0])
             memory_states = torch.cat(next_memory_states, dim=0)
             self._stage_profile_add("encoder_suffix_transformer_layer_s", llm_start, memory_states, g_layer_idx)
+            self._per_query_latency_event_end("transformer", transformer_latency_event, memory_states)
 
         norm_start = self._stage_profile_start(memory_states)
         memory_states = self.norm(memory_states)

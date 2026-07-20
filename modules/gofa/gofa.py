@@ -49,6 +49,7 @@ from modules.gofa.int_gemm_quant import (
     maybe_create_suffix_transformer_int_gemm_quantizer,
 )
 from modules.gofa.query_trace import GOFAQueryTraceExporter
+from modules.gofa.per_query_latency import GOFAPerQueryLatencyExporter
 
 ###################################################################
 #                 Configurations                                  #
@@ -115,6 +116,16 @@ class ModelArguments:
     gofa_query_trace_include_text_preview: Optional[bool] = field(default=None)
     gofa_query_trace_rank_zero_only: Optional[bool] = field(default=None)
     gofa_query_trace_strict: Optional[bool] = field(default=None)
+    gofa_per_query_latency: Optional[Dict[str, Any]] = field(default_factory=dict)
+    gofa_per_query_latency_enabled: Optional[bool] = field(default=None)
+    gofa_per_query_latency_output_csv: Optional[str] = field(default=None)
+    gofa_per_query_latency_trace_index_path: Optional[str] = field(default=None)
+    gofa_per_query_latency_strict_trace_match: Optional[bool] = field(default=None)
+    gofa_per_query_latency_cuda_sync: Optional[bool] = field(default=None)
+    gofa_per_query_latency_export_wall_time: Optional[bool] = field(default=None)
+    gofa_per_query_latency_export_gpu_time: Optional[bool] = field(default=None)
+    gofa_per_query_latency_append: Optional[bool] = field(default=None)
+    gofa_per_query_latency_rank_zero_only: Optional[bool] = field(default=None)
     encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
     encoder_cache_verify_tolerance: float = field(default=1e-3, metadata={"help": "Strict max-absolute tolerance for exact verification reporting"})
     encoder_cache_verify_mean_tolerance: float = field(default=3e-2)
@@ -349,6 +360,11 @@ class GOFAMistral(torch.nn.Module):
             bool(self.gofa_query_trace["enabled"]) and self._gofa_query_trace_rank_allowed()
         )
         self.gofa_query_trace_exporter = None
+        self.gofa_per_query_latency = self._normalize_gofa_per_query_latency_config(model_args)
+        self.gofa_per_query_latency_enabled = (
+            bool(self.gofa_per_query_latency["enabled"]) and self._gofa_per_query_latency_rank_allowed()
+        )
+        self.gofa_per_query_latency_exporter = None
         self.scheme_b_ablation = self._normalize_scheme_b_ablation_config(model_args)
         self.scheme_b_ablation_enabled = bool(self.scheme_b_ablation["enabled"])
         self.scheme_b_ablation_calls = 0
@@ -689,6 +705,24 @@ class GOFAMistral(torch.nn.Module):
                 f"strict={self.gofa_query_trace['strict']}, "
                 "batch_size=1, cache_precision=M4K2V2"
             )
+        if self.gofa_per_query_latency_enabled:
+            self.gofa_per_query_latency_exporter = GOFAPerQueryLatencyExporter(
+                self,
+                self.gofa_per_query_latency,
+                enabled=True,
+            )
+            self.gofa_per_query_latency_exporter.validate_setup()
+            print(
+                "GOFA canonical H100 per-query latency exporter enabled: "
+                f"output_csv={self.gofa_per_query_latency['output_csv']}, "
+                f"trace_index_path={self.gofa_per_query_latency['trace_index_path']}, "
+                f"strict_trace_match={self.gofa_per_query_latency['strict_trace_match']}, "
+                f"cuda_sync={self.gofa_per_query_latency['cuda_sync']}, "
+                f"export_wall_time={self.gofa_per_query_latency['export_wall_time']}, "
+                f"export_gpu_time={self.gofa_per_query_latency['export_gpu_time']}, "
+                f"append={self.gofa_per_query_latency['append']}, "
+                f"rank_zero_only={self.gofa_per_query_latency['rank_zero_only']}"
+            )
         if self.gofa_trace_source_audit_enabled and not self.gofa_trace_source_audit_metadata_written:
             os.makedirs(self.gofa_trace_source_audit["output_dir"], exist_ok=True)
             self._write_trace_source_audit_metadata()
@@ -1026,6 +1060,54 @@ class GOFAMistral(torch.nn.Module):
         cfg["strict"] = bool(cfg["strict"])
         if cfg["enabled"] and not cfg["output_dir"]:
             raise ValueError("gofa_query_trace.output_dir must be set when query trace export is enabled.")
+        return cfg
+
+    def _normalize_gofa_per_query_latency_config(self, model_args):
+        cfg = {
+            "enabled": False,
+            "output_csv": "",
+            "trace_index_path": "",
+            "strict_trace_match": True,
+            "cuda_sync": True,
+            "export_wall_time": True,
+            "export_gpu_time": True,
+            "append": False,
+            "rank_zero_only": True,
+        }
+        nested = getattr(model_args, "gofa_per_query_latency", None)
+        if isinstance(nested, dict):
+            cfg.update({key: value for key, value in nested.items() if key in cfg})
+        direct_fields = {
+            "enabled": "gofa_per_query_latency_enabled",
+            "output_csv": "gofa_per_query_latency_output_csv",
+            "trace_index_path": "gofa_per_query_latency_trace_index_path",
+            "strict_trace_match": "gofa_per_query_latency_strict_trace_match",
+            "cuda_sync": "gofa_per_query_latency_cuda_sync",
+            "export_wall_time": "gofa_per_query_latency_export_wall_time",
+            "export_gpu_time": "gofa_per_query_latency_export_gpu_time",
+            "append": "gofa_per_query_latency_append",
+            "rank_zero_only": "gofa_per_query_latency_rank_zero_only",
+        }
+        for cfg_key, field_name in direct_fields.items():
+            value = getattr(model_args, field_name, None)
+            if value is not None:
+                cfg[cfg_key] = value
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["output_csv"] = str(cfg["output_csv"] or "")
+        cfg["trace_index_path"] = str(cfg["trace_index_path"] or "")
+        for key in (
+            "strict_trace_match",
+            "cuda_sync",
+            "export_wall_time",
+            "export_gpu_time",
+            "append",
+            "rank_zero_only",
+        ):
+            cfg[key] = bool(cfg[key])
+        if cfg["enabled"] and not cfg["output_csv"]:
+            raise ValueError("gofa_per_query_latency.output_csv must be set when enabled.")
+        if cfg["enabled"] and not cfg["trace_index_path"]:
+            raise ValueError("gofa_per_query_latency.trace_index_path must be set when enabled.")
         return cfg
 
     def _normalize_scheme_b_weight_quant_config(self, model_args):
@@ -1777,6 +1859,15 @@ class GOFAMistral(torch.nn.Module):
                 return False
         return True
 
+    def _gofa_per_query_latency_rank_allowed(self):
+        if not self.gofa_per_query_latency.get("rank_zero_only", True):
+            return True
+        for env_name in ("RANK", "LOCAL_RANK", "SLURM_PROCID"):
+            value = os.environ.get(env_name)
+            if value not in (None, "", "0"):
+                return False
+        return True
+
     def set_gofa_query_trace_context(
         self,
         task_name=None,
@@ -1790,6 +1881,21 @@ class GOFAMistral(torch.nn.Module):
                 dataset_name=dataset_name,
                 split=split,
                 runtime_query_index=runtime_query_index,
+            )
+
+    def set_gofa_per_query_latency_context(
+        self,
+        task_name=None,
+        split=None,
+        runtime_query_index=None,
+        is_warmup=False,
+    ):
+        if self.gofa_per_query_latency_exporter is not None:
+            self.gofa_per_query_latency_exporter.set_context(
+                task=task_name,
+                split=split,
+                query_index=runtime_query_index,
+                is_warmup=is_warmup,
             )
 
     def _trace_source_audit_active(self):
@@ -3963,8 +4069,14 @@ class GOFAMistral(torch.nn.Module):
                 self.gofa_trace_source_audit.get("dump_cache_miss_snapshot", True)
             )
         )
+        per_query_latency_active = (
+            self.gofa_per_query_latency_exporter is not None
+            and self.gofa_per_query_latency_exporter.active()
+        )
         all_cache_keys = (
-            [self._encoder_cache_key(ids) for ids in token_ids] if diagnostic_requested else None
+            [self._encoder_cache_key(ids) for ids in token_ids]
+            if diagnostic_requested or per_query_latency_active
+            else None
         )
         self._maybe_dump_pre_cache_audit_snapshot(
             snapshot_kind="pre_cache",
@@ -4540,6 +4652,15 @@ class GOFAMistral(torch.nn.Module):
         self._maybe_log_scheme_b_quant_kv_attention_stats()
         self._maybe_log_scheme_b_activation_quant_stats()
         self._maybe_dump_encoder_cache_manifest(current_batch_seen=manifest_batch_seen)
+        if per_query_latency_active:
+            self.gofa_per_query_latency_exporter.record_cache_snapshot(
+                timing=current_timing,
+                cache_hits=current_hits,
+                cache_misses=current_misses,
+                cache_skips=current_skips,
+                cache_keys=all_cache_keys,
+                cache_fallback_count=current_quant_stats["fallback_to_full_cache_count"],
+            )
 
         return final_hidden_states
 
@@ -4547,46 +4668,84 @@ class GOFAMistral(torch.nn.Module):
         """
         Encode the graph and generate logits for answer tokens.
         """
-        g.num_node_feat = g.x.shape[0]
-        if hasattr(g, "edge_attr") and g.edge_attr is not None:
-            text_inputs = np.concatenate([g.x, g.edge_attr], axis=0)
-        else:
-            text_inputs = g.x
-        text_inputs = text_inputs.tolist()
-        llm_output = self.encode(text_inputs, graph=g, partial_grad=True)
-        emb = llm_output[:g.node_map.size(-1)]
-        if not hasattr(g, "answer"):
-            raise ValueError("Forward stage graph should contain answer.")
-        answer_texts = g.answer[g.answer_map.cpu().numpy()].tolist()
-        prompt_texts = g.question[g.question_map.cpu().numpy()].tolist()
-        # Legacy hard coding TODO: remove when TAGLAS is fixed.
-        prompt_input_texts = ["" if (p.startswith("Please complete the sentence of the node") or p == "") else p for p
-                              in prompt_texts]
-        emb = emb[g.question_index]
-        answer_logits, answer_id, masks = self.decode(answer_texts, emb, prompt=prompt_input_texts)
-        return answer_logits, answer_id, masks, answer_texts
+        latency_exporter = self.gofa_per_query_latency_exporter
+        latency_active = False
+        if latency_exporter is not None:
+            latency_active = latency_exporter.begin_query(
+                g,
+                self.model.memory_token_embed.weight.device,
+            )
+        try:
+            g.num_node_feat = g.x.shape[0]
+            if hasattr(g, "edge_attr") and g.edge_attr is not None:
+                text_inputs = np.concatenate([g.x, g.edge_attr], axis=0)
+            else:
+                text_inputs = g.x
+            text_inputs = text_inputs.tolist()
+            llm_output = self.encode(text_inputs, graph=g, partial_grad=True)
+            emb = llm_output[:g.node_map.size(-1)]
+            if not hasattr(g, "answer"):
+                raise ValueError("Forward stage graph should contain answer.")
+            answer_texts = g.answer[g.answer_map.cpu().numpy()].tolist()
+            prompt_texts = g.question[g.question_map.cpu().numpy()].tolist()
+            # Legacy hard coding TODO: remove when TAGLAS is fixed.
+            prompt_input_texts = [
+                "" if (p.startswith("Please complete the sentence of the node") or p == "") else p
+                for p in prompt_texts
+            ]
+            emb = emb[g.question_index]
+            answer_logits, answer_id, masks = self.decode(answer_texts, emb, prompt=prompt_input_texts)
+            result = (answer_logits, answer_id, masks, answer_texts)
+            if latency_active:
+                latency_exporter.finish_query()
+            return result
+        except Exception:
+            if latency_active:
+                latency_exporter.abort_query()
+            raise
 
     def generate(self, g, max_length=128):
         """
         Autoregressively generate tokens.
         """
-        g.num_node_feat = g.x.shape[0]
-        if hasattr(g, "edge_attr") and g.edge_attr is not None:
-            text_inputs = np.concatenate([g.x, g.edge_attr], axis=0)
-        else:
-            text_inputs = g.x
-        text_inputs = text_inputs.tolist()
-        llm_output = self.encode(text_inputs, graph=g, partial_grad=True)
-        emb = llm_output[:g.node_map.size(-1)]
-        prompt_texts = g.question[g.question_map.cpu().numpy()].tolist()
-        prompt_input_texts = ["" if (p.startswith("Please complete the sentence of the node") or p == "") else p for p
-                              in prompt_texts]
-        emb = emb[g.question_index]
-        generated_text = self.infer(emb, prompt=prompt_input_texts, max_length=max_length)
-        return generated_text
+        latency_exporter = self.gofa_per_query_latency_exporter
+        latency_active = False
+        if latency_exporter is not None:
+            latency_active = latency_exporter.begin_query(
+                g,
+                self.model.memory_token_embed.weight.device,
+            )
+        try:
+            g.num_node_feat = g.x.shape[0]
+            if hasattr(g, "edge_attr") and g.edge_attr is not None:
+                text_inputs = np.concatenate([g.x, g.edge_attr], axis=0)
+            else:
+                text_inputs = g.x
+            text_inputs = text_inputs.tolist()
+            llm_output = self.encode(text_inputs, graph=g, partial_grad=True)
+            emb = llm_output[:g.node_map.size(-1)]
+            prompt_texts = g.question[g.question_map.cpu().numpy()].tolist()
+            prompt_input_texts = [
+                "" if (p.startswith("Please complete the sentence of the node") or p == "") else p
+                for p in prompt_texts
+            ]
+            emb = emb[g.question_index]
+            generated_text = self.infer(emb, prompt=prompt_input_texts, max_length=max_length)
+            if latency_active:
+                latency_exporter.finish_query()
+            return generated_text
+        except Exception:
+            if latency_active:
+                latency_exporter.abort_query()
+            raise
 
     def encode(self, data, graph=None, partial_grad=None):
         cur_device = self.model.memory_token_embed.weight.device
+        per_query_encoder_start = (
+            self.gofa_per_query_latency_exporter.stage_start(cur_device)
+            if self.gofa_per_query_latency_exporter is not None
+            else None
+        )
         if self.gofa_query_trace_exporter is not None:
             self.gofa_query_trace_exporter.validate_graph(graph)
         batch_size = len(data)
@@ -4664,9 +4823,20 @@ class GOFAMistral(torch.nn.Module):
             memory_embedding = node_emb[map_mem_mask].view(len(node_emb), self.mem_size, -1)
         else:
             memory_embedding = compress_outputs[mem_mask].view(batch_size, self.mem_size, -1)
+        if self.gofa_per_query_latency_exporter is not None:
+            self.gofa_per_query_latency_exporter.stage_end(
+                "encoder",
+                per_query_encoder_start,
+                cur_device,
+            )
         return memory_embedding
 
     def decode(self, data, mem_embs, graph=None, prompt=None):
+        per_query_decoder_start = (
+            self.gofa_per_query_latency_exporter.stage_start(mem_embs.device)
+            if self.gofa_per_query_latency_exporter is not None
+            else None
+        )
         prompt_output = self.model.tokenizer(data, add_special_tokens=False, padding=False, truncation=False)["input_ids"]
         prompt_output = [p + [self.model.tokenizer.eos_token_id] if len(p) < self.model.training_args.model_max_length else p[:self.model.training_args.model_max_length] for p in prompt_output]
         original_prompt_output = prompt_output
@@ -4715,11 +4885,22 @@ class GOFAMistral(torch.nn.Module):
         output_emb = self.model.icae(inputs_embeds=prompt_answer_embs).logits
         self._stage_timer_add_decoder(decoder_start, mem_embs.device)
         self._maybe_log_stage_profile()
+        if self.gofa_per_query_latency_exporter is not None:
+            self.gofa_per_query_latency_exporter.stage_end(
+                "decoder",
+                per_query_decoder_start,
+                mem_embs.device,
+            )
 
         return output_emb, answer_prompt, target_mask
 
     def infer(self, mem_embs, graph=None, prompt=None, max_length=128):
         cur_device = self.model.memory_token_embed.weight.device
+        per_query_decoder_start = (
+            self.gofa_per_query_latency_exporter.stage_start(cur_device)
+            if self.gofa_per_query_latency_exporter is not None
+            else None
+        )
 
         if prompt is None:
             prompt = [""] * len(mem_embs)
@@ -4795,5 +4976,12 @@ class GOFAMistral(torch.nn.Module):
         generate_text[generate_text >= 32000] = 1
 
         generated_text = self.model.tokenizer.batch_decode(generate_text)
+
+        if self.gofa_per_query_latency_exporter is not None:
+            self.gofa_per_query_latency_exporter.stage_end(
+                "decoder",
+                per_query_decoder_start,
+                cur_device,
+            )
 
         return generated_text

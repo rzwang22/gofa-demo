@@ -59,6 +59,48 @@ def _resolve_train_sampling_config(params):
     return resolved
 
 
+def _gofa_per_query_latency_enabled(params):
+    nested = getattr(params, "gofa_per_query_latency", None)
+    enabled = nested.get("enabled", False) if isinstance(nested, dict) else False
+    flat = getattr(params, "gofa_per_query_latency_enabled", None)
+    return bool(enabled if flat is None else flat)
+
+
+def _validate_canonical_h100_latency_run(params):
+    if not _gofa_per_query_latency_enabled(params):
+        return
+    errors = []
+    if getattr(params, "run_mode", None) != "inf":
+        errors.append("run_mode must be inf")
+    if int(getattr(params, "seed", -1)) != 1:
+        errors.append("seed must be 1")
+    if int(getattr(params, "batch_size", -1)) != 1:
+        errors.append("batch_size must be 1")
+    if bool(getattr(params, "skip_validation", False)):
+        errors.append("skip_validation must be False so validation runs before test")
+    if int(getattr(params, "eval_sample_size", -1)) != 100:
+        errors.append("eval_sample_size must be 100")
+
+    canonical_tasks = {"cora_node", "cora_link", "pubmed_node", "wikics", "arxiv"}
+    tasks = list(getattr(params, "eval_task_names", []) or [])
+    if not tasks:
+        errors.append("eval_task_names must contain at least one canonical task")
+    unexpected_tasks = sorted(set(tasks) - canonical_tasks)
+    if unexpected_tasks:
+        errors.append(f"unsupported canonical task(s): {unexpected_tasks}")
+
+    for field_name, expected in (
+        ("inf_sample_size_per_task", 100),
+        ("inf_hops", 3),
+        ("inf_max_nodes_per_hops", 10),
+    ):
+        values = list(getattr(params, field_name, []) or [])
+        if len(values) != len(tasks) or any(int(value) != expected for value in values):
+            errors.append(f"{field_name} must contain {expected} once per eval task")
+    if errors:
+        raise ValueError("Invalid canonical H100 per-query latency run: " + "; ".join(errors) + ".")
+
+
 def main(params):
     ##################################################################
     #                    Configuration                               #
@@ -72,6 +114,7 @@ def main(params):
         raise NotImplementedError(params.base_llm + " is not supported. Please choose from: mistral7b,")
     if params.mode == "generate":
         params.last_save = False
+    _validate_canonical_h100_latency_run(params)
 
     wandb_logger = WandbLogger(project=params.log_project, name=f"{params.exp_name}_{params.base_llm}",
                                save_dir=params.exp_dir, offline=params.offline_log, )
@@ -135,6 +178,21 @@ def main(params):
         "gofa_query_trace_include_text_preview",
         "gofa_query_trace_rank_zero_only",
         "gofa_query_trace_strict",
+    ):
+        if hasattr(params, field_name):
+            setattr(model_args, field_name, getattr(params, field_name))
+    if hasattr(params, "gofa_per_query_latency"):
+        model_args.gofa_per_query_latency = params.gofa_per_query_latency
+    for field_name in (
+        "gofa_per_query_latency_enabled",
+        "gofa_per_query_latency_output_csv",
+        "gofa_per_query_latency_trace_index_path",
+        "gofa_per_query_latency_strict_trace_match",
+        "gofa_per_query_latency_cuda_sync",
+        "gofa_per_query_latency_export_wall_time",
+        "gofa_per_query_latency_export_gpu_time",
+        "gofa_per_query_latency_append",
+        "gofa_per_query_latency_rank_zero_only",
     ):
         if hasattr(params, field_name):
             setattr(model_args, field_name, getattr(params, field_name))

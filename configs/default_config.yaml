@@ -53,6 +53,16 @@ gofa_query_trace:
   include_text_preview: True
   rank_zero_only: True
   strict: True
+gofa_per_query_latency:
+  enabled: False
+  output_csv: ""
+  trace_index_path: ""
+  strict_trace_match: True
+  cuda_sync: True
+  export_wall_time: True
+  export_gpu_time: True
+  append: False
+  rank_zero_only: True
 encoder_cache_verify: False  # when using memory_kv, compare final memory slots against the full encoder path
 encoder_cache_verify_tolerance: 0.001  # strict max-absolute threshold; reported as exact_passed
 encoder_cache_verify_mean_tolerance: 0.03  # practical verification threshold for mean absolute drift
