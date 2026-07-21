@@ -2,6 +2,25 @@
 
 The exporter is read-only with respect to formal query traces and Scheme-B caches. It records one CSV row after each successful batch-size-1 query and leaves the existing aggregate profiler counters unchanged.
 
+Set `gofa_per_query_latency.export_detail_gpu_time: False` to disable all fine-grained Event creation while retaining the original per-query exporter fields and behavior. Detailed CSV columns remain present and are written as zero in that mode.
+
+## Detailed GPU boundaries
+
+All detailed times use `torch.cuda.Event`. Region code records start/end events only; elapsed times are evaluated after the existing end-of-query CUDA synchronization.
+
+| CSV field | Start boundary | End boundary |
+| --- | --- | --- |
+| `quant_kv_attention_gpu_ms` | Entry to each successful quantized-KV attention call, before cached K/V payload materialization | After cached/current PV outputs are combined, before returning from that attention call |
+| `kv_prepare_gpu_ms` | Cached K/V unpack/scale materialization, per-head Q-scale folding and INT-QK input preparation, or INT-PV P/V padding | Immediately before the corresponding attention arithmetic region |
+| `int_qk_gpu_ms` | Immediately before the cached QK `torch._int_mm` | Immediately after that `torch._int_mm`, before slicing or logits dequantization |
+| `softmax_prob_quant_gpu_ms` | Before attention softmax, and separately before each per-query P-to-INT8 quantization | After dropout for softmax, or after the INT8 probability tensor is produced |
+| `int_pv_gpu_ms` | Immediately before the cached PV `torch._int_mm` | Immediately after that `torch._int_mm`, before slicing or output dequantization |
+| `gnn_score_gpu_ms` | Before GNN node/edge normalization and QKV/edge projections | After edge attention scores are normalized and dropout is applied |
+| `gnn_message_gpu_ms` | After normalized scores are available, before weighted message construction | After PyG neighborhood aggregation/scatter returns from `propagate` |
+| `gnn_update_gpu_ms` | Before the aggregated-message output projection | After attention residual/gating, post-GNN normalization, FFN, and FFN residual/gating |
+
+`gnn_other_gpu_ms` is `max(0, suffix_gnn_gpu_ms - gnn_score_gpu_ms - gnn_message_gpu_ms - gnn_update_gpu_ms)`. It contains outer suffix-GNN work such as slicing, concatenation, dtype conversion, and Event granularity remainder.
+
 ## Generate an override
 
 Source the helper and pass task-specific cache paths explicitly:

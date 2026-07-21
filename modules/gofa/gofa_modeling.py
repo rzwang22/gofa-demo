@@ -26,6 +26,7 @@ from transformers.modeling_outputs import (
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from .cache_quant import dequantize_tensor, quantized_tensor_int, quantized_tensor_scale
+from .latency_event_accumulator import LatencyEventAccumulator
 
 logger = logging.get_logger(__name__)
 
@@ -122,6 +123,7 @@ class GOFAMistralModel(MistralModel):
         self.quant_kv_attention_warned_fallback = False
         self.query_trace_shape_capture = None
         self.per_query_latency_capture = None
+        self.per_query_detail_events = LatencyEventAccumulator()
         self.reset_stage_profile()
 
         # self.g_layers = nn.ModuleList([GOFAGatedDecoderLayer(gofa_config, layer_idx=i) for i in range(gofa_config.num_layers)])
@@ -204,14 +206,18 @@ class GOFAMistralModel(MistralModel):
         if self._stage_profile_enabled():
             self.stage_profile[key] += 1
 
-    def begin_per_query_latency_capture(self, export_gpu_time=True):
+    def begin_per_query_latency_capture(self, export_gpu_time=True, export_detail_gpu_time=True):
         if self.per_query_latency_capture is not None:
             raise RuntimeError("GOFA suffix per-query latency capture is already active.")
+        export_gpu_time = bool(export_gpu_time)
+        export_detail_gpu_time = bool(export_detail_gpu_time) and export_gpu_time
         self.per_query_latency_capture = {
-            "export_gpu_time": bool(export_gpu_time),
+            "export_gpu_time": export_gpu_time,
+            "export_detail_gpu_time": export_detail_gpu_time,
             "gnn": [],
             "transformer": [],
         }
+        self.per_query_detail_events.begin(enabled=export_detail_gpu_time)
 
     def _per_query_latency_event_start(self, ref_tensor):
         capture = self.per_query_latency_capture
@@ -233,17 +239,43 @@ class GOFAMistralModel(MistralModel):
         end_event.record(torch.cuda.current_stream(ref_tensor.device))
         self.per_query_latency_capture[category].append((start_event, end_event))
 
+    def _per_query_detail_event_enabled(self):
+        capture = self.per_query_latency_capture
+        return bool(capture is not None and capture.get("export_detail_gpu_time", False))
+
+    def _per_query_detail_event_start(self, category, ref_tensor):
+        if (
+            not self._per_query_detail_event_enabled()
+            or ref_tensor is None
+            or ref_tensor.device.type != "cuda"
+        ):
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(torch.cuda.current_stream(ref_tensor.device))
+        return self.per_query_detail_events.start(category, event)
+
+    def _per_query_detail_event_end(self, token, ref_tensor):
+        if token is None:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(torch.cuda.current_stream(ref_tensor.device))
+        self.per_query_detail_events.end(token, event)
+
     def end_per_query_latency_capture(self):
         capture = self.per_query_latency_capture
-        self.per_query_latency_capture = None
         if capture is None:
             return {"gnn": [], "transformer": []}
-        return {
+        detail_events = self.per_query_detail_events.finish()
+        self.per_query_latency_capture = None
+        result = {
             "gnn": list(capture["gnn"]),
             "transformer": list(capture["transformer"]),
         }
+        result.update(detail_events)
+        return result
 
     def abort_per_query_latency_capture(self):
+        self.per_query_detail_events.abort()
         self.per_query_latency_capture = None
 
     def begin_query_trace_shape_capture(self):
@@ -437,10 +469,12 @@ class GOFAMistralModel(MistralModel):
         qmax = int(cfg.get("prob_quant_qmax", 127))
         if qmax <= 0 or qmax > 127:
             raise RuntimeError("quantized-KV int_pv requires 1 <= prob_quant_qmax <= 127.")
+        detail_event = self._per_query_detail_event_start("softmax_prob_quant", probs)
         quant_start = time.perf_counter()
         probs_f = probs.float()
         scale_p = (probs_f.amax(dim=-1, keepdim=True) / float(qmax)).clamp(min=1e-12)
         probs_q = torch.round(probs_f / scale_p).clamp(0, qmax).to(torch.int8).contiguous()
+        self._per_query_detail_event_end(detail_event, probs_q)
         self._quant_kv_record_prob_quant_stats(probs_q, scale_p, qmax, time.perf_counter() - quant_start)
         return probs_q, scale_p
 
@@ -508,15 +542,19 @@ class GOFAMistralModel(MistralModel):
                 for head_idx in range(num_heads):
                     kv_head_idx = head_idx // num_key_value_groups
                     probs_q, scale_p = self._quant_kv_quantize_probs_int8(cached_probs[batch_idx, head_idx], cfg)
+                    prepare_event = self._per_query_detail_event_start("kv_prepare", probs_q)
                     probs_q_padded, original_m, original_k = _pad_int8_2d_to_multiple(probs_q)
                     v_q_padded, v_original_k, original_n = _pad_int8_2d_to_multiple(v_int[kv_head_idx].contiguous())
+                    self._per_query_detail_event_end(prepare_event, v_q_padded)
                     if original_k != v_original_k:
                         raise RuntimeError(
                             "quantized-KV int_pv K dimension mismatch after padding: "
                             f"P={original_k}, V={v_original_k}."
                         )
+                    int_pv_event = self._per_query_detail_event_start("int_pv", probs_q_padded)
                     pv_start = time.perf_counter()
                     out_int = torch._int_mm(probs_q_padded, v_q_padded)
+                    self._per_query_detail_event_end(int_pv_event, out_int)
                     out_int = out_int[:original_m, :original_n].contiguous()
                     self._quant_kv_stat_add("pv_int_mm_time_s", time.perf_counter() - pv_start)
 
@@ -646,11 +684,13 @@ class GOFAMistralModel(MistralModel):
             stats["quant_kv_attention_call_count"] += 1
             device = query_states.device
             dtype = query_states.dtype
+            quant_attention_event = self._per_query_detail_event_start("quant_kv_attention", query_states)
             bsz, num_heads, q_len, _ = query_states.shape
             _, num_kv_heads, current_len, _ = key_states.shape
             key_bits = int(cfg.get("key_bits", 4))
             value_bits = int(cfg.get("value_bits", 4))
 
+            kv_prepare_event = self._per_query_detail_event_start("kv_prepare", query_states)
             k_unpack_start = time.perf_counter()
             k_int, scale_k = self._quant_kv_payload_to_q_scale(text_kv.key_quant_payload, key_bits, device, "key")
             self._quant_kv_stat_add("k_unpack_time_s", time.perf_counter() - k_unpack_start)
@@ -674,6 +714,7 @@ class GOFAMistralModel(MistralModel):
 
             current_key_states = repeat_kv(key_states, num_key_value_groups)
             current_value_states = repeat_kv(value_states, num_key_value_groups)
+            self._per_query_detail_event_end(kv_prepare_event, current_value_states)
             current_logits = torch.matmul(
                 query_states.float(),
                 current_key_states.float().transpose(2, 3),
@@ -686,6 +727,7 @@ class GOFAMistralModel(MistralModel):
                         kv_head_idx = head_idx // num_key_value_groups
                         q_fp = query_states[batch_idx, head_idx].float()
 
+                        qk_prepare_event = self._per_query_detail_event_start("kv_prepare", q_fp)
                         fold_start = time.perf_counter()
                         q_eff = q_fp * scale_k.reshape(1, head_dim)
                         self._quant_kv_stat_add("q_scale_fold_time_s", time.perf_counter() - fold_start)
@@ -696,9 +738,14 @@ class GOFAMistralModel(MistralModel):
                         q_eff_int8, original_m = _pad_int8_rows_to_multiple(q_eff_int8)
                         self._quant_kv_stat_add("q_eff_quant_time_s", time.perf_counter() - quant_start)
 
-                        qk_start = time.perf_counter()
                         k_head_int8, original_n = _pad_int8_rows_to_multiple(k_int[kv_head_idx].contiguous())
-                        logits_int = torch._int_mm(q_eff_int8, k_head_int8.t().contiguous())
+                        k_head_int8_t = k_head_int8.t().contiguous()
+                        self._per_query_detail_event_end(qk_prepare_event, k_head_int8_t)
+
+                        int_qk_event = self._per_query_detail_event_start("int_qk", q_eff_int8)
+                        qk_start = time.perf_counter()
+                        logits_int = torch._int_mm(q_eff_int8, k_head_int8_t)
+                        self._per_query_detail_event_end(int_qk_event, logits_int)
                         if logits_int.size(0) != original_m or logits_int.size(1) != original_n:
                             logits_int = logits_int[:original_m, :original_n].contiguous()
                         self._quant_kv_stat_add("qk_int_mm_time_s", time.perf_counter() - qk_start)
@@ -717,6 +764,7 @@ class GOFAMistralModel(MistralModel):
                 trace_source_item_index,
                 qk_shape=attn_weights,
             )
+            softmax_prob_event = self._per_query_detail_event_start("softmax_prob_quant", attn_weights)
             softmax_start = time.perf_counter()
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
             self._quant_kv_stat_add("softmax_time_s", time.perf_counter() - softmax_start)
@@ -727,6 +775,7 @@ class GOFAMistralModel(MistralModel):
                 softmax_probability_shape=attn_weights,
             )
             attn_weights = nn.functional.dropout(attn_weights, p=attention.attention_dropout, training=attention.training)
+            self._per_query_detail_event_end(softmax_prob_event, attn_weights)
 
             cached_probs = attn_weights[:, :, :, :text_len]
             if cfg.get("pv_compute_mode") == "int_pv":
@@ -770,6 +819,7 @@ class GOFAMistralModel(MistralModel):
                 returned_attn_weights = None
             else:
                 returned_attn_weights = attn_weights
+            self._per_query_detail_event_end(quant_attention_event, attn_output)
             return attn_output, returned_attn_weights
         except _QuantKVPVError:
             raise
@@ -1184,7 +1234,16 @@ class GOFAMistralModel(MistralModel):
                 gnn_latency_event = self._per_query_latency_event_start(memory_states)
                 gnn_input = memory_states[:cur_node_size]
                 gnn_edge_input = memory_states[cur_node_size:][graph.edge_map]
-                output = self.g_layers[g_layer_idx](gnn_input, graph.edge_index, gnn_edge_input)
+                gnn_layer = self.g_layers[g_layer_idx]
+                if hasattr(gnn_layer, "set_per_query_latency_recorder"):
+                    gnn_layer.set_per_query_latency_recorder(
+                        self if self._per_query_detail_event_enabled() else None
+                    )
+                try:
+                    output = gnn_layer(gnn_input, graph.edge_index, gnn_edge_input)
+                finally:
+                    if hasattr(gnn_layer, "set_per_query_latency_recorder"):
+                        gnn_layer.set_per_query_latency_recorder(None)
                 self._record_query_trace_gnn_shapes(i, gnn_input, output, gnn_edge_input)
                 memory_states = torch.cat([output, memory_states[cur_node_size:]], dim=0)
                 memory_states = memory_states.to(self.gofa_config.llama_dtype)

@@ -5,6 +5,7 @@ import time
 
 import torch
 
+from .latency_event_accumulator import elapsed_event_pairs_ms
 from .query_trace import FORMAL_BATCH_ERROR, infer_graph_batch_size
 
 
@@ -30,6 +31,15 @@ CSV_FIELDS = [
     "cache_skips",
     "quant_kv_attention_calls",
     "fallback_count",
+    "quant_kv_attention_gpu_ms",
+    "kv_prepare_gpu_ms",
+    "int_qk_gpu_ms",
+    "softmax_prob_quant_gpu_ms",
+    "int_pv_gpu_ms",
+    "gnn_score_gpu_ms",
+    "gnn_message_gpu_ms",
+    "gnn_update_gpu_ms",
+    "gnn_other_gpu_ms",
 ]
 
 
@@ -290,6 +300,8 @@ class GOFAPerQueryLatencyExporter:
             errors.append("gofa_query_trace.enabled must be False to keep canonical traces read-only")
         if self.config.get("export_gpu_time", True) and not torch.cuda.is_available():
             errors.append("export_gpu_time=True requires CUDA")
+        if self.config.get("export_detail_gpu_time", True) and not self.config.get("export_gpu_time", True):
+            errors.append("export_detail_gpu_time=True requires export_gpu_time=True")
         if errors:
             raise ValueError("Invalid canonical H100 per-query latency configuration: " + "; ".join(errors) + ".")
         self._initialize_csv()
@@ -384,7 +396,8 @@ class GOFAPerQueryLatencyExporter:
 
         base_model = self.owner.model.icae.get_base_model().model
         base_model.begin_per_query_latency_capture(
-            export_gpu_time=bool(self.config.get("export_gpu_time", True))
+            export_gpu_time=bool(self.config.get("export_gpu_time", True)),
+            export_detail_gpu_time=bool(self.config.get("export_detail_gpu_time", True)),
         )
         stats = getattr(base_model, "quant_kv_attention_stats", {})
         int_gemm_stats = getattr(getattr(self.owner, "scheme_b_int_gemm_quantizer", None), "stats", {})
@@ -448,7 +461,7 @@ class GOFAPerQueryLatencyExporter:
         }
 
     def _elapsed_event_pairs(self, pairs):
-        return sum(float(start.elapsed_time(end)) for start, end in pairs)
+        return elapsed_event_pairs_ms(pairs)
 
     def finish_query(self):
         if not self.active():
@@ -467,10 +480,40 @@ class GOFAPerQueryLatencyExporter:
         query_gpu_ms = 0.0
         suffix_gnn_gpu_ms = 0.0
         suffix_transformer_gpu_ms = 0.0
+        detail_gpu_ms = {
+            "quant_kv_attention_gpu_ms": 0.0,
+            "kv_prepare_gpu_ms": 0.0,
+            "int_qk_gpu_ms": 0.0,
+            "softmax_prob_quant_gpu_ms": 0.0,
+            "int_pv_gpu_ms": 0.0,
+            "gnn_score_gpu_ms": 0.0,
+            "gnn_message_gpu_ms": 0.0,
+            "gnn_update_gpu_ms": 0.0,
+            "gnn_other_gpu_ms": 0.0,
+        }
         if current["query_gpu_start"] is not None:
             query_gpu_ms = float(current["query_gpu_start"].elapsed_time(current["query_gpu_end"]))
             suffix_gnn_gpu_ms = self._elapsed_event_pairs(suffix_events.get("gnn", []))
             suffix_transformer_gpu_ms = self._elapsed_event_pairs(suffix_events.get("transformer", []))
+            if self.config.get("export_detail_gpu_time", True):
+                category_to_field = {
+                    "quant_kv_attention": "quant_kv_attention_gpu_ms",
+                    "kv_prepare": "kv_prepare_gpu_ms",
+                    "int_qk": "int_qk_gpu_ms",
+                    "softmax_prob_quant": "softmax_prob_quant_gpu_ms",
+                    "int_pv": "int_pv_gpu_ms",
+                    "gnn_score": "gnn_score_gpu_ms",
+                    "gnn_message": "gnn_message_gpu_ms",
+                    "gnn_update": "gnn_update_gpu_ms",
+                }
+                for category, field_name in category_to_field.items():
+                    detail_gpu_ms[field_name] = self._elapsed_event_pairs(suffix_events.get(category, []))
+                classified_gnn_ms = (
+                    detail_gpu_ms["gnn_score_gpu_ms"]
+                    + detail_gpu_ms["gnn_message_gpu_ms"]
+                    + detail_gpu_ms["gnn_update_gpu_ms"]
+                )
+                detail_gpu_ms["gnn_other_gpu_ms"] = max(0.0, suffix_gnn_gpu_ms - classified_gnn_ms)
 
         cache = current.get("cache")
         if cache is None:
@@ -539,6 +582,7 @@ class GOFAPerQueryLatencyExporter:
             for key, value in cache.items()
             if key not in {"cache_keys", "cache_fallback_count"}
         })
+        row.update(detail_gpu_ms)
         with open(self.config["output_csv"], "a", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
             writer.writerow({key: row[key] for key in CSV_FIELDS})

@@ -191,6 +191,7 @@ def main(params):
         "gofa_per_query_latency_cuda_sync",
         "gofa_per_query_latency_export_wall_time",
         "gofa_per_query_latency_export_gpu_time",
+        "gofa_per_query_latency_export_detail_gpu_time",
         "gofa_per_query_latency_append",
         "gofa_per_query_latency_rank_zero_only",
     ):

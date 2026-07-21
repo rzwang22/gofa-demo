@@ -29,6 +29,15 @@ REQUIRED_FIELDS = {
     "cache_skips",
     "quant_kv_attention_calls",
     "fallback_count",
+    "quant_kv_attention_gpu_ms",
+    "kv_prepare_gpu_ms",
+    "int_qk_gpu_ms",
+    "softmax_prob_quant_gpu_ms",
+    "int_pv_gpu_ms",
+    "gnn_score_gpu_ms",
+    "gnn_message_gpu_ms",
+    "gnn_update_gpu_ms",
+    "gnn_other_gpu_ms",
 }
 
 TIME_FIELDS = {
@@ -42,6 +51,15 @@ TIME_FIELDS = {
     "suffix_wall_ms",
     "suffix_gnn_gpu_ms",
     "suffix_transformer_gpu_ms",
+    "quant_kv_attention_gpu_ms",
+    "kv_prepare_gpu_ms",
+    "int_qk_gpu_ms",
+    "softmax_prob_quant_gpu_ms",
+    "int_pv_gpu_ms",
+    "gnn_score_gpu_ms",
+    "gnn_message_gpu_ms",
+    "gnn_update_gpu_ms",
+    "gnn_other_gpu_ms",
 }
 
 
@@ -145,12 +163,14 @@ def validate_rows(rows, trace_index_template, expected_per_split):
             row["query_index"] = int(row["query_index"])
             cache_misses = int(row["cache_misses"])
             fallback_count = int(row["fallback_count"])
+            quant_kv_attention_calls = int(row["quant_kv_attention_calls"])
         except ValueError as exc:
             raise RuntimeError(f"Invalid integer field at {source}: {exc}") from exc
         if cache_misses != 0:
             raise RuntimeError(f"cache_misses must be zero at {source}, got {cache_misses}")
         if fallback_count != 0:
             raise RuntimeError(f"fallback_count must be zero at {source}, got {fallback_count}")
+        time_values = {}
         for field in TIME_FIELDS:
             try:
                 value = float(row[field])
@@ -158,6 +178,24 @@ def validate_rows(rows, trace_index_template, expected_per_split):
                 raise RuntimeError(f"Invalid {field} at {source}: {row[field]!r}") from exc
             if not math.isfinite(value) or value < 0:
                 raise RuntimeError(f"{field} must be finite and nonnegative at {source}, got {value}")
+            time_values[field] = value
+        if time_values["quant_kv_attention_gpu_ms"] > time_values["suffix_transformer_gpu_ms"] + 1.0:
+            raise RuntimeError(
+                f"quant_kv_attention_gpu_ms exceeds suffix_transformer_gpu_ms + 1 ms at {source}"
+            )
+        classified_gnn_ms = (
+            time_values["gnn_score_gpu_ms"]
+            + time_values["gnn_message_gpu_ms"]
+            + time_values["gnn_update_gpu_ms"]
+        )
+        if classified_gnn_ms > time_values["suffix_gnn_gpu_ms"] + 1.0:
+            raise RuntimeError(
+                f"classified GNN GPU time exceeds suffix_gnn_gpu_ms + 1 ms at {source}"
+            )
+        if quant_kv_attention_calls <= 0:
+            raise RuntimeError(f"quant_kv_attention_calls must be positive on the canonical path at {source}")
+        if time_values["quant_kv_attention_gpu_ms"] <= 0:
+            raise RuntimeError(f"quant_kv_attention_gpu_ms must be positive on the canonical path at {source}")
         row["split"] = split
         row["rep"] = rep
         grouped[(task, rep)].append(row)

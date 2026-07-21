@@ -275,6 +275,9 @@ class GOFAGNNConv(MessagePassing):
         self.xe_norm = MistralRMSNorm(self.in_dim)
 
         self.post_gnn_norm = MistralRMSNorm(self.in_dim)
+        self._per_query_latency_recorder = None
+        self._gnn_score_event = None
+        self._gnn_message_event = None
 
         if config.gating:
             self.attn_gate = nn.Parameter(torch.tensor([0.]))
@@ -295,6 +298,19 @@ class GOFAGNNConv(MessagePassing):
     def reset_parameters(self):
         super().reset_parameters()
 
+    def set_per_query_latency_recorder(self, recorder):
+        self._per_query_latency_recorder = recorder
+
+    def _latency_event_start(self, category, ref_tensor):
+        if self._per_query_latency_recorder is None:
+            return None
+        return self._per_query_latency_recorder._per_query_detail_event_start(category, ref_tensor)
+
+    def _latency_event_end(self, token, ref_tensor):
+        if token is None or self._per_query_latency_recorder is None:
+            return
+        self._per_query_latency_recorder._per_query_detail_event_end(token, ref_tensor)
+
     def forward(self, x: Tensor, edge_index: Adj, xe: Tensor):
         r"""Runs the forward pass of the module.
 
@@ -304,6 +320,8 @@ class GOFAGNNConv(MessagePassing):
             edge_index (torch.Tensor or SparseTensor): The edge indices.
         """
         x = x.view(x.size()[0], self.in_layer, self.in_dim)
+        self._gnn_score_event = self._latency_event_start("gnn_score", x)
+        self._gnn_message_event = None
         # Q = x.clone().detach()
         residual = x
         x = self.x_norm(x)
@@ -322,6 +340,14 @@ class GOFAGNNConv(MessagePassing):
         xe_key, xe_value = torch.chunk(xe, 2, -1)
 
         out = self.propagate(edge_index, query=query, key=key, value=value, xe_key=xe_key, xe_value=xe_value)
+        if self._gnn_score_event is not None:
+            self._latency_event_end(self._gnn_score_event, out)
+            self._gnn_score_event = None
+        if self._gnn_message_event is not None:
+            self._latency_event_end(self._gnn_message_event, out)
+            self._gnn_message_event = None
+
+        update_event = self._latency_event_start("gnn_update", out)
         out = self.o_proj(out)
 
         # Initital gating
@@ -338,6 +364,7 @@ class GOFAGNNConv(MessagePassing):
             out = residual + out * self.ff_gate.tanh()
         else:
             out = residual + out
+        self._latency_event_end(update_event, out)
         #
         # H = out.clone().detach().view(Q.size())
         # diff = (((H - Q).to(torch.float32))**2).sum(dim=(-2))/((Q.to(torch.float32))**2).sum(dim=(-2))
@@ -364,6 +391,9 @@ class GOFAGNNConv(MessagePassing):
         alpha = softmax(alpha, index, ptr, size_i, dim=0)
         self._alpha = alpha
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        self._latency_event_end(self._gnn_score_event, alpha)
+        self._gnn_score_event = None
+        self._gnn_message_event = self._latency_event_start("gnn_message", value_j)
 
         out = value_j.view(-1, self.d_model)
         out = out * alpha.view(-1, 1)
@@ -405,6 +435,9 @@ class GOFAGNNConvFullAtt(GOFAGNNConv):
 
         alpha = softmax(alpha, softmax_ind, num_nodes=size_i, dim=1)
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        self._latency_event_end(self._gnn_score_event, alpha)
+        self._gnn_score_event = None
+        self._gnn_message_event = self._latency_event_start("gnn_message", value_j)
         alpha = alpha.view(self.head, -1, self.in_layer, self.in_layer).transpose(-1, -2)
 
         out = alpha @ value_j

@@ -124,6 +124,7 @@ class ModelArguments:
     gofa_per_query_latency_cuda_sync: Optional[bool] = field(default=None)
     gofa_per_query_latency_export_wall_time: Optional[bool] = field(default=None)
     gofa_per_query_latency_export_gpu_time: Optional[bool] = field(default=None)
+    gofa_per_query_latency_export_detail_gpu_time: Optional[bool] = field(default=None)
     gofa_per_query_latency_append: Optional[bool] = field(default=None)
     gofa_per_query_latency_rank_zero_only: Optional[bool] = field(default=None)
     encoder_cache_verify: bool = field(default=False, metadata={"help": "Compare memory_kv cache output against the full encoder path"})
@@ -720,6 +721,7 @@ class GOFAMistral(torch.nn.Module):
                 f"cuda_sync={self.gofa_per_query_latency['cuda_sync']}, "
                 f"export_wall_time={self.gofa_per_query_latency['export_wall_time']}, "
                 f"export_gpu_time={self.gofa_per_query_latency['export_gpu_time']}, "
+                f"export_detail_gpu_time={self.gofa_per_query_latency['export_detail_gpu_time']}, "
                 f"append={self.gofa_per_query_latency['append']}, "
                 f"rank_zero_only={self.gofa_per_query_latency['rank_zero_only']}"
             )
@@ -1071,6 +1073,7 @@ class GOFAMistral(torch.nn.Module):
             "cuda_sync": True,
             "export_wall_time": True,
             "export_gpu_time": True,
+            "export_detail_gpu_time": True,
             "append": False,
             "rank_zero_only": True,
         }
@@ -1085,6 +1088,7 @@ class GOFAMistral(torch.nn.Module):
             "cuda_sync": "gofa_per_query_latency_cuda_sync",
             "export_wall_time": "gofa_per_query_latency_export_wall_time",
             "export_gpu_time": "gofa_per_query_latency_export_gpu_time",
+            "export_detail_gpu_time": "gofa_per_query_latency_export_detail_gpu_time",
             "append": "gofa_per_query_latency_append",
             "rank_zero_only": "gofa_per_query_latency_rank_zero_only",
         }
@@ -1100,6 +1104,7 @@ class GOFAMistral(torch.nn.Module):
             "cuda_sync",
             "export_wall_time",
             "export_gpu_time",
+            "export_detail_gpu_time",
             "append",
             "rank_zero_only",
         ):

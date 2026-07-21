@@ -111,6 +111,7 @@ gofa_per_query_latency:
   cuda_sync: True
   export_wall_time: True
   export_gpu_time: True
+  export_detail_gpu_time: True
   append: False
   rank_zero_only: True
 EOF
