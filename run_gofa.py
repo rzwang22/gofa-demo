@@ -112,6 +112,12 @@ def _validate_canonical_h100_latency_run(params):
 
 
 def main(params):
+    if getattr(params, "model_type", None) == "llm_n" or getattr(params, "llm_n_enabled", False):
+        # Isolated pure-LLM path.  The default GOFA construction below remains
+        # untouched and is never instantiated for LLM-N runs.
+        from llm_n.runner import run as run_llm_n
+        return run_llm_n(params)
+
     ##################################################################
     #                    Configuration                               #
     ##################################################################

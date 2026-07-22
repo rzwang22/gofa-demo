@@ -1,0 +1,44 @@
+# Set llm_n_mode=llm_n_sft and adapter_path=/path/to/adapter to evaluate SFT.
+# With the defaults below this is a zero-shot Mistral baseline.
+model_type: llm_n
+llm_n_enabled: true
+llm_n_mode: llm_n_zero_shot
+run_mode: inference
+
+model_name_or_path: mistralai/Mistral-7B-Instruct-v0.2
+adapter_path:
+torch_dtype: bfloat16
+attn_implementation: eager
+device_map: auto
+trust_remote_code: false
+use_fast_tokenizer: true
+max_context_length: 32768
+max_new_tokens: 32
+truncate_mode: none  # no silent truncation
+
+data_root_path: ./TAGDataset
+eval_task_names:
+  - arxiv
+  - cora_node
+  - cora_link
+  - pubmed_node
+  - pubmed_link
+  - wikics
+  - wn18rr
+eval_split: test
+inf_sample_size_per_task: 1.0
+inf_hops: 3
+inf_max_nodes_per_hops: 5
+sample_mode: random
+save_data: true
+from_saved: true
+fast_data_load: true
+taglas_to_sparse: true
+num_workers: 4
+seed: 1
+
+batch_size: 1
+warm_up_samples: 10
+save_prompts: true
+load_in_4bit: false
+output_dir: ./outputs/llm_n_inference

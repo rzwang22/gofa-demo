@@ -1,0 +1,3 @@
+# Needed by Transformers low_cpu_mem_usage/device_map; SFT uses an isolated PyTorch loop.
+# Keep this opt-in so the original GOFA environment remains unchanged.
+accelerate==0.26.1

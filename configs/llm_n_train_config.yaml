@@ -1,0 +1,66 @@
+# Pure LLM-as-Predictor supervised baseline.  This file never loads a GOFA,
+# ICAE, GNN, memory-token, or graph checkpoint.
+model_type: llm_n
+llm_n_enabled: true
+llm_n_mode: llm_n_sft
+run_mode: train
+
+model_name_or_path: mistralai/Mistral-7B-Instruct-v0.2
+torch_dtype: bfloat16
+attn_implementation: eager
+device_map:
+trust_remote_code: false
+use_fast_tokenizer: true
+max_context_length: 32768
+max_new_tokens: 32
+truncate_mode: none  # none fails loudly; left/right/middle explicitly permit token truncation
+
+data_root_path: ./TAGDataset
+train_task_names:
+  - arxiv
+  - cora_node
+  - cora_link
+  - pubmed_node
+  - pubmed_link
+  - wikics
+  - wn18rr
+
+# Match the corresponding seven entries in configs/supervised_config.yaml.
+sample_size_per_task: [16000, 1200, 15000, 1300, 20000, 8000, 20000]
+hops: 3
+max_nodes_per_hop: 5
+sample_mode: random
+save_data: true
+from_saved: true
+fast_data_load: true
+gofa_size_filter: true  # match run_gofa.py supervised training sample filtering
+taglas_to_sparse: true
+num_workers: 4
+dataloader_num_workers: 0  # keep tokenizer overflow metadata in the main process
+seed: 1
+
+batch_size: 1
+grad_acc_step: 8
+num_epochs: 1
+max_steps: -1
+lr: 0.0002
+l2: 0.0
+warmup_ratio: 0.03
+lr_scheduler_type: cosine
+training_precision: bf16
+gradient_checkpointing: true
+load_in_4bit: false
+
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+logging_steps: 10
+save_strategy: steps
+save_steps: 500
+save_total_limit: 2
+offline_log: true
+output_dir: ./outputs/llm_n_train
+adapter_output_dir:
+resume_from_checkpoint: null
