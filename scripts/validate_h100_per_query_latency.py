@@ -145,10 +145,10 @@ def load_expected_traces(path, task):
             query_uid = index_query_uid or trace_query_uid
             if not query_uid:
                 raise RuntimeError(f"trace_order={trace_order} has no query UID")
-            trace_signature = trace.get("graph_signature") or entry.get("graph_signature")
+            trace_signature = trace.get("graph_signature") or index_entry.get("graph_signature")
             if not trace_signature:
                 raise RuntimeError(f"trace_order={trace_order} has no graph_signature")
-            workload = trace.get("workload_profile") or entry.get("workload_profile")
+            workload = trace.get("workload_profile") or index_entry.get("workload_profile")
             if isinstance(workload, dict):
                 workload = workload.get("name")
             if not workload:

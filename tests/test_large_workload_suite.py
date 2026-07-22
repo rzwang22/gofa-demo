@@ -16,12 +16,20 @@ from modules.gofa.workload_profile import (
     resolve_saved_workload_names,
     validate_runtime_sampling,
 )
-from scripts.large_workload_common import TASK_WAYS, build_task_configs, normalize_args
+from scripts.large_workload_common import TASK_WAYS, build_task_configs, normalize_args, prepare_suite
 from tests.test_h100_per_query_latency import PER_QUERY_LATENCY
 
 
 class LargeWorkloadProfileTest(unittest.TestCase):
     def _args(self, root):
+        runtime_root = Path(root) / "runtime_inputs"
+        data_root = runtime_root / "data"
+        model_root = runtime_root / "model"
+        checkpoint_root = runtime_root / "checkpoints"
+        for path in (data_root, model_root, checkpoint_root):
+            path.mkdir(parents=True, exist_ok=True)
+        load_path = checkpoint_root / "instruct_2_ckpt.pth"
+        load_path.touch()
         return types.SimpleNamespace(
             profile_root=root,
             profile_name="large_h6_n32_s100",
@@ -31,12 +39,13 @@ class LargeWorkloadProfileTest(unittest.TestCase):
             seed=1,
             tasks=["cora_node"],
             reps=3,
-            data_root="/datasets/TAGDataset",
-            model_name_or_path="/models/Mistral-7B-Instruct-v0.2",
-            checkpoint_dir="/models/checkpoints",
-            load_dir="/models/checkpoints/instruct_2_ckpt.pth",
+            data_root=str(data_root),
+            model_name_or_path=str(model_root),
+            checkpoint_dir=str(checkpoint_root),
+            load_dir=str(load_path),
             kv_policy="target_1hop",
             kv_target_hops=1,
+            overwrite_suite=False,
         )
 
     def test_h6_n32_runtime_sampling_is_accepted(self):
@@ -110,6 +119,21 @@ class LargeWorkloadProfileTest(unittest.TestCase):
                     (formal_quant["kv_base_load_policy"], formal_quant["kv_base_target_hops"]),
                     (gpu_quant["kv_base_load_policy"], gpu_quant["kv_base_target_hops"]),
                 )
+
+    def test_required_runtime_path_types_are_checked(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = self._args(root)
+            args.load_dir = args.checkpoint_dir
+            with self.assertRaisesRegex(ValueError, "load-dir must be an existing file"):
+                normalize_args(args)
+
+    def test_suite_identity_mismatch_requires_overwrite(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = self._args(root)
+            prepare_suite(args)
+            args.reps = 2
+            with self.assertRaisesRegex(RuntimeError, "suite identity mismatch"):
+                prepare_suite(args)
 
 
 class ProfileModeAndIntGemmTest(unittest.TestCase):

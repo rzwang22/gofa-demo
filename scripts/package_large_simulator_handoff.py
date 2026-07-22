@@ -5,7 +5,7 @@ import json
 import tarfile
 from pathlib import Path
 
-from large_workload_common import add_common_arguments, suite_root
+from large_workload_common import add_common_arguments, load_locked_suite
 
 
 INCLUDE_PATHS = ("suite_manifest.json", "configs", "plans", "manifests", "traces", "latency", "summary")
@@ -15,7 +15,8 @@ def main():
     parser = add_common_arguments(argparse.ArgumentParser(description="Package GOFA simulator handoff artifacts."))
     parser.add_argument("--output", default="")
     args = parser.parse_args()
-    root = suite_root(args)
+    _manifest_path, suite = load_locked_suite(args)
+    root = Path(suite["paths"]["root"])
     output = Path(args.output).expanduser().resolve() if args.output else root / f"{args.profile_name}_simulator_handoff.tar.gz"
     checksums = {}
     with tarfile.open(output, "w:gz") as archive:

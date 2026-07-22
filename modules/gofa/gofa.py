@@ -1039,6 +1039,7 @@ class GOFAMistral(torch.nn.Module):
             "include_text_preview": True,
             "rank_zero_only": True,
             "strict": True,
+            "resume": False,
         }
         nested = getattr(model_args, "gofa_query_trace", None)
         if isinstance(nested, dict):
@@ -1063,6 +1064,7 @@ class GOFAMistral(torch.nn.Module):
         cfg["include_text_preview"] = bool(cfg["include_text_preview"])
         cfg["rank_zero_only"] = bool(cfg["rank_zero_only"])
         cfg["strict"] = bool(cfg["strict"])
+        cfg["resume"] = bool(cfg["resume"])
         if cfg["enabled"] and not cfg["output_dir"]:
             raise ValueError("gofa_query_trace.output_dir must be set when query trace export is enabled.")
         return cfg

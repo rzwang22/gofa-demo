@@ -1,9 +1,13 @@
 import copy
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from scripts.summarize_gofa_query_traces import summarize_traces
 from scripts.validate_gofa_query_trace import validate_trace
 from modules.gofa.workload_profile import graph_signature, query_uid
+from modules.gofa.query_trace import GOFAQueryTraceExporter
 
 
 def _synthetic_trace():
@@ -22,8 +26,15 @@ def _synthetic_trace():
             "key_bits": 2,
             "value_bits": 2,
             "memory_shape": [2, 4],
+            "memory_scale_shape": [4],
             "text_kv_shapes": [
-                {"layer_id": layer_id, "key_shape": [1, 2, 4], "value_shape": [1, 2, 4]}
+                {
+                    "layer_id": layer_id,
+                    "key_shape": [1, 2, 4],
+                    "value_shape": [1, 2, 4],
+                    "key_scale_shape": [4],
+                    "value_scale_shape": [4],
+                }
                 for layer_id in suffix_layers
             ],
         })
@@ -125,16 +136,47 @@ def _synthetic_trace():
         },
         "runtime_operation_shapes": {"item_order": item_order, "layers": runtime_layers},
         "traffic_metadata": {
-            "byte_accounting": "quantized_data_only_excluding_scale_and_container_metadata",
+            "byte_accounting": "separate_quantized_data_fp32_scale_and_uint32_gather_index",
             "memory_cache_bytes": 12,
             "selected_key_bytes": 24,
             "selected_value_bytes": 12,
             "full_key_bytes": 36,
             "full_value_bytes": 36,
             "edge_cache_bytes": 28,
+            "logical_data_bytes": {
+                "memory_cache": 12,
+                "selected_key": 24,
+                "selected_value": 12,
+                "full_key": 36,
+                "full_value": 36,
+                "edge_cache": 28,
+                "persistent_cache": 84,
+                "runtime_loaded": 48,
+            },
+            "scale_bytes": {
+                "dtype": "float32",
+                "memory_cache": 48,
+                "selected_key": 192,
+                "selected_value": 96,
+                "full_key": 288,
+                "full_value": 288,
+                "edge_cache": 208,
+                "persistent_cache": 624,
+                "runtime_loaded": 336,
+            },
+            "gather_index_metadata_bytes": {
+                "index_dtype": "uint32",
+                "bytes_per_index": 4,
+                "memory_item_indices": 12,
+                "selected_key_item_indices": 48,
+                "selected_value_item_indices": 24,
+                "runtime_loaded": 84,
+            },
             "nog_online_item_count": 1,
             "persistent_cache_bytes": 84,
             "runtime_loaded_cache_bytes": 48,
+            "runtime_loaded_scale_bytes": 336,
+            "runtime_gather_index_metadata_bytes": 84,
         },
         "logical_address_layout": {
             "address_space": "query_local_cache_bytes",
@@ -152,6 +194,9 @@ def _synthetic_trace():
             "selected_KV_ratio": 1 / 3,
             "persistent_cache_bytes": 84,
             "runtime_loaded_cache_bytes": 48,
+            "persistent_scale_bytes": 624,
+            "runtime_loaded_scale_bytes": 336,
+            "runtime_gather_index_metadata_bytes": 84,
         },
     }
     graph = trace["query_graph_structure"]
@@ -174,10 +219,15 @@ def _synthetic_trace():
     for item in inventory:
         if not item["cache_eligible"]:
             continue
-        entries = [("memory", None, 4)]
+        entries = [("memory", None, "data", 4), ("memory", None, "scale", 16)]
         for layer in item["text_kv_shapes"]:
-            entries.extend((("key", layer["layer_id"], 2), ("value", layer["layer_id"], 2)))
-        for component, layer_id, size in entries:
+            entries.extend((
+                ("key", layer["layer_id"], "data", 2),
+                ("key", layer["layer_id"], "scale", 16),
+                ("value", layer["layer_id"], "data", 2),
+                ("value", layer["layer_id"], "scale", 16),
+            ))
+        for component, layer_id, storage_kind, size in entries:
             offset = ((offset + 63) // 64) * 64
             entry = {
                 "item_index": item["item_index"],
@@ -185,6 +235,7 @@ def _synthetic_trace():
                 "base_offset": offset,
                 "size_bytes": size,
                 "alignment_bytes": 64,
+                "storage_kind": storage_kind,
             }
             if layer_id is not None:
                 entry["layer_id"] = layer_id
@@ -214,6 +265,45 @@ class GOFAQueryTraceTest(unittest.TestCase):
         self.assertEqual(task["node_count"]["p95"], 2.0)
         self.assertEqual(task["persistent_cache_bytes"]["total"], 168)
         self.assertEqual(task["NOG_online_count"]["total"], 2)
+
+    def test_separates_data_scale_and_gather_index_bytes(self):
+        traffic = _synthetic_trace()["traffic_metadata"]
+        self.assertEqual(traffic["logical_data_bytes"]["runtime_loaded"], 48)
+        self.assertEqual(traffic["scale_bytes"]["runtime_loaded"], 336)
+        self.assertEqual(traffic["gather_index_metadata_bytes"]["runtime_loaded"], 84)
+
+    def test_resume_replays_and_verifies_existing_trace_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as root:
+            trace = {
+                "query_id": "query_000000",
+                "task_name": "cora_node",
+                "split": "val",
+                "runtime_query_index": 0,
+                "graph_signature": "sig-0",
+            }
+            index = {
+                "query_id": "query_000000",
+                "trace_path": "query_000000.json",
+                "task": "cora_node",
+                "split": "val",
+                "query_index": 0,
+                "graph_signature": "sig-0",
+            }
+            trace_path = Path(root) / "query_000000.json"
+            index_path = Path(root) / "trace_index.jsonl"
+            trace_path.write_text(json.dumps(trace))
+            index_path.write_text(json.dumps(index) + "\n")
+            original_index = index_path.read_bytes()
+            exporter = GOFAQueryTraceExporter(
+                None,
+                {"output_dir": root, "resume": True, "max_queries": 1, "strict": True},
+                enabled=True,
+            )
+            exporter.validate_graph = lambda _graph: True
+            exporter._build_trace = lambda **_kwargs: dict(trace)
+            self.assertEqual(exporter.write_query(graph=None), str(trace_path))
+            self.assertEqual(exporter.queries_written, 1)
+            self.assertEqual(index_path.read_bytes(), original_index)
 
 
 if __name__ == "__main__":

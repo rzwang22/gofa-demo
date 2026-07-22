@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 from pathlib import Path
 import sys
 
@@ -38,6 +39,7 @@ def add_common_arguments(parser):
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--kv-policy", choices=("all", "target_1hop"), default="target_1hop")
     parser.add_argument("--kv-target-hops", type=int, default=1)
+    parser.add_argument("--overwrite-suite", action="store_true")
     return parser
 
 
@@ -57,8 +59,16 @@ def normalize_args(args):
     if int(args.kv_target_hops) < 0:
         raise ValueError("--kv-target-hops must be non-negative")
     for field_name in ("data_root", "model_name_or_path", "checkpoint_dir", "load_dir"):
-        if not str(getattr(args, field_name, "") or "").strip():
+        raw_path = str(getattr(args, field_name, "") or "").strip()
+        if not raw_path:
             raise ValueError(f"--{field_name.replace('_', '-')} must not be empty")
+        path = Path(raw_path).expanduser().resolve()
+        expects_file = field_name == "load_dir"
+        if expects_file and not path.is_file():
+            raise ValueError(f"--load-dir must be an existing file: {path}")
+        if not expects_file and not path.is_dir():
+            raise ValueError(f"--{field_name.replace('_', '-')} must be an existing directory: {path}")
+        setattr(args, field_name, str(path))
     profile = normalize_workload_profile({
         "name": args.profile_name,
         "seed": args.seed,
@@ -67,6 +77,62 @@ def normalize_args(args):
         "max_nodes_per_hop": args.max_nodes_per_hop,
     })
     return profile, tasks
+
+
+def repository_commit_sha():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _suite_identity(args, profile, tasks):
+    return {
+        "repository_commit_sha": repository_commit_sha(),
+        "profile": profile,
+        "tasks": list(tasks),
+        "reps": int(args.reps),
+        "runtime": {
+            "data_root_path": str(args.data_root),
+            "model_name_or_path": str(args.model_name_or_path),
+            "checkpoint_dir": str(args.checkpoint_dir),
+            "load_dir": str(args.load_dir),
+            "load_model": True,
+        },
+        "kv_policy": {
+            "name": str(args.kv_policy),
+            "target_hops": int(args.kv_target_hops),
+        },
+    }
+
+
+def _validate_locked_suite(existing, expected_identity):
+    mismatches = []
+    for field, expected in expected_identity.items():
+        actual = existing.get(field)
+        if actual != expected:
+            mismatches.append(f"{field}: locked={actual!r}, requested={expected!r}")
+    if mismatches:
+        raise RuntimeError(
+            "Large-workload suite identity mismatch; use --overwrite-suite only to intentionally rebuild it: "
+            + "; ".join(mismatches)
+        )
+
+
+def load_locked_suite(args):
+    profile, tasks = normalize_args(args)
+    manifest_path = suite_root(args) / "suite_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"Large-workload suite manifest does not exist: {manifest_path}")
+    with manifest_path.open() as handle:
+        manifest = json.load(handle)
+    _validate_locked_suite(manifest, _suite_identity(args, profile, tasks))
+    return manifest_path, manifest
 
 
 def suite_root(args):
@@ -82,6 +148,7 @@ def suite_paths(args):
         "manifests": root / "manifests",
         "traces": root / "traces",
         "latency": root / "latency",
+        "logs": root / "logs",
         "full_cache": root / "cache" / "full" / "shared",
         "quant_cache": root / "cache" / "quant" / "m4k2v2",
         "summary": root / "summary",
@@ -223,6 +290,7 @@ def build_task_configs(args, profile, task):
         "include_text_preview": True,
         "rank_zero_only": True,
         "strict": True,
+        "resume": False,
     }
     configs["formal_trace"] = formal_trace
 
@@ -263,6 +331,14 @@ def write_json_yaml(path, payload):
 def prepare_suite(args):
     profile, tasks = normalize_args(args)
     paths = suite_paths(args)
+    manifest_path = paths["root"] / "suite_manifest.json"
+    expected_identity = _suite_identity(args, profile, tasks)
+    existing_manifest = None
+    if manifest_path.is_file():
+        with manifest_path.open() as handle:
+            existing_manifest = json.load(handle)
+        if not bool(getattr(args, "overwrite_suite", False)):
+            _validate_locked_suite(existing_manifest, expected_identity)
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
     config_paths = {}
@@ -274,20 +350,7 @@ def prepare_suite(args):
             config_paths[task][stage] = str(path)
     manifest = {
         "suite_format": "gofa_large_workload_suite_v1",
-        "profile": profile,
-        "tasks": tasks,
-        "reps": int(args.reps),
-        "runtime": {
-            "data_root_path": str(args.data_root),
-            "model_name_or_path": str(args.model_name_or_path),
-            "checkpoint_dir": str(args.checkpoint_dir),
-            "load_dir": str(args.load_dir),
-            "load_model": True,
-        },
-        "kv_policy": {
-            "name": str(args.kv_policy),
-            "target_hops": int(args.kv_target_hops),
-        },
+        **expected_identity,
         "saved_workloads": {
             task: {
                 split: saved_workload_name(profile, task, split)
@@ -298,8 +361,10 @@ def prepare_suite(args):
         "paths": {key: str(value) for key, value in paths.items()},
         "configs": config_paths,
     }
-    manifest_path = paths["root"] / "suite_manifest.json"
-    write_json_yaml(manifest_path, manifest)
+    if existing_manifest is None or bool(getattr(args, "overwrite_suite", False)):
+        write_json_yaml(manifest_path, manifest)
+    else:
+        manifest = existing_manifest
     return manifest_path, manifest
 
 

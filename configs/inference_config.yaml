@@ -36,6 +36,7 @@ gofa_query_trace:
   output_dir: ""
   max_queries: 0
   include_token_ids: False
+  resume: False
   include_text_preview: True
   rank_zero_only: True
   strict: True

@@ -91,6 +91,12 @@ def quantized_data_bytes(shape, bits):
     return int(math.ceil(_shape_numel(shape) * int(bits) / 8.0))
 
 
+def quantized_scale_bytes(shape):
+    if not shape or _shape_numel(shape) == 0:
+        return 0
+    return int(shape[-1]) * 4
+
+
 def _component_has_tokens(layer_kv, component):
     if not isinstance(layer_kv, dict):
         return False
@@ -123,34 +129,56 @@ class GOFAQueryTraceExporter:
         self.enabled = bool(enabled)
         self.queries_written = 0
         self.context = {}
-        self.next_query_id = 0
+        self.resume_entries = []
         if not self.enabled:
             return
         output_dir = self.config.get("output_dir", "")
         if not output_dir:
             raise ValueError("gofa_query_trace.enabled=True requires gofa_query_trace.output_dir.")
         os.makedirs(output_dir, exist_ok=True)
-        self.next_query_id = self._discover_next_query_id()
+        has_existing = os.path.isfile(os.path.join(output_dir, "trace_index.jsonl")) or any(
+            Path(output_dir).glob("query_*.json")
+        )
+        if self.config.get("resume", False):
+            self.resume_entries = self._load_resume_entries()
+        elif has_existing:
+            raise RuntimeError(
+                f"GOFA formal trace output already exists: {output_dir}. "
+                "Use the large-workload --fresh or --resume mode explicitly."
+            )
 
-    def _discover_next_query_id(self):
+    def _load_resume_entries(self):
         output_dir = self.config["output_dir"]
-        maximum = -1
-        for path in Path(output_dir).glob("query_*.json"):
-            try:
-                maximum = max(maximum, int(path.stem.rsplit("_", 1)[-1]))
-            except ValueError:
-                continue
         index_path = os.path.join(output_dir, "trace_index.jsonl")
-        if os.path.isfile(index_path):
-            with open(index_path) as handle:
-                for line in handle:
-                    try:
-                        query_id = json.loads(line).get("query_id")
-                        if isinstance(query_id, str) and query_id.startswith("query_"):
-                            maximum = max(maximum, int(query_id.rsplit("_", 1)[-1]))
-                    except (ValueError, TypeError, json.JSONDecodeError):
-                        continue
-        return maximum + 1
+        if not os.path.isfile(index_path):
+            raise RuntimeError(f"GOFA formal trace resume requires an existing index: {index_path}")
+        entries = []
+        with open(index_path) as handle:
+            for trace_order, line in enumerate(handle):
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                expected_query_id = f"query_{trace_order:06d}"
+                expected_filename = f"{expected_query_id}.json"
+                if entry.get("query_id") != expected_query_id or entry.get("trace_path") != expected_filename:
+                    raise RuntimeError(
+                        "GOFA formal trace resume requires a continuous index: "
+                        f"trace_order={trace_order}, entry={entry}"
+                    )
+                trace_path = os.path.join(output_dir, expected_filename)
+                if not os.path.isfile(trace_path):
+                    raise RuntimeError(f"GOFA formal trace resume is missing {trace_path}")
+                with open(trace_path) as trace_handle:
+                    trace = json.load(trace_handle)
+                entries.append({"index": entry, "trace": trace, "path": trace_path})
+        query_paths = sorted(path.name for path in Path(output_dir).glob("query_*.json"))
+        expected_paths = [f"query_{index:06d}.json" for index in range(len(entries))]
+        if query_paths != expected_paths:
+            raise RuntimeError(
+                "GOFA formal trace resume found non-continuous query files: "
+                f"expected={expected_paths}, actual={query_paths}"
+            )
+        return entries
 
     def active(self):
         maximum = int(self.config.get("max_queries", 0))
@@ -231,10 +259,14 @@ class GOFAQueryTraceExporter:
             layer = base_layers[offset] if offset < len(base_layers) else None
             if not isinstance(layer, dict):
                 layer = item_layers[offset] if offset < len(item_layers) else None
+            key_shape = _shape(layer.get("key")) if isinstance(layer, dict) else None
+            value_shape = _shape(layer.get("value")) if isinstance(layer, dict) else None
             result.append({
                 "layer_id": int(layer_id),
-                "key_shape": _shape(layer.get("key")) if isinstance(layer, dict) else None,
-                "value_shape": _shape(layer.get("value")) if isinstance(layer, dict) else None,
+                "key_shape": key_shape,
+                "value_shape": value_shape,
+                "key_scale_shape": [int(key_shape[-1])] if key_shape else None,
+                "value_scale_shape": [int(value_shape[-1])] if value_shape else None,
             })
         return result
 
@@ -281,6 +313,9 @@ class GOFAQueryTraceExporter:
                 "memory_shape": _shape(memory_source),
                 "text_kv_shapes": self._layer_shapes(cache_item, base_payload, suffix_layer_ids),
             }
+            entry["memory_scale_shape"] = (
+                [int(entry["memory_shape"][-1])] if entry["memory_shape"] else None
+            )
             if self.config.get("include_token_ids", False):
                 entry["token_ids"] = [int(token_id) for token_id in ids]
             if self.config.get("include_text_preview", True):
@@ -330,6 +365,7 @@ class GOFAQueryTraceExporter:
         inventory_by_index = {item["item_index"]: item for item in inventory}
         cacheable = [item for item in inventory if item["cache_eligible"]]
         memory_bytes = sum(quantized_data_bytes(item["memory_shape"], FORMAL_MEMORY_BITS) for item in cacheable)
+        memory_scale_bytes = sum(quantized_scale_bytes(item["memory_shape"]) for item in cacheable)
 
         def layer_component_bytes(item, layer_id, component, bits):
             for layer in item["text_kv_shapes"]:
@@ -339,43 +375,113 @@ class GOFAQueryTraceExporter:
 
         full_key_bytes = 0
         full_value_bytes = 0
+        full_key_scale_bytes = 0
+        full_value_scale_bytes = 0
         edge_cache_bytes = 0
+        edge_cache_scale_bytes = 0
         for item in cacheable:
             item_bytes = quantized_data_bytes(item["memory_shape"], FORMAL_MEMORY_BITS)
+            item_scale_bytes = quantized_scale_bytes(item["memory_shape"])
             for layer in item["text_kv_shapes"]:
                 key_bytes = quantized_data_bytes(layer["key_shape"], FORMAL_KEY_BITS)
                 value_bytes = quantized_data_bytes(layer["value_shape"], FORMAL_VALUE_BITS)
                 full_key_bytes += key_bytes
                 full_value_bytes += value_bytes
+                key_scale_bytes = quantized_scale_bytes(layer["key_shape"])
+                value_scale_bytes = quantized_scale_bytes(layer["value_shape"])
+                full_key_scale_bytes += key_scale_bytes
+                full_value_scale_bytes += value_scale_bytes
                 item_bytes += key_bytes + value_bytes
+                item_scale_bytes += key_scale_bytes + value_scale_bytes
             if item["item_type"] == "edge":
                 edge_cache_bytes += item_bytes
+                edge_cache_scale_bytes += item_scale_bytes
 
         selected_key_bytes = 0
         selected_value_bytes = 0
+        selected_key_scale_bytes = 0
+        selected_value_scale_bytes = 0
         for layer_id, item_indices in selective["effective_key_items_by_layer"].items():
             for item_index in item_indices:
+                item = inventory_by_index[item_index]
                 selected_key_bytes += layer_component_bytes(
-                    inventory_by_index[item_index], layer_id, "key", FORMAL_KEY_BITS
+                    item, layer_id, "key", FORMAL_KEY_BITS
+                )
+                selected_key_scale_bytes += quantized_scale_bytes(
+                    next(
+                        layer["key_shape"]
+                        for layer in item["text_kv_shapes"]
+                        if int(layer["layer_id"]) == int(layer_id)
+                    )
                 )
         for layer_id, item_indices in selective["effective_value_items_by_layer"].items():
             for item_index in item_indices:
+                item = inventory_by_index[item_index]
                 selected_value_bytes += layer_component_bytes(
-                    inventory_by_index[item_index], layer_id, "value", FORMAL_VALUE_BITS
+                    item, layer_id, "value", FORMAL_VALUE_BITS
+                )
+                selected_value_scale_bytes += quantized_scale_bytes(
+                    next(
+                        layer["value_shape"]
+                        for layer in item["text_kv_shapes"]
+                        if int(layer["layer_id"]) == int(layer_id)
+                    )
                 )
         persistent = memory_bytes + full_key_bytes + full_value_bytes
         loaded = memory_bytes + selected_key_bytes + selected_value_bytes
+        persistent_scales = memory_scale_bytes + full_key_scale_bytes + full_value_scale_bytes
+        loaded_scales = memory_scale_bytes + selected_key_scale_bytes + selected_value_scale_bytes
+        index_bytes = 4
+        memory_index_bytes = len(cacheable) * index_bytes
+        selected_key_index_bytes = sum(
+            len(indices) for indices in selective["effective_key_items_by_layer"].values()
+        ) * index_bytes
+        selected_value_index_bytes = sum(
+            len(indices) for indices in selective["effective_value_items_by_layer"].values()
+        ) * index_bytes
+        loaded_index_bytes = memory_index_bytes + selected_key_index_bytes + selected_value_index_bytes
         return {
-            "byte_accounting": "quantized_data_only_excluding_scale_and_container_metadata",
+            "byte_accounting": "separate_quantized_data_fp32_scale_and_uint32_gather_index",
             "memory_cache_bytes": int(memory_bytes),
             "selected_key_bytes": int(selected_key_bytes),
             "selected_value_bytes": int(selected_value_bytes),
             "full_key_bytes": int(full_key_bytes),
             "full_value_bytes": int(full_value_bytes),
             "edge_cache_bytes": int(edge_cache_bytes),
+            "logical_data_bytes": {
+                "memory_cache": int(memory_bytes),
+                "selected_key": int(selected_key_bytes),
+                "selected_value": int(selected_value_bytes),
+                "full_key": int(full_key_bytes),
+                "full_value": int(full_value_bytes),
+                "edge_cache": int(edge_cache_bytes),
+                "persistent_cache": int(persistent),
+                "runtime_loaded": int(loaded),
+            },
+            "scale_bytes": {
+                "dtype": "float32",
+                "memory_cache": int(memory_scale_bytes),
+                "selected_key": int(selected_key_scale_bytes),
+                "selected_value": int(selected_value_scale_bytes),
+                "full_key": int(full_key_scale_bytes),
+                "full_value": int(full_value_scale_bytes),
+                "edge_cache": int(edge_cache_scale_bytes),
+                "persistent_cache": int(persistent_scales),
+                "runtime_loaded": int(loaded_scales),
+            },
+            "gather_index_metadata_bytes": {
+                "index_dtype": "uint32",
+                "bytes_per_index": index_bytes,
+                "memory_item_indices": int(memory_index_bytes),
+                "selected_key_item_indices": int(selected_key_index_bytes),
+                "selected_value_item_indices": int(selected_value_index_bytes),
+                "runtime_loaded": int(loaded_index_bytes),
+            },
             "nog_online_item_count": sum(1 for item in inventory if item["is_nog"]),
             "persistent_cache_bytes": int(persistent),
             "runtime_loaded_cache_bytes": int(loaded),
+            "runtime_loaded_scale_bytes": int(loaded_scales),
+            "runtime_gather_index_metadata_bytes": int(loaded_index_bytes),
         }
 
     def _summary(self, inventory, selective, traffic, suffix_layer_ids):
@@ -400,6 +506,9 @@ class GOFAQueryTraceExporter:
             "selected_KV_ratio": complete_accesses / denominator if denominator else 0.0,
             "persistent_cache_bytes": traffic["persistent_cache_bytes"],
             "runtime_loaded_cache_bytes": traffic["runtime_loaded_cache_bytes"],
+            "persistent_scale_bytes": traffic["scale_bytes"]["persistent_cache"],
+            "runtime_loaded_scale_bytes": traffic["runtime_loaded_scale_bytes"],
+            "runtime_gather_index_metadata_bytes": traffic["runtime_gather_index_metadata_bytes"],
         }
 
     def _logical_address_layout(self, inventory, alignment=64):
@@ -407,7 +516,7 @@ class GOFAQueryTraceExporter:
         offset = 0
         components = []
 
-        def append_component(item_index, component, size_bytes, layer_id=None):
+        def append_component(item_index, component, size_bytes, layer_id=None, storage_kind="data"):
             nonlocal offset
             size_bytes = int(size_bytes)
             if size_bytes <= 0:
@@ -419,6 +528,7 @@ class GOFAQueryTraceExporter:
                 "base_offset": int(offset),
                 "size_bytes": size_bytes,
                 "alignment_bytes": alignment,
+                "storage_kind": storage_kind,
             }
             if layer_id is not None:
                 entry["layer_id"] = int(layer_id)
@@ -433,6 +543,12 @@ class GOFAQueryTraceExporter:
                 "memory",
                 quantized_data_bytes(item["memory_shape"], item["memory_bits"]),
             )
+            append_component(
+                item["item_index"],
+                "memory",
+                quantized_scale_bytes(item["memory_shape"]),
+                storage_kind="scale",
+            )
             for layer in item["text_kv_shapes"]:
                 append_component(
                     item["item_index"],
@@ -442,9 +558,23 @@ class GOFAQueryTraceExporter:
                 )
                 append_component(
                     item["item_index"],
+                    "key",
+                    quantized_scale_bytes(layer["key_shape"]),
+                    layer["layer_id"],
+                    storage_kind="scale",
+                )
+                append_component(
+                    item["item_index"],
                     "value",
                     quantized_data_bytes(layer["value_shape"], item["value_bits"]),
                     layer["layer_id"],
+                )
+                append_component(
+                    item["item_index"],
+                    "value",
+                    quantized_scale_bytes(layer["value_shape"]),
+                    layer["layer_id"],
+                    storage_kind="scale",
                 )
         total_size = ((offset + alignment - 1) // alignment) * alignment if offset else 0
         return {
@@ -528,7 +658,7 @@ class GOFAQueryTraceExporter:
         return {
             "trace_format": TRACE_FORMAT,
             "trace_version": TRACE_VERSION,
-            "query_id": f"query_{self.next_query_id:06d}",
+            "query_id": f"query_{self.queries_written:06d}",
             "query_uid": stable_query_uid,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "repository_commit_sha": owner._trace_source_audit_repo_commit(),
@@ -589,6 +719,42 @@ class GOFAQueryTraceExporter:
             query_id = trace["query_id"]
             filename = f"{query_id}.json"
             output_path = os.path.join(self.config["output_dir"], filename)
+            if self.queries_written < len(self.resume_entries):
+                existing = self.resume_entries[self.queries_written]
+                expected_trace = existing["trace"]
+                expected_index = existing["index"]
+                comparisons = {
+                    "task": (trace["task_name"], expected_trace.get("task_name"), expected_index.get("task")),
+                    "split": (trace["split"], expected_trace.get("split"), expected_index.get("split")),
+                    "query_index": (
+                        trace["runtime_query_index"],
+                        expected_trace.get("runtime_query_index"),
+                        expected_index.get("query_index"),
+                    ),
+                    "graph_signature": (
+                        trace["graph_signature"],
+                        expected_trace.get("graph_signature"),
+                        expected_index.get("graph_signature"),
+                    ),
+                }
+                for field, values in comparisons.items():
+                    if len(set(values)) != 1:
+                        raise RuntimeError(
+                            "GOFA formal trace resume mismatch: "
+                            f"trace_order={self.queries_written}, field={field}, "
+                            f"runtime/trace/index={values}"
+                        )
+                if expected_trace.get("query_id") != query_id or expected_index.get("query_id") != query_id:
+                    raise RuntimeError(
+                        f"GOFA formal trace resume query_id mismatch at trace_order={self.queries_written}"
+                    )
+                self.queries_written += 1
+                print(
+                    "GOFA query trace resume verified: "
+                    f"query_id={query_id}, task={trace['task_name']}, split={trace['split']}, "
+                    f"path={existing['path']}"
+                )
+                return existing["path"]
             self._write_json_atomic(output_path, trace)
             graph = trace["query_graph_structure"]
             index_entry = {
@@ -606,12 +772,13 @@ class GOFAQueryTraceExporter:
                 "selected_K_items": len(trace["selective_kv_access"]["selected_key_item_indices"]),
                 "selected_V_items": len(trace["selective_kv_access"]["selected_value_item_indices"]),
                 "runtime_loaded_bytes": trace["summary"]["runtime_loaded_cache_bytes"],
+                "runtime_loaded_scale_bytes": trace["summary"]["runtime_loaded_scale_bytes"],
+                "runtime_gather_index_metadata_bytes": trace["summary"]["runtime_gather_index_metadata_bytes"],
             }
             with open(os.path.join(self.config["output_dir"], "trace_index.jsonl"), "a") as handle:
                 handle.write(json.dumps(index_entry, sort_keys=True, allow_nan=False) + "\n")
                 handle.flush()
             self.queries_written += 1
-            self.next_query_id += 1
             print(
                 "GOFA query trace written: "
                 f"query_id={query_id}, task={trace['task_name']}, split={trace['split']}, "

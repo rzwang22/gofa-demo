@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 "${SCRIPT_DIR}/large_workload_stage.py" --stage gpu "$@"
+python3 "${SCRIPT_DIR}/large_workload_gpu_runner.py" "$@"

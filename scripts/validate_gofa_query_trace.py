@@ -63,6 +63,12 @@ def _bytes(shape: list[int] | None, bits: int) -> int:
     return math.ceil(_numel(shape) * bits / 8)
 
 
+def _scale_bytes(shape: list[int] | None) -> int:
+    if not shape or _numel(shape) == 0:
+        return 0
+    return int(shape[-1]) * 4
+
+
 def _layer_shape(item: dict[str, Any], layer_id: int, component: str) -> list[int] | None:
     for layer in item.get("text_kv_shapes", []):
         if isinstance(layer, dict) and layer.get("layer_id") == layer_id:
@@ -263,19 +269,32 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
                 continue
             memory_size = _bytes(item.get("memory_shape"), int(item.get("memory_bits", MEMORY_BITS)))
             if memory_size:
-                expected_components.append((item.get("item_index"), "memory", None, memory_size))
+                expected_components.append((item.get("item_index"), "memory", None, "data", memory_size))
+            memory_scale_size = _scale_bytes(item.get("memory_shape"))
+            if memory_scale_size:
+                expected_components.append(
+                    (item.get("item_index"), "memory", None, "scale", memory_scale_size)
+                )
             for layer in item.get("text_kv_shapes", []):
                 if not isinstance(layer, dict):
                     continue
                 for component, bits in (("key", KEY_BITS), ("value", VALUE_BITS)):
                     size = _bytes(layer.get(f"{component}_shape"), int(item.get(f"{component}_bits", bits)))
                     if size:
-                        expected_components.append((item.get("item_index"), component, layer.get("layer_id"), size))
+                        expected_components.append(
+                            (item.get("item_index"), component, layer.get("layer_id"), "data", size)
+                        )
+                    scale_size = _scale_bytes(layer.get(f"{component}_shape"))
+                    if scale_size:
+                        expected_components.append(
+                            (item.get("item_index"), component, layer.get("layer_id"), "scale", scale_size)
+                        )
         actual_components = [
             (
                 component.get("item_index"),
                 component.get("component"),
                 component.get("layer_id"),
+                component.get("storage_kind"),
                 component.get("size_bytes"),
             )
             for component in (components or [])
@@ -309,6 +328,10 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
         require(item.get("value_bits") == VALUE_BITS, f"inventory[{expected_index}] value_bits must be 2")
         require(_valid_shape(item.get("memory_shape")), f"inventory[{expected_index}] invalid memory_shape")
         require(
+            item.get("memory_scale_shape") == [model.get("hidden_size")],
+            f"inventory[{expected_index}] memory_scale_shape mismatch",
+        )
+        require(
             item.get("memory_shape") == [model.get("mem_size"), model.get("hidden_size")],
             f"inventory[{expected_index}] memory_shape does not match model dimensions",
         )
@@ -331,6 +354,14 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
                 expected_kv_shape = [model.get("num_key_value_heads"), item.get("text_length"), model.get("head_dim")]
                 require(layer.get("key_shape") == expected_kv_shape, f"inventory[{expected_index}] key shape mismatch")
                 require(layer.get("value_shape") == expected_kv_shape, f"inventory[{expected_index}] value shape mismatch")
+                require(
+                    layer.get("key_scale_shape") == [model.get("head_dim")],
+                    f"inventory[{expected_index}] key scale shape mismatch",
+                )
+                require(
+                    layer.get("value_scale_shape") == [model.get("head_dim")],
+                    f"inventory[{expected_index}] value scale shape mismatch",
+                )
     _check_no_cache_payload(inventory, errors)
     if isinstance(question_indices, list) and len(question_indices) == 1 and isinstance(node_map, list):
         question_index = question_indices[0]
@@ -455,11 +486,18 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
     memory_bytes = sum(_bytes(item.get("memory_shape"), MEMORY_BITS) for item in inventory if item.get("cache_eligible"))
     full_key_bytes = 0
     full_value_bytes = 0
+    memory_scale_bytes = sum(
+        _scale_bytes(item.get("memory_shape")) for item in inventory if item.get("cache_eligible")
+    )
+    full_key_scale_bytes = 0
+    full_value_scale_bytes = 0
     edge_cache_bytes = 0
+    edge_cache_scale_bytes = 0
     for item in inventory:
         if not item.get("cache_eligible"):
             continue
         item_bytes = _bytes(item.get("memory_shape"), MEMORY_BITS)
+        item_scale_bytes = _scale_bytes(item.get("memory_shape"))
         for layer in item.get("text_kv_shapes", []):
             if not isinstance(layer, dict):
                 continue
@@ -467,9 +505,15 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
             value_bytes = _bytes(layer.get("value_shape"), VALUE_BITS)
             full_key_bytes += key_bytes
             full_value_bytes += value_bytes
+            key_scale_bytes = _scale_bytes(layer.get("key_shape"))
+            value_scale_bytes = _scale_bytes(layer.get("value_shape"))
+            full_key_scale_bytes += key_scale_bytes
+            full_value_scale_bytes += value_scale_bytes
             item_bytes += key_bytes + value_bytes
+            item_scale_bytes += key_scale_bytes + value_scale_bytes
         if item.get("item_type") == "edge":
             edge_cache_bytes += item_bytes
+            edge_cache_scale_bytes += item_scale_bytes
     selected_key_bytes = sum(
         _bytes(_layer_shape(inventory_by_index[index], int(layer_id), "key"), KEY_BITS)
         for layer_id, indices in by_key.items()
@@ -482,6 +526,29 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
         for index in indices
         if index in inventory_by_index
     ) if valid_value_layers else 0
+    selected_key_scale_bytes = sum(
+        _scale_bytes(_layer_shape(inventory_by_index[index], int(layer_id), "key"))
+        for layer_id, indices in by_key.items()
+        for index in indices
+        if index in inventory_by_index
+    ) if valid_key_layers else 0
+    selected_value_scale_bytes = sum(
+        _scale_bytes(_layer_shape(inventory_by_index[index], int(layer_id), "value"))
+        for layer_id, indices in by_value.items()
+        for index in indices
+        if index in inventory_by_index
+    ) if valid_value_layers else 0
+    key_access_count = sum(len(values) for values in by_key.values()) if valid_key_layers else 0
+    value_access_count = sum(len(values) for values in by_value.values()) if valid_value_layers else 0
+    persistent_data_bytes = memory_bytes + full_key_bytes + full_value_bytes
+    runtime_data_bytes = memory_bytes + selected_key_bytes + selected_value_bytes
+    persistent_scale_bytes = memory_scale_bytes + full_key_scale_bytes + full_value_scale_bytes
+    runtime_scale_bytes = memory_scale_bytes + selected_key_scale_bytes + selected_value_scale_bytes
+    bytes_per_index = 4
+    memory_index_bytes = len(eligible) * bytes_per_index
+    selected_key_index_bytes = key_access_count * bytes_per_index
+    selected_value_index_bytes = value_access_count * bytes_per_index
+    runtime_index_bytes = memory_index_bytes + selected_key_index_bytes + selected_value_index_bytes
     traffic = trace.get("traffic_metadata", {})
     expected_traffic = {
         "memory_cache_bytes": memory_bytes,
@@ -491,12 +558,52 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
         "full_value_bytes": full_value_bytes,
         "edge_cache_bytes": edge_cache_bytes,
         "nog_online_item_count": len(nog_indices),
-        "persistent_cache_bytes": memory_bytes + full_key_bytes + full_value_bytes,
-        "runtime_loaded_cache_bytes": memory_bytes + selected_key_bytes + selected_value_bytes,
+        "persistent_cache_bytes": persistent_data_bytes,
+        "runtime_loaded_cache_bytes": runtime_data_bytes,
+        "runtime_loaded_scale_bytes": runtime_scale_bytes,
+        "runtime_gather_index_metadata_bytes": runtime_index_bytes,
     }
-    require(traffic.get("byte_accounting") == "quantized_data_only_excluding_scale_and_container_metadata", "traffic byte accounting mode mismatch")
+    require(
+        traffic.get("byte_accounting") == "separate_quantized_data_fp32_scale_and_uint32_gather_index",
+        "traffic byte accounting mode mismatch",
+    )
     for key, expected in expected_traffic.items():
         require(traffic.get(key) == expected, f"traffic_metadata.{key}={traffic.get(key)} expected {expected}")
+    expected_data = {
+        "memory_cache": memory_bytes,
+        "selected_key": selected_key_bytes,
+        "selected_value": selected_value_bytes,
+        "full_key": full_key_bytes,
+        "full_value": full_value_bytes,
+        "edge_cache": edge_cache_bytes,
+        "persistent_cache": persistent_data_bytes,
+        "runtime_loaded": runtime_data_bytes,
+    }
+    expected_scales = {
+        "dtype": "float32",
+        "memory_cache": memory_scale_bytes,
+        "selected_key": selected_key_scale_bytes,
+        "selected_value": selected_value_scale_bytes,
+        "full_key": full_key_scale_bytes,
+        "full_value": full_value_scale_bytes,
+        "edge_cache": edge_cache_scale_bytes,
+        "persistent_cache": persistent_scale_bytes,
+        "runtime_loaded": runtime_scale_bytes,
+    }
+    expected_indices = {
+        "index_dtype": "uint32",
+        "bytes_per_index": bytes_per_index,
+        "memory_item_indices": memory_index_bytes,
+        "selected_key_item_indices": selected_key_index_bytes,
+        "selected_value_item_indices": selected_value_index_bytes,
+        "runtime_loaded": runtime_index_bytes,
+    }
+    require(traffic.get("logical_data_bytes") == expected_data, "logical data byte category mismatch")
+    require(traffic.get("scale_bytes") == expected_scales, "scale byte category mismatch")
+    require(
+        traffic.get("gather_index_metadata_bytes") == expected_indices,
+        "gather/index metadata byte category mismatch",
+    )
 
     summary = trace.get("summary", {})
     require(summary.get("total_item_count") == total_items, "summary total item count mismatch")
@@ -505,9 +612,13 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
     require(summary.get("selection_ratio_basis") == "cacheable_item_layer_accesses", "summary selection ratio basis mismatch")
     require(summary.get("persistent_cache_bytes") == expected_traffic["persistent_cache_bytes"], "summary persistent bytes mismatch")
     require(summary.get("runtime_loaded_cache_bytes") == expected_traffic["runtime_loaded_cache_bytes"], "summary loaded bytes mismatch")
+    require(summary.get("persistent_scale_bytes") == persistent_scale_bytes, "summary persistent scale bytes mismatch")
+    require(summary.get("runtime_loaded_scale_bytes") == runtime_scale_bytes, "summary runtime scale bytes mismatch")
+    require(
+        summary.get("runtime_gather_index_metadata_bytes") == runtime_index_bytes,
+        "summary runtime gather/index bytes mismatch",
+    )
     denominator = len(eligible) * len(suffix_layers)
-    key_access_count = sum(len(values) for values in by_key.values()) if valid_key_layers else 0
-    value_access_count = sum(len(values) for values in by_value.values()) if valid_value_layers else 0
     complete_access_count = sum(
         len(set(by_key.get(str(layer_id), [])) & set(by_value.get(str(layer_id), [])))
         for layer_id in suffix_layers
@@ -569,6 +680,8 @@ def _validate_index(directory: Path, traces: dict[str, dict[str, Any]]) -> list[
             "selected_K_items": len(trace["selective_kv_access"]["selected_key_item_indices"]),
             "selected_V_items": len(trace["selective_kv_access"]["selected_value_item_indices"]),
             "runtime_loaded_bytes": trace["summary"]["runtime_loaded_cache_bytes"],
+            "runtime_loaded_scale_bytes": trace["summary"]["runtime_loaded_scale_bytes"],
+            "runtime_gather_index_metadata_bytes": trace["summary"]["runtime_gather_index_metadata_bytes"],
         }
         for key, value in expected.items():
             if entry.get(key) != value:
