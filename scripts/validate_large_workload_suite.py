@@ -5,9 +5,14 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from large_workload_common import PROFILE_MODES, add_common_arguments, load_locked_suite
-from validate_gofa_query_trace import validate_trace
-from validate_h100_per_query_latency import load_csv_rows, validate_rows
+try:
+    from .large_workload_common import PROFILE_MODES, add_common_arguments, load_locked_suite
+    from .validate_gofa_query_trace import validate_trace
+    from .validate_h100_per_query_latency import load_csv_rows, validate_rows
+except ImportError:
+    from large_workload_common import PROFILE_MODES, add_common_arguments, load_locked_suite
+    from validate_gofa_query_trace import validate_trace
+    from validate_h100_per_query_latency import load_csv_rows, validate_rows
 
 
 def _load_suite(args):

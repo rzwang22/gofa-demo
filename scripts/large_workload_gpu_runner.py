@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -152,6 +153,32 @@ def _terminate_process_group(process):
         process.wait()
 
 
+def archive_contaminated_log(log_path, timestamp=None):
+    log_path = Path(log_path)
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = log_path.with_name(f"{log_path.stem}.contaminated_{timestamp}{log_path.suffix}")
+    collision = 1
+    while candidate.exists():
+        candidate = log_path.with_name(
+            f"{log_path.stem}.contaminated_{timestamp}_{collision}{log_path.suffix}"
+        )
+        collision += 1
+    log_path.replace(candidate)
+    return candidate
+
+
+def archive_existing_contaminated_log(log_path):
+    log_path = Path(log_path)
+    if not log_path.is_file():
+        return None
+    with log_path.open("rb") as handle:
+        handle.seek(max(log_path.stat().st_size - 65536, 0))
+        tail = handle.read()
+    if b"CONTAMINATED" not in tail:
+        return None
+    return archive_contaminated_log(log_path)
+
+
 def run_rep_transaction(
     command,
     csv_path,
@@ -170,6 +197,7 @@ def run_rep_transaction(
     original_size = csv_path.stat().st_size if csv_path.exists() else 0
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_existing_contaminated_log(log_path)
     contaminated = False
     with log_path.open("w") as log_handle:
         log_handle.write(f"command={command!r}\n")
@@ -198,9 +226,16 @@ def run_rep_transaction(
             if return_code != 0:
                 raise RuntimeError(f"GPU repetition exited with code {return_code}; log={log_path}")
             verify_complete()
-        except Exception:
+        except Exception as exc:
             _terminate_process_group(process)
             _rollback_csv(csv_path, original_size)
+            if contaminated:
+                log_handle.flush()
+                archived_log = archive_contaminated_log(log_path)
+                raise RuntimeError(
+                    "GPU repetition contaminated by multiple compute processes; "
+                    f"audit_log={archived_log}"
+                ) from exc
             raise
     return log_path
 

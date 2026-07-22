@@ -169,6 +169,8 @@ def _base_config(args, profile, task, from_saved=True):
         "seed": profile["seed"],
         "batch_size": 1,
         "eval_sample_size": samples,
+        "sample_size_per_task": samples,
+        "train_sample_size": -1,
         "skip_validation": False,
         "task_names": [task],
         "train_task_names": [task],

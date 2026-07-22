@@ -107,6 +107,8 @@ class LargeWorkloadProfileTest(unittest.TestCase):
                     self.assertEqual(config["eval_task_names"], [task])
                     self.assertEqual(config["ways"], ways)
                     self.assertEqual(config["inf_ways"], [ways])
+                    self.assertEqual(config["sample_size_per_task"], 100)
+                    self.assertEqual(config["train_sample_size"], -1)
                     self.assertTrue(config["load_model"])
                     self.assertTrue(config["load_dir"])
                     self.assertTrue(config["data_root_path"])

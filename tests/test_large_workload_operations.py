@@ -13,7 +13,13 @@ from scripts.large_workload_trace_state import (
     prepare_formal_trace_outputs,
     validate_resume_trace_directory,
 )
-from scripts.summarize_large_workload_suite import TIME_FIELDS, aggregate_per_query_medians
+from scripts.package_large_simulator_handoff import validate_handoff_artifacts
+from scripts.summarize_large_workload_suite import (
+    DETERMINISTIC_FIELDS,
+    TIME_FIELDS,
+    aggregate_per_query_medians,
+    load_suite_latency_rows,
+)
 
 
 class FormalTraceStateTest(unittest.TestCase):
@@ -78,6 +84,31 @@ class FormalTraceStateTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "graph_signature mismatch"):
                 validate_resume_trace_directory(trace_dir, "cora_node", 2)
 
+    def test_resume_treats_not_started_task_as_new(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = self._manifest(root)
+            state = prepare_formal_trace_outputs(manifest, resume=True)
+            self.assertEqual(state["cora_node"]["action"], "new")
+            self.assertEqual(state["cora_node"]["existing_entries"], 0)
+
+    def test_resume_rejects_partial_directory_without_index(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = self._manifest(root)
+            trace_dir = Path(manifest["paths"]["traces"]) / "cora_node_formal_v1"
+            trace_dir.mkdir(parents=True)
+            (trace_dir / "query_000000.json").write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "requires an existing trace index"):
+                prepare_formal_trace_outputs(manifest, resume=True)
+
+    def test_resume_rejects_empty_index(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = self._manifest(root)
+            trace_dir = Path(manifest["paths"]["traces"]) / "cora_node_formal_v1"
+            trace_dir.mkdir(parents=True)
+            (trace_dir / "trace_index.jsonl").touch()
+            with self.assertRaisesRegex(RuntimeError, "index is empty"):
+                prepare_formal_trace_outputs(manifest, resume=True)
+
 
 class GPUTransactionTest(unittest.TestCase):
     def test_contamination_rolls_back_csv_and_preserves_log(self):
@@ -122,7 +153,31 @@ class GPUTransactionTest(unittest.TestCase):
                     sleep=lambda _seconds: None,
                 )
             self.assertEqual(csv_path.read_bytes(), original)
-            self.assertIn("CONTAMINATED", log_path.read_text())
+            self.assertFalse(log_path.exists())
+            archived_logs = list(Path(root).glob("rep_001.contaminated_*.log"))
+            self.assertEqual(len(archived_logs), 1)
+            self.assertIn("CONTAMINATED", archived_logs[0].read_text())
+
+            class SuccessfulProcess:
+                pid = 99999998
+
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            run_rep_transaction(
+                ["successful-command"],
+                csv_path,
+                log_path,
+                verify_complete=lambda: None,
+                query_pids=lambda: [],
+                popen_factory=lambda *_args, **_kwargs: SuccessfulProcess(),
+                sleep=lambda _seconds: None,
+            )
+            self.assertTrue(log_path.exists())
+            self.assertEqual(len(list(Path(root).glob("rep_001.contaminated_*.log"))), 1)
 
     def _write_latency_fixture(self, root):
         trace_dir = Path(root) / "trace"
@@ -216,11 +271,68 @@ class MedianSummaryTest(unittest.TestCase):
                     "rep": str(rep),
                 }
                 row.update({field: str(value + query_index) for field in TIME_FIELDS})
+                row.update({field: str(query_index + 10) for field in DETERMINISTIC_FIELDS})
                 rows.append(row)
         medians = aggregate_per_query_medians(rows, expected_reps=3)
         self.assertEqual(len(medians), 2)
         self.assertEqual(medians[0]["query_wall_ms"], 3.0)
         self.assertEqual(medians[1]["query_wall_ms"], 4.0)
+        self.assertEqual(medians[0]["logical_memory_loaded_bytes"], 10)
+
+    def test_rejects_nondeterministic_counter_across_reps(self):
+        rows = []
+        for rep in range(3):
+            row = {
+                "task": "cora_node",
+                "profile_mode": "cache_w8a8_m4k2v2",
+                "split": "val",
+                "query_uid": "uid-0",
+                "trace_order": "0",
+                "query_index": "0",
+                "workload_profile": "profile",
+                "graph_signature": "sig-0",
+                "rep": str(rep),
+            }
+            row.update({field: "1.0" for field in TIME_FIELDS})
+            row.update({field: "10" for field in DETERMINISTIC_FIELDS})
+            row["cache_hits"] = str(10 + rep)
+            rows.append(row)
+        with self.assertRaisesRegex(RuntimeError, "cache_hits differs"):
+            aggregate_per_query_medians(rows, expected_reps=3)
+
+    def test_summary_requires_all_mode_task_csvs_by_default(self):
+        with tempfile.TemporaryDirectory() as root:
+            suite = {
+                "profile": {"samples_per_split": 1},
+                "reps": 3,
+                "tasks": ["cora_node"],
+                "paths": {"latency": str(Path(root) / "latency")},
+            }
+            with self.assertRaisesRegex(RuntimeError, "requires every mode/task"):
+                load_suite_latency_rows(suite, allow_partial=False)
+            rows, counts = load_suite_latency_rows(suite, allow_partial=True)
+            self.assertEqual(rows, [])
+            self.assertEqual(counts, {})
+
+
+class SimulatorHandoffValidationTest(unittest.TestCase):
+    def test_rejects_missing_handoff_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            suite = {
+                "profile": {"samples_per_split": 1},
+                "reps": 1,
+                "tasks": ["cora_node"],
+                "paths": {
+                    "root": str(root_path),
+                    "manifests": str(root_path / "manifests"),
+                    "traces": str(root_path / "traces"),
+                    "latency": str(root_path / "latency"),
+                    "summary": str(root_path / "summary"),
+                },
+            }
+            with self.assertRaisesRegex(RuntimeError, "expected 2 trace JSON files"):
+                validate_handoff_artifacts(suite)
 
 
 if __name__ == "__main__":

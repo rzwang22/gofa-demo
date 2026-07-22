@@ -25,6 +25,8 @@ COMMON=(
 
 The task-specific `ways` values are fixed to 7/2/3/10/40 for Cora node, Cora link, PubMed node, WikiCS, and Arxiv respectively. Every generated stage config explicitly loads `--load-dir`; it does not inherit dataset or checkpoint identity from `default_config.yaml`. Formal traces and the `cache_w8a8_m4k2v2` baseline use the same KV policy. The formal importance-aware profile is `target_1hop` with `--kv-target-hops 1`; use `--kv-policy all` only for an explicit all-KV comparison suite.
 
+All generated stages also set `sample_size_per_task` to the profile's samples-per-split value and set `train_sample_size: -1`. This is required because the current inference entry point still constructs the training task wrapper even though it does not train.
+
 `--data-root`, `--model-name-or-path`, and `--checkpoint-dir` must be existing directories. `--load-dir` must be an existing checkpoint file. The first preparation locks `suite_manifest.json` to the current Git commit, profile, ordered tasks, repetitions, runtime paths, and KV policy. Every later stage validates that identity. Use `--overwrite-suite` only when intentionally replacing the suite definition; it does not make old traces or latency rows compatible with the new identity.
 
 ## Pipeline
@@ -47,7 +49,7 @@ The task-specific `ways` values are fixed to 7/2/3/10/40 for Cora node, Cora lin
    python3 scripts/build_large_quant_cache.py "${COMMON[@]}" --execute
    ```
 
-4. Generate formal traces. Existing output is rejected by default. Use `--fresh` to remove each task's previous trace directory before rebuilding, or `--resume` to validate a complete continuous prefix and replay-check its task, split, query index, and graph signature before appending.
+4. Generate formal traces. Existing output is rejected by default. Use `--fresh` to remove each task's previous trace directory before rebuilding, or `--resume` to validate a complete continuous prefix and replay-check its task, split, query index, and graph signature before appending. Under `--resume`, a task with no directory or a completely empty directory starts as new; a nonempty directory without a valid, nonempty continuous index is rejected.
 
    ```bash
    scripts/generate_large_formal_traces.sh "${COMMON[@]}" --fresh --execute
@@ -55,7 +57,7 @@ The task-specific `ways` values are fixed to 7/2/3/10/40 for Cora node, Cora lin
    scripts/generate_large_formal_traces.sh "${COMMON[@]}" --resume --execute
    ```
 
-   Each trace keeps packed M4/K2/V2 logical data bytes, FP32 per-channel scale bytes, and uint32 gather/index metadata bytes in separate traffic categories. Scale or indexing overhead is never folded into the low-bit data byte count.
+   Each trace keeps packed M4/K2/V2 logical data bytes, FP32 per-channel scale bytes, and uint32 gather/index metadata bytes in separate traffic categories. Scale or indexing overhead is never folded into the low-bit data byte count. The logical address layout assigns aligned offsets to data, scales, memory item indices, and each suffix layer's selected K/V item-index arrays.
 
 5. Run `nocache_bf16`, `cache_bf16`, and `cache_w8a8_m4k2v2`. Repetitions append to each mode/task CSV.
 
@@ -63,7 +65,7 @@ The task-specific `ways` values are fixed to 7/2/3/10/40 for Cora node, Cora lin
    scripts/run_large_gpu_suite.sh "${COMMON[@]}" --execute
    ```
 
-   The GPU runner checks for an idle GPU before every repetition and polls compute PIDs once per second. Multiple compute processes terminate the current process group, roll the CSV back to its pre-repetition byte offset, and retain a contaminated log under `logs/gpu/`. Complete validated repetitions are skipped on restart; partial repetitions are removed and rerun.
+   The GPU runner checks for an idle GPU before every repetition and polls compute PIDs once per second. Multiple compute processes terminate the current process group, roll the CSV back to its pre-repetition byte offset, and archive an immutable `rep_NNN.contaminated_YYYYMMDD_HHMMSS.log` under `logs/gpu/`. Complete validated repetitions are skipped on restart; partial repetitions are removed and rerun.
 
 6. Validate, summarize, and package simulator inputs. The package intentionally excludes full and quantized cache tensors; formal traces provide logical addresses and byte traffic.
 
@@ -73,6 +75,8 @@ The task-specific `ways` values are fixed to 7/2/3/10/40 for Cora node, Cora lin
    python3 scripts/package_large_simulator_handoff.py "${COMMON[@]}"
    ```
 
-   The raw mode/task latency CSV remains unchanged at 600 rows for a three-repetition, 200-query task. Summarization first takes rep0/1/2 medians per `(mode, task, split, query_uid)`, writes `summary/per_query_median.csv`, then reports task-level mean/p50/p95 across the 200 unique query medians.
+   The raw mode/task latency CSV remains unchanged at 600 rows for a three-repetition, 200-query task. Summarization requires every mode/task CSV by default, checks deterministic bytes/counters across repetitions, writes them alongside timing medians in `summary/per_query_median.csv`, then reports task-level mean/p50/p95 across the 200 unique query medians. `--allow-partial` is available only for an explicit intermediate summary preview.
+
+   Simulator packaging always invokes the full suite validator and then checks every task manifest, all trace files, all mode/task latency CSVs, the JSON summary, and the median CSV. For the canonical five-task profile this means 15 latency CSVs, 1000 traces, 9000 raw rows, and 3000 per-query median rows. Missing artifacts are fatal and are never silently skipped.
 
 Without `--execute`, preparation/build/run entry points only emit auditable shell plans. Formal trace matching checks task, split, query index, stable query UID, graph signature, workload profile, and cache keys where a cache mode is active.

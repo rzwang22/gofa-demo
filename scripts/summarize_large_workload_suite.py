@@ -50,6 +50,18 @@ MEDIAN_IDENTITY_FIELDS = (
     "graph_signature",
 )
 
+DETERMINISTIC_FIELDS = (
+    "logical_memory_loaded_bytes",
+    "logical_key_loaded_bytes",
+    "logical_value_loaded_bytes",
+    "quant_kv_attention_calls",
+    "int_gemm_call_count",
+    "cache_hits",
+    "cache_misses",
+    "cache_skips",
+    "fallback_count",
+)
+
 
 def _percentile(values, probability):
     if not values:
@@ -96,6 +108,13 @@ def aggregate_per_query_medians(rows, expected_reps):
                 raise RuntimeError(f"Per-query identity field {field} differs across repetitions for {key}")
         output = {field: first[field] for field in MEDIAN_IDENTITY_FIELDS}
         output["rep_count"] = int(expected_reps)
+        for field in DETERMINISTIC_FIELDS:
+            values = [int(row[field]) for row in query_rows]
+            if len(set(values)) != 1:
+                raise RuntimeError(
+                    f"Deterministic field {field} differs across repetitions for {key}: {values}"
+                )
+            output[field] = values[0]
         for field in TIME_FIELDS:
             values = [float(row[field]) for row in query_rows]
             if any(not math.isfinite(value) or value < 0 for value in values):
@@ -125,7 +144,12 @@ def summarize_latency_medians(median_rows, raw_counts):
 
 def _write_median_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(MEDIAN_IDENTITY_FIELDS) + ["rep_count"] + list(TIME_FIELDS)
+    fieldnames = (
+        list(MEDIAN_IDENTITY_FIELDS)
+        + ["rep_count"]
+        + list(DETERMINISTIC_FIELDS)
+        + list(TIME_FIELDS)
+    )
     temporary = path.with_name(f"{path.name}.tmp")
     with temporary.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -134,12 +158,38 @@ def _write_median_csv(path, rows):
     temporary.replace(path)
 
 
-def main():
-    parser = add_common_arguments(argparse.ArgumentParser(description="Summarize a GOFA large-workload suite."))
-    args = parser.parse_args()
-    _manifest_path, suite = load_locked_suite(args)
+def load_suite_latency_rows(suite, allow_partial=False):
     all_rows = []
     raw_counts = {}
+    missing = []
+    expected_raw_rows = 2 * int(suite["profile"]["samples_per_split"]) * int(suite["reps"])
+    for task in suite["tasks"]:
+        for mode in PROFILE_MODES:
+            csv_path = Path(suite["paths"]["latency"]) / mode / f"{task}.csv"
+            if not csv_path.is_file():
+                missing.append(str(csv_path))
+                continue
+            with csv_path.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            if len(rows) != expected_raw_rows:
+                raise RuntimeError(
+                    f"{task}/{mode}: expected {expected_raw_rows} raw rows, got {len(rows)} in {csv_path}"
+                )
+            raw_counts[(task, mode)] = len(rows)
+            all_rows.extend(rows)
+    if missing and not allow_partial:
+        raise RuntimeError(
+            "Large-workload summary requires every mode/task latency CSV; missing: "
+            + ", ".join(missing)
+        )
+    return all_rows, raw_counts
+
+
+def main():
+    parser = add_common_arguments(argparse.ArgumentParser(description="Summarize a GOFA large-workload suite."))
+    parser.add_argument("--allow-partial", action="store_true")
+    args = parser.parse_args()
+    _manifest_path, suite = load_locked_suite(args)
     graph_summary = {}
     for task in suite["tasks"]:
         trace_dir = Path(suite["paths"]["traces"]) / f"{task}_formal_v1"
@@ -150,21 +200,18 @@ def main():
             nodes.append(int(trace["num_graph_nodes"]))
             edges.append(int(trace["num_structural_edges"]))
         graph_summary[task] = {"nodes": _stats(nodes), "edges": _stats(edges)}
-        for mode in PROFILE_MODES:
-            csv_path = Path(suite["paths"]["latency"]) / mode / f"{task}.csv"
-            if not csv_path.is_file():
-                continue
-            with csv_path.open(newline="") as handle:
-                rows = list(csv.DictReader(handle))
-            expected_raw_rows = 2 * int(suite["profile"]["samples_per_split"]) * int(suite["reps"])
-            if len(rows) != expected_raw_rows:
-                raise RuntimeError(
-                    f"{task}/{mode}: expected {expected_raw_rows} raw rows, got {len(rows)} in {csv_path}"
-                )
-            raw_counts[(task, mode)] = len(rows)
-            all_rows.extend(rows)
-
+    all_rows, raw_counts = load_suite_latency_rows(suite, allow_partial=args.allow_partial)
     medians = aggregate_per_query_medians(all_rows, suite["reps"])
+    expected_queries = 2 * int(suite["profile"]["samples_per_split"])
+    median_counts = defaultdict(int)
+    for row in medians:
+        median_counts[(row["task"], row["profile_mode"])] += 1
+    for key in raw_counts:
+        if median_counts[key] != expected_queries:
+            raise RuntimeError(
+                f"{key[0]}/{key[1]}: expected {expected_queries} per-query medians, "
+                f"got {median_counts[key]}"
+            )
     latency_summary = summarize_latency_medians(medians, raw_counts)
     result = {
         "summary_format": "gofa_large_workload_summary_v2",

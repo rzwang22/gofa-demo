@@ -179,7 +179,7 @@ def _synthetic_trace():
             "runtime_gather_index_metadata_bytes": 84,
         },
         "logical_address_layout": {
-            "address_space": "query_local_cache_bytes",
+            "address_space": "query_local_cache_and_gather_metadata_bytes",
             "alignment_bytes": 64,
             "total_size_bytes": 0,
             "components": [],
@@ -241,6 +241,28 @@ def _synthetic_trace():
                 entry["layer_id"] = layer_id
             components.append(entry)
             offset += size
+    metadata_entries = [("memory_item_indices", None, [0, 1, 3])]
+    metadata_entries.extend(
+        ("selected_key_item_indices", layer_id, [0, 3]) for layer_id in suffix_layers
+    )
+    metadata_entries.extend(
+        ("selected_value_item_indices", layer_id, [0]) for layer_id in suffix_layers
+    )
+    for component, layer_id, item_indices in metadata_entries:
+        offset = ((offset + 63) // 64) * 64
+        entry = {
+            "component": component,
+            "base_offset": offset,
+            "size_bytes": 4 * len(item_indices),
+            "alignment_bytes": 64,
+            "storage_kind": "gather_index_metadata",
+            "index_dtype": "uint32",
+            "item_indices": item_indices,
+        }
+        if layer_id is not None:
+            entry["layer_id"] = layer_id
+        components.append(entry)
+        offset += entry["size_bytes"]
     trace["logical_address_layout"]["components"] = components
     trace["logical_address_layout"]["total_size_bytes"] = ((offset + 63) // 64) * 64
     return trace
@@ -267,10 +289,18 @@ class GOFAQueryTraceTest(unittest.TestCase):
         self.assertEqual(task["NOG_online_count"]["total"], 2)
 
     def test_separates_data_scale_and_gather_index_bytes(self):
-        traffic = _synthetic_trace()["traffic_metadata"]
+        trace = _synthetic_trace()
+        traffic = trace["traffic_metadata"]
         self.assertEqual(traffic["logical_data_bytes"]["runtime_loaded"], 48)
         self.assertEqual(traffic["scale_bytes"]["runtime_loaded"], 336)
         self.assertEqual(traffic["gather_index_metadata_bytes"]["runtime_loaded"], 84)
+        metadata_components = [
+            component
+            for component in trace["logical_address_layout"]["components"]
+            if component["storage_kind"] == "gather_index_metadata"
+        ]
+        self.assertEqual(sum(component["size_bytes"] for component in metadata_components), 84)
+        self.assertTrue(all(component["base_offset"] % 64 == 0 for component in metadata_components))
 
     def test_resume_replays_and_verifies_existing_trace_without_rewriting(self):
         with tempfile.TemporaryDirectory() as root:

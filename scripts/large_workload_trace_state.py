@@ -29,6 +29,8 @@ def validate_resume_trace_directory(trace_dir, task, samples_per_split):
             if not isinstance(entry, dict):
                 raise RuntimeError(f"Trace index entry {line_number} is not an object: {index_path}")
             entries.append(entry)
+    if not entries:
+        raise RuntimeError(f"Formal trace resume index is empty: {index_path}")
 
     expected_names = [f"query_{index:06d}.json" for index in range(len(entries))]
     actual_names = [path.name for path in query_paths]
@@ -81,6 +83,7 @@ def prepare_formal_trace_outputs(manifest, fresh=False, resume=False, execute=Fa
     samples = int(manifest["profile"]["samples_per_split"])
     for task in manifest["tasks"]:
         trace_dir = Path(manifest["paths"]["traces"]) / f"{task}_formal_v1"
+        directory_is_empty = not trace_dir.exists() or not any(trace_dir.iterdir())
         index_exists = (trace_dir / "trace_index.jsonl").exists()
         query_exists = any(trace_dir.glob("query_*.json")) if trace_dir.exists() else False
         has_outputs = index_exists or query_exists
@@ -91,12 +94,19 @@ def prepare_formal_trace_outputs(manifest, fresh=False, resume=False, execute=Fa
             if execute:
                 trace_dir.mkdir(parents=True, exist_ok=True)
         elif resume:
-            entries = validate_resume_trace_directory(trace_dir, task, samples)
-            states[task] = {
-                "action": "resume",
-                "existing_entries": len(entries),
-                "trace_dir": str(trace_dir),
-            }
+            if directory_is_empty:
+                states[task] = {
+                    "action": "new",
+                    "existing_entries": 0,
+                    "trace_dir": str(trace_dir),
+                }
+            else:
+                entries = validate_resume_trace_directory(trace_dir, task, samples)
+                states[task] = {
+                    "action": "resume",
+                    "existing_entries": len(entries),
+                    "trace_dir": str(trace_dir),
+                }
         else:
             if has_outputs:
                 raise RuntimeError(

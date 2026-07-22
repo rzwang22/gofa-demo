@@ -29,12 +29,12 @@ def main():
             execute=args.execute,
         )
         for task in manifest["tasks"]:
+            state = states[task]
             config_path = Path(manifest["configs"][task]["formal_trace"])
             with config_path.open() as handle:
                 config = json.load(handle)
-            config["gofa_query_trace"]["resume"] = bool(args.resume)
+            config["gofa_query_trace"]["resume"] = state["action"] == "resume"
             write_json_yaml(config_path, config)
-            state = states[task]
             print(
                 f"formal_trace task={task} action={state['action']} "
                 f"existing_entries={state['existing_entries']} output_dir={state['trace_dir']}"

@@ -241,6 +241,10 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
 
     layout = trace.get("logical_address_layout")
     if isinstance(layout, dict):
+        require(
+            layout.get("address_space") == "query_local_cache_and_gather_metadata_bytes",
+            "logical layout address_space mismatch",
+        )
         alignment = layout.get("alignment_bytes")
         components = layout.get("components")
         require(isinstance(alignment, int) and alignment > 0, "logical layout alignment must be positive")
@@ -269,11 +273,11 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
                 continue
             memory_size = _bytes(item.get("memory_shape"), int(item.get("memory_bits", MEMORY_BITS)))
             if memory_size:
-                expected_components.append((item.get("item_index"), "memory", None, "data", memory_size))
+                expected_components.append((item.get("item_index"), "memory", None, "data", memory_size, None, None))
             memory_scale_size = _scale_bytes(item.get("memory_shape"))
             if memory_scale_size:
                 expected_components.append(
-                    (item.get("item_index"), "memory", None, "scale", memory_scale_size)
+                    (item.get("item_index"), "memory", None, "scale", memory_scale_size, None, None)
                 )
             for layer in item.get("text_kv_shapes", []):
                 if not isinstance(layer, dict):
@@ -282,13 +286,33 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
                     size = _bytes(layer.get(f"{component}_shape"), int(item.get(f"{component}_bits", bits)))
                     if size:
                         expected_components.append(
-                            (item.get("item_index"), component, layer.get("layer_id"), "data", size)
+                            (item.get("item_index"), component, layer.get("layer_id"), "data", size, None, None)
                         )
                     scale_size = _scale_bytes(layer.get(f"{component}_shape"))
                     if scale_size:
                         expected_components.append(
-                            (item.get("item_index"), component, layer.get("layer_id"), "scale", scale_size)
+                            (item.get("item_index"), component, layer.get("layer_id"), "scale", scale_size, None, None)
                         )
+        layout_access = trace.get("selective_kv_access", {})
+        layout_eligible = layout_access.get("eligible_item_indices", []) if isinstance(layout_access, dict) else []
+        layout_by_key = layout_access.get("effective_key_items_by_layer", {}) if isinstance(layout_access, dict) else {}
+        layout_by_value = layout_access.get("effective_value_items_by_layer", {}) if isinstance(layout_access, dict) else {}
+        if layout_eligible:
+            expected_components.append(
+                (None, "memory_item_indices", None, "gather_index_metadata", 4 * len(layout_eligible), "uint32", layout_eligible)
+            )
+        for layer_id in suffix_layers:
+            indices = layout_by_key.get(str(layer_id), []) if isinstance(layout_by_key, dict) else []
+            if indices:
+                expected_components.append(
+                    (None, "selected_key_item_indices", layer_id, "gather_index_metadata", 4 * len(indices), "uint32", indices)
+                )
+        for layer_id in suffix_layers:
+            indices = layout_by_value.get(str(layer_id), []) if isinstance(layout_by_value, dict) else []
+            if indices:
+                expected_components.append(
+                    (None, "selected_value_item_indices", layer_id, "gather_index_metadata", 4 * len(indices), "uint32", indices)
+                )
         actual_components = [
             (
                 component.get("item_index"),
@@ -296,13 +320,15 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
                 component.get("layer_id"),
                 component.get("storage_kind"),
                 component.get("size_bytes"),
+                component.get("index_dtype"),
+                component.get("item_indices"),
             )
             for component in (components or [])
             if isinstance(component, dict)
         ]
         require(
             actual_components == expected_components,
-            "logical layout must contain every cacheable memory/K/V component in inventory order",
+            "logical layout must contain every cache data/scale and gather/index component in order",
         )
 
     inventory_by_index: dict[int, dict[str, Any]] = {}

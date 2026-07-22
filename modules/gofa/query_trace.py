@@ -511,27 +511,38 @@ class GOFAQueryTraceExporter:
             "runtime_gather_index_metadata_bytes": traffic["runtime_gather_index_metadata_bytes"],
         }
 
-    def _logical_address_layout(self, inventory, alignment=64):
+    def _logical_address_layout(self, inventory, selective, suffix_layer_ids, alignment=64):
         alignment = int(alignment)
         offset = 0
         components = []
 
-        def append_component(item_index, component, size_bytes, layer_id=None, storage_kind="data"):
+        def append_component(
+            item_index,
+            component,
+            size_bytes,
+            layer_id=None,
+            storage_kind="data",
+            item_indices=None,
+        ):
             nonlocal offset
             size_bytes = int(size_bytes)
             if size_bytes <= 0:
                 return
             offset = ((offset + alignment - 1) // alignment) * alignment
             entry = {
-                "item_index": int(item_index),
                 "component": component,
                 "base_offset": int(offset),
                 "size_bytes": size_bytes,
                 "alignment_bytes": alignment,
                 "storage_kind": storage_kind,
             }
+            if item_index is not None:
+                entry["item_index"] = int(item_index)
             if layer_id is not None:
                 entry["layer_id"] = int(layer_id)
+            if item_indices is not None:
+                entry["index_dtype"] = "uint32"
+                entry["item_indices"] = [int(index) for index in item_indices]
             components.append(entry)
             offset += size_bytes
 
@@ -576,9 +587,36 @@ class GOFAQueryTraceExporter:
                     layer["layer_id"],
                     storage_kind="scale",
                 )
+        append_component(
+            None,
+            "memory_item_indices",
+            4 * len(selective["eligible_item_indices"]),
+            storage_kind="gather_index_metadata",
+            item_indices=selective["eligible_item_indices"],
+        )
+        for layer_id in suffix_layer_ids:
+            indices = selective["effective_key_items_by_layer"][str(layer_id)]
+            append_component(
+                None,
+                "selected_key_item_indices",
+                4 * len(indices),
+                layer_id=layer_id,
+                storage_kind="gather_index_metadata",
+                item_indices=indices,
+            )
+        for layer_id in suffix_layer_ids:
+            indices = selective["effective_value_items_by_layer"][str(layer_id)]
+            append_component(
+                None,
+                "selected_value_item_indices",
+                4 * len(indices),
+                layer_id=layer_id,
+                storage_kind="gather_index_metadata",
+                item_indices=indices,
+            )
         total_size = ((offset + alignment - 1) // alignment) * alignment if offset else 0
         return {
-            "address_space": "query_local_cache_bytes",
+            "address_space": "query_local_cache_and_gather_metadata_bytes",
             "alignment_bytes": alignment,
             "total_size_bytes": int(total_size),
             "components": components,
@@ -654,7 +692,7 @@ class GOFAQueryTraceExporter:
             runtime_query_index,
             signature,
         )
-        logical_layout = self._logical_address_layout(inventory)
+        logical_layout = self._logical_address_layout(inventory, selective, suffix_layer_ids)
         return {
             "trace_format": TRACE_FORMAT,
             "trace_version": TRACE_VERSION,
