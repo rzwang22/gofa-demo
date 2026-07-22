@@ -1072,6 +1072,7 @@ class GOFAMistralModel(MistralModel):
         hidden_states = decoder_layer.input_layernorm(hidden_states)
         self._stage_profile_add("memory_kv_input_norm_s", norm_start, hidden_states, g_layer_idx)
 
+        attention_latency_event = self._per_query_detail_event_start("attention", hidden_states)
         attn_output, self_attn_weights, present_key_value = self._memory_kv_attention_breakdown(
             decoder_layer.self_attn,
             hidden_states,
@@ -1086,6 +1087,7 @@ class GOFAMistralModel(MistralModel):
             trace_runtime_item_index=trace_runtime_item_index,
             trace_source_item_index=trace_source_item_index,
         )
+        self._per_query_detail_event_end(attention_latency_event, attn_output)
         hidden_states = residual + attn_output
 
         residual = hidden_states
@@ -1095,7 +1097,9 @@ class GOFAMistralModel(MistralModel):
 
         mlp_start = self._stage_profile_start(hidden_states)
         mlp_input = hidden_states
+        dense_fc_latency_event = self._per_query_detail_event_start("dense_fc", hidden_states)
         hidden_states = decoder_layer.mlp(hidden_states)
+        self._per_query_detail_event_end(dense_fc_latency_event, hidden_states)
         self._record_query_trace_item_shapes(
             trace_layer_id,
             trace_runtime_item_index,
@@ -1315,7 +1319,7 @@ class GOFAMistralModel(MistralModel):
                         trace_source_item_index=item_order[item_idx],
                     )
                 else:
-                    layer_outputs = self.llm_forward(
+                    layer_outputs = self._llm_forward_with_latency(
                         decoder_layer,
                         mem_hidden_states,
                         causal_mask,
@@ -1363,21 +1367,23 @@ class GOFAMistralModel(MistralModel):
 
         self._stage_profile_increment("encoder_prefix_calls")
         prefix_start = self._stage_profile_start(hidden_states)
+        prefix_latency_event = self._per_query_detail_event_start("prefix_transformer", hidden_states)
         for decoder_layer in self.layers[:self.gnn_start_layer]:
             if partial_grad:
                 with torch.no_grad():
-                    layer_outputs = self.llm_forward(
+                    layer_outputs = self._llm_forward_with_latency(
                         decoder_layer, hidden_states, causal_mask, position_ids, None, output_attentions,
                         False, cache_position, position_embeddings, flash_attn_kwargs
                     )
             else:
-                layer_outputs = self.llm_forward(
+                layer_outputs = self._llm_forward_with_latency(
                     decoder_layer, hidden_states, causal_mask, position_ids, None, output_attentions,
                     False, cache_position, position_embeddings, flash_attn_kwargs
                 )
             hidden_states = layer_outputs[0]
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+        self._per_query_detail_event_end(prefix_latency_event, hidden_states)
         self._stage_profile_add("encoder_prefix_transformer_s", prefix_start, hidden_states)
 
         output = BaseModelOutputWithPast(
@@ -1553,6 +1559,10 @@ class GOFAMistralModel(MistralModel):
         if graph is not None:
             self._stage_profile_increment("encoder_full_calls")
         prefix_start = self._stage_profile_start(hidden_states) if graph is not None else None
+        prefix_latency_event = (
+            self._per_query_detail_event_start("prefix_transformer", hidden_states)
+            if graph is not None else None
+        )
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1560,8 +1570,11 @@ class GOFAMistralModel(MistralModel):
             if g_layer_idx >= 0 and graph is not None:
                 if g_layer_idx == 0:
                     self._stage_profile_add("encoder_prefix_transformer_s", prefix_start, hidden_states)
+                    self._per_query_detail_event_end(prefix_latency_event, hidden_states)
+                    prefix_latency_event = None
                     prefix_start = None
                 gnn_start = self._stage_profile_start(hidden_states)
+                gnn_latency_event = self._per_query_latency_event_start(hidden_states)
                 if g_layer_idx == 0 and map_node:
                     hidden_states = torch.cat(
                         [hidden_states[:cur_node_size][graph.node_map], hidden_states[cur_node_size:]], dim=0)
@@ -1574,28 +1587,48 @@ class GOFAMistralModel(MistralModel):
                 gnn_input = mem_repr[:cur_node_size]
                 gnn_edge_input = mem_repr[cur_node_size:][graph.edge_map]
 
-                output = self.g_layers[g_layer_idx](gnn_input, graph.edge_index, gnn_edge_input)
+                gnn_layer = self.g_layers[g_layer_idx]
+                if hasattr(gnn_layer, "set_per_query_latency_recorder"):
+                    gnn_layer.set_per_query_latency_recorder(
+                        self if self._per_query_detail_event_enabled() else None
+                    )
+                try:
+                    output = gnn_layer(gnn_input, graph.edge_index, gnn_edge_input)
+                finally:
+                    if hasattr(gnn_layer, "set_per_query_latency_recorder"):
+                        gnn_layer.set_per_query_latency_recorder(None)
                 output = torch.cat([output, mem_repr[cur_node_size:]], dim=0)
                 gnn_output = torch.zeros_like(hidden_states, dtype=output.dtype)
                 gnn_output[mem_mask] = output.view(-1, output.size()[-1])
                 hidden_states = hidden_states * torch.logical_not(mem_mask).unsqueeze(2) + gnn_output
                 hidden_states = hidden_states.to(self.gofa_config.llama_dtype)
                 self._stage_profile_add("encoder_gnn_layer_s", gnn_start, hidden_states, g_layer_idx)
+                self._per_query_latency_event_end("gnn", gnn_latency_event, hidden_states)
             llm_start = self._stage_profile_start(hidden_states) if g_layer_idx >= 0 and graph is not None else None
+            transformer_latency_event = (
+                self._per_query_latency_event_start(hidden_states)
+                if g_layer_idx >= 0 and graph is not None else None
+            )
+            encoder_llm_forward = self._llm_forward_with_latency if graph is not None else self.llm_forward
             if g_layer_idx < 0 and partial_grad:
                 with torch.no_grad():
-                    layer_outputs = self.llm_forward(decoder_layer, hidden_states, causal_mask, position_ids, past_key_values, output_attentions, use_cache, cache_position, position_embeddings, flash_attn_kwargs)
+                    layer_outputs = encoder_llm_forward(decoder_layer, hidden_states, causal_mask, position_ids, past_key_values, output_attentions, use_cache, cache_position, position_embeddings, flash_attn_kwargs)
             else:
-                layer_outputs = self.llm_forward(decoder_layer, hidden_states, causal_mask, position_ids,
-                                                 past_key_values, output_attentions, use_cache, cache_position,
-                                                 position_embeddings, flash_attn_kwargs)
+                layer_outputs = encoder_llm_forward(
+                    decoder_layer, hidden_states, causal_mask, position_ids,
+                    past_key_values, output_attentions, use_cache, cache_position,
+                    position_embeddings, flash_attn_kwargs,
+                )
 
             hidden_states = layer_outputs[0]
             if g_layer_idx >= 0 and graph is not None:
                 self._stage_profile_add("encoder_suffix_transformer_layer_s", llm_start, hidden_states, g_layer_idx)
+                self._per_query_latency_event_end("transformer", transformer_latency_event, hidden_states)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+        self._per_query_detail_event_end(prefix_latency_event, hidden_states)
 
         norm_start = self._stage_profile_start(hidden_states) if graph is not None else None
         hidden_states = self.norm(hidden_states)
@@ -1622,6 +1655,64 @@ class GOFAMistralModel(MistralModel):
                 past_key_value=past_key_values, output_attentions=output_attentions, use_cache=use_cache,
                 cache_position=cache_position, position_embeddings=position_embeddings, **flash_attn_kwargs, )
         return layer_outputs
+
+    def _llm_forward_with_latency(
+        self,
+        decoder_layer,
+        hidden_states,
+        causal_mask,
+        position_ids,
+        past_key_values,
+        output_attentions,
+        use_cache,
+        cache_position,
+        position_embeddings,
+        flash_attn_kwargs,
+    ):
+        if not self._per_query_detail_event_enabled():
+            return self.llm_forward(
+                decoder_layer, hidden_states, causal_mask, position_ids, past_key_values,
+                output_attentions, use_cache, cache_position, position_embeddings, flash_attn_kwargs,
+            )
+
+        active_tokens = {"attention": [], "dense_fc": []}
+
+        def first_tensor(value):
+            if isinstance(value, torch.Tensor):
+                return value
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    found = first_tensor(item)
+                    if found is not None:
+                        return found
+            return None
+
+        def pre_hook(category):
+            def start_event(_module, args):
+                token = self._per_query_detail_event_start(category, first_tensor(args))
+                active_tokens[category].append(token)
+            return start_event
+
+        def post_hook(category):
+            def end_event(_module, _args, output):
+                token = active_tokens[category].pop() if active_tokens[category] else None
+                self._per_query_detail_event_end(token, first_tensor(output))
+            return end_event
+
+        handles = [
+            decoder_layer.self_attn.register_forward_pre_hook(pre_hook("attention")),
+            decoder_layer.self_attn.register_forward_hook(post_hook("attention")),
+            decoder_layer.mlp.register_forward_pre_hook(pre_hook("dense_fc")),
+            decoder_layer.mlp.register_forward_hook(post_hook("dense_fc")),
+        ]
+        try:
+            return self.llm_forward(
+                decoder_layer, hidden_states, causal_mask, position_ids, past_key_values,
+                output_attentions, use_cache, cache_position, position_embeddings, flash_attn_kwargs,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
 
 
 

@@ -16,9 +16,14 @@ from modules.gofa.weight_quant import (
     _module_weight,
     _resolve_submodule,
 )
+from modules.gofa.int_gemm_backend import (
+    SUPPORTED_INT_GEMM_WEIGHT_BITS,
+    execute_int_mm,
+    normalize_weight_bits,
+    weight_qmax,
+)
 
 
-SUPPORTED_INT_GEMM_WEIGHT_BITS = {4}
 SUPPORTED_INT_GEMM_ACTIVATION_BITS = {8}
 SUPPORTED_INT_GEMM_BACKENDS = {"torch_int_mm"}
 TORCH_INT_MM_M_ALIGNMENT = 32
@@ -39,10 +44,7 @@ class IntGemmQuantizedModule:
 
 
 def _normalize_weight_bits(bits: int) -> int:
-    bits = int(bits)
-    if bits not in SUPPORTED_INT_GEMM_WEIGHT_BITS:
-        raise ValueError("scheme_b_int_gemm.weight_bits currently supports only 4.")
-    return bits
+    return normalize_weight_bits(bits)
 
 
 def _normalize_activation_bits(bits: int) -> int:
@@ -66,14 +68,21 @@ def _linear_bias(module: nn.Module) -> Optional[torch.Tensor]:
     return None
 
 
-def quantize_weight_symmetric_int4_per_output(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_weight_symmetric_per_output(
+        weight: torch.Tensor,
+        bits: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    bits = _normalize_weight_bits(bits)
     if weight.dim() != 2:
-        raise ValueError(f"W4A8 int GEMM expects 2D Linear weight, got shape={tuple(weight.shape)}.")
+        raise ValueError(f"W{bits}A8 int GEMM expects 2D Linear weight, got shape={tuple(weight.shape)}.")
     weight_f = weight.detach().to(torch.float32)
-    qmax = 7
+    qmax = weight_qmax(bits)
     scale_w = (weight_f.abs().amax(dim=1, keepdim=True) / float(qmax)).clamp(min=1e-12).to(torch.float32)
     q_weight = torch.round(weight_f / scale_w).clamp(-qmax, qmax).to(torch.int8).contiguous()
     return q_weight.cpu(), scale_w.cpu()
+
+
+def quantize_weight_symmetric_int4_per_output(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    return quantize_weight_symmetric_per_output(weight, 4)
 
 
 def pad_int8_rows_to_multiple(
@@ -110,16 +119,16 @@ def _fake_quant_activation_symmetric_a8(activation: torch.Tensor) -> torch.Tenso
     return (q * scale).to(original_dtype)
 
 
-def _fake_quant_dequant_weight_symmetric_int4(weight: torch.Tensor) -> torch.Tensor:
+def _fake_quant_dequant_weight_symmetric(weight: torch.Tensor, bits: int) -> torch.Tensor:
     original_dtype = weight.dtype
-    q_weight, scale_w = quantize_weight_symmetric_int4_per_output(weight)
+    q_weight, scale_w = quantize_weight_symmetric_per_output(weight, bits)
     return (q_weight.to(device=weight.device, dtype=torch.float32) * scale_w.to(device=weight.device)).to(original_dtype)
 
 
 class SuffixTransformerIntGemmQuantizer:
     """
     Replaces selected suffix Transformer Linear forwards with an experimental
-    W4A8 int8 x int8 -> int32 GEMM path while active.
+    W4A8/W8A8 int8 x int8 -> int32 GEMM path while active.
     """
 
     def __init__(
@@ -207,7 +216,7 @@ class SuffixTransformerIntGemmQuantizer:
                 weight = _module_weight(forward_module)
                 if weight is None:
                     continue
-                q_weight, scale_w = quantize_weight_symmetric_int4_per_output(weight.detach())
+                q_weight, scale_w = quantize_weight_symmetric_per_output(weight.detach(), self.weight_bits)
                 item = IntGemmQuantizedModule(
                     layer_idx=layer_idx,
                     name=f"layers.{layer_idx}.{path}",
@@ -253,7 +262,7 @@ class SuffixTransformerIntGemmQuantizer:
         if weight is None:
             raise RuntimeError(f"GOFA suffix int GEMM fallback failed to find Linear weight for {item.name}.")
         activation_dq = _fake_quant_activation_symmetric_a8(input_tensor)
-        weight_dq = _fake_quant_dequant_weight_symmetric_int4(weight)
+        weight_dq = _fake_quant_dequant_weight_symmetric(weight, self.weight_bits)
         return F.linear(activation_dq, weight_dq, _linear_bias(module))
 
     def _int_gemm_forward(self, item: IntGemmQuantizedModule, module: nn.Module, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -296,7 +305,7 @@ class SuffixTransformerIntGemmQuantizer:
 
         int_mm_start = time.perf_counter()
         try:
-            y_int = torch._int_mm(q_x_for_mm, q_w_t)
+            y_int = execute_int_mm(torch._int_mm, q_x_for_mm, q_w_t)
             if y_int.size(0) != original_m:
                 y_int = y_int[:original_m].contiguous()
         except Exception as exc:

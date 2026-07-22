@@ -1,4 +1,7 @@
 DETAIL_GPU_EVENT_CATEGORIES = (
+    "prefix_transformer",
+    "attention",
+    "dense_fc",
     "quant_kv_attention",
     "kv_prepare",
     "int_qk",

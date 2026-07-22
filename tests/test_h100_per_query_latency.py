@@ -31,6 +31,7 @@ def _load_latency_modules():
         f"{package_name}.latency_event_accumulator",
         GOFA_MODULE_DIR / "latency_event_accumulator.py",
     )
+    _load_module(f"{package_name}.workload_profile", GOFA_MODULE_DIR / "workload_profile.py")
     _load_module(f"{package_name}.query_trace", GOFA_MODULE_DIR / "query_trace.py")
 
     fake_torch = types.ModuleType("torch")
@@ -78,15 +79,27 @@ class H100PerQueryLatencyValidatorTest(unittest.TestCase):
             with open(os.path.join(trace_dir, filename), "w") as handle:
                 json.dump({
                     "query_id": query_id,
+                    "query_uid": f"uid-{order}",
                     "task_name": "cora_node",
                     "split": split,
                     "runtime_query_index": query_index,
+                    "graph_signature": f"sig-{order}",
+                    "workload_profile": {"name": "large_h6_n32_s100"},
+                    "traffic_metadata": {
+                        "memory_cache_bytes": 10,
+                        "selected_key_bytes": 2,
+                        "selected_value_bytes": 2,
+                    },
                     "cache_item_inventory": [{"cache_key": f"key-{order}"}],
                 }, handle)
             traces.append({
                 "query_id": query_id,
+                "query_uid": f"uid-{order}",
                 "task": "cora_node",
                 "split": split,
+                "query_index": query_index,
+                "graph_signature": f"sig-{order}",
+                "workload_profile": "large_h6_n32_s100",
                 "trace_path": filename,
             })
         with open(index_path, "w") as handle:
@@ -110,9 +123,13 @@ class H100PerQueryLatencyValidatorTest(unittest.TestCase):
                     "split": split,
                     "trace_order": order,
                     "query_index": query_index,
-                    "query_uid": f"query_{order:06d}",
+                    "query_uid": f"uid-{order}",
+                    "graph_signature": f"sig-{order}",
+                    "workload_profile": "large_h6_n32_s100",
+                    "profile_mode": "cache_w8a8_m4k2v2",
                     "rep": 0,
                     "quant_kv_attention_calls": 6,
+                    "int_gemm_call_count": 42,
                     "suffix_transformer_gpu_ms": 10.0,
                     "quant_kv_attention_gpu_ms": 5.0,
                     "suffix_gnn_gpu_ms": 8.0,
@@ -145,6 +162,23 @@ class H100PerQueryLatencyValidatorTest(unittest.TestCase):
             rows[0]["quant_kv_attention_gpu_ms"] = "12.0"
             with self.assertRaisesRegex(RuntimeError, "exceeds suffix_transformer"):
                 validate_rows(rows, trace_template, expected_per_split=2)
+
+    def test_cache_bf16_accepts_zero_miss_without_quant_calls(self):
+        with tempfile.TemporaryDirectory() as root:
+            csv_path, trace_template = self._write_fixture(root)
+            rows = load_csv_rows([csv_path])
+            for row in rows:
+                row["profile_mode"] = "cache_bf16"
+                row["quant_kv_attention_calls"] = "0"
+                row["quant_kv_attention_gpu_ms"] = "0"
+            summaries = validate_rows(rows, trace_template, expected_per_split=2)
+            self.assertEqual(summaries, [("cora_node", 0, 4)])
+
+    def test_w8a8_quant_mode_accepts_zero_fallback(self):
+        with tempfile.TemporaryDirectory() as root:
+            csv_path, trace_template = self._write_fixture(root)
+            summaries = validate_rows(load_csv_rows([csv_path]), trace_template, expected_per_split=2)
+            self.assertEqual(summaries, [("cora_node", 0, 4)])
 
 
 class LatencyEventLifecycleTest(unittest.TestCase):

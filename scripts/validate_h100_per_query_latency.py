@@ -6,6 +6,15 @@ import math
 import os
 from collections import defaultdict
 
+PROFILE_MODES = {
+    "nocache_bf16",
+    "cache_bf16",
+    "cache_w8a8_m4k2v2",
+    "cache_w4a8_m4k2v2",
+}
+CACHE_PROFILE_MODES = {"cache_bf16", "cache_w8a8_m4k2v2", "cache_w4a8_m4k2v2"}
+QUANT_PROFILE_MODES = {"cache_w8a8_m4k2v2", "cache_w4a8_m4k2v2"}
+
 
 REQUIRED_FIELDS = {
     "task",
@@ -38,6 +47,17 @@ REQUIRED_FIELDS = {
     "gnn_message_gpu_ms",
     "gnn_update_gpu_ms",
     "gnn_other_gpu_ms",
+    "profile_mode",
+    "workload_profile",
+    "graph_signature",
+    "prefix_transformer_gpu_ms",
+    "dense_fc_gpu_ms",
+    "attention_gpu_ms",
+    "norm_residual_other_gpu_ms",
+    "logical_memory_loaded_bytes",
+    "logical_key_loaded_bytes",
+    "logical_value_loaded_bytes",
+    "int_gemm_call_count",
 }
 
 TIME_FIELDS = {
@@ -60,6 +80,10 @@ TIME_FIELDS = {
     "gnn_message_gpu_ms",
     "gnn_update_gpu_ms",
     "gnn_other_gpu_ms",
+    "prefix_transformer_gpu_ms",
+    "dense_fc_gpu_ms",
+    "attention_gpu_ms",
+    "norm_residual_other_gpu_ms",
 }
 
 
@@ -121,12 +145,22 @@ def load_expected_traces(path, task):
             query_uid = index_query_uid or trace_query_uid
             if not query_uid:
                 raise RuntimeError(f"trace_order={trace_order} has no query UID")
+            trace_signature = trace.get("graph_signature") or entry.get("graph_signature")
+            if not trace_signature:
+                raise RuntimeError(f"trace_order={trace_order} has no graph_signature")
+            workload = trace.get("workload_profile") or entry.get("workload_profile")
+            if isinstance(workload, dict):
+                workload = workload.get("name")
+            if not workload:
+                raise RuntimeError(f"trace_order={trace_order} has no workload_profile")
             entries.append({
                 "task": entry_task,
                 "split": split,
                 "trace_order": int(trace_order),
                 "query_index": int(query_index),
                 "query_uid": str(query_uid),
+                "graph_signature": str(trace_signature),
+                "workload_profile": str(workload),
             })
     return entries
 
@@ -164,12 +198,27 @@ def validate_rows(rows, trace_index_template, expected_per_split):
             cache_misses = int(row["cache_misses"])
             fallback_count = int(row["fallback_count"])
             quant_kv_attention_calls = int(row["quant_kv_attention_calls"])
+            int_gemm_call_count = int(row["int_gemm_call_count"])
         except ValueError as exc:
             raise RuntimeError(f"Invalid integer field at {source}: {exc}") from exc
-        if cache_misses != 0:
+        profile_mode = row["profile_mode"]
+        if profile_mode not in PROFILE_MODES:
+            raise RuntimeError(f"Unsupported profile_mode={profile_mode!r} at {source}")
+        if profile_mode in CACHE_PROFILE_MODES and cache_misses != 0:
             raise RuntimeError(f"cache_misses must be zero at {source}, got {cache_misses}")
-        if fallback_count != 0:
+        if profile_mode in QUANT_PROFILE_MODES and fallback_count != 0:
             raise RuntimeError(f"fallback_count must be zero at {source}, got {fallback_count}")
+        for field in (
+            "logical_memory_loaded_bytes",
+            "logical_key_loaded_bytes",
+            "logical_value_loaded_bytes",
+        ):
+            try:
+                logical_bytes = int(row[field])
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid {field} at {source}: {row[field]!r}") from exc
+            if logical_bytes < 0:
+                raise RuntimeError(f"{field} must be nonnegative at {source}")
         time_values = {}
         for field in TIME_FIELDS:
             try:
@@ -192,10 +241,17 @@ def validate_rows(rows, trace_index_template, expected_per_split):
             raise RuntimeError(
                 f"classified GNN GPU time exceeds suffix_gnn_gpu_ms + 1 ms at {source}"
             )
-        if quant_kv_attention_calls <= 0:
-            raise RuntimeError(f"quant_kv_attention_calls must be positive on the canonical path at {source}")
-        if time_values["quant_kv_attention_gpu_ms"] <= 0:
-            raise RuntimeError(f"quant_kv_attention_gpu_ms must be positive on the canonical path at {source}")
+        transformer_parts = time_values["attention_gpu_ms"] + time_values["dense_fc_gpu_ms"]
+        transformer_total = time_values["prefix_transformer_gpu_ms"] + time_values["suffix_transformer_gpu_ms"]
+        if transformer_parts > transformer_total + 1.0:
+            raise RuntimeError(f"attention+dense GPU time exceeds encoder Transformer total + 1 ms at {source}")
+        if profile_mode in QUANT_PROFILE_MODES:
+            if quant_kv_attention_calls <= 0:
+                raise RuntimeError(f"quant_kv_attention_calls must be positive on the quant path at {source}")
+            if time_values["quant_kv_attention_gpu_ms"] <= 0:
+                raise RuntimeError(f"quant_kv_attention_gpu_ms must be positive on the quant path at {source}")
+            if int_gemm_call_count <= 0:
+                raise RuntimeError(f"int_gemm_call_count must be positive on the quant path at {source}")
         row["split"] = split
         row["rep"] = rep
         grouped[(task, rep)].append(row)
@@ -257,7 +313,14 @@ def validate_rows(rows, trace_index_template, expected_per_split):
                     )
             for row in current:
                 expected_entry = expected_by_order[row["trace_order"]]
-                for key in ("task", "split", "query_index", "query_uid"):
+                for key in (
+                    "task",
+                    "split",
+                    "query_index",
+                    "query_uid",
+                    "graph_signature",
+                    "workload_profile",
+                ):
                     if row[key] != expected_entry[key]:
                         raise RuntimeError(
                             f"Task {task} rep {rep} trace_order={row['trace_order']} {key} mismatch: "

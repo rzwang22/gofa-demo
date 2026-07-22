@@ -12,6 +12,12 @@ from gp.lightning.module_template import ExpConfig
 from lightning_model import GraphTextPredLightning
 from model import GOFA
 from modules.gofa import GOFAMistralConfig
+from modules.gofa.workload_profile import (
+    resolve_from_saved_flags,
+    resolve_saved_workload_names,
+    validate_runtime_sampling,
+    workload_profile_from_runtime,
+)
 
 from torchmetrics import AUROC, Accuracy, MeanMetric, MeanAbsoluteError, Perplexity
 from utils import (MultiApr, MultiAuc, SimAnyAuc, normalized_loss_factory, sentence_base, sentence_perplexity)
@@ -66,21 +72,23 @@ def _gofa_per_query_latency_enabled(params):
     return bool(enabled if flat is None else flat)
 
 
+def _gofa_query_trace_enabled(params):
+    nested = getattr(params, "gofa_query_trace", None)
+    enabled = nested.get("enabled", False) if isinstance(nested, dict) else False
+    flat = getattr(params, "gofa_query_trace_enabled", None)
+    return bool(enabled if flat is None else flat)
+
+
 def _validate_canonical_h100_latency_run(params):
-    if not _gofa_per_query_latency_enabled(params):
+    if not (_gofa_per_query_latency_enabled(params) or _gofa_query_trace_enabled(params)):
         return
     errors = []
     if getattr(params, "run_mode", None) != "inf":
         errors.append("run_mode must be inf")
-    if int(getattr(params, "seed", -1)) != 1:
-        errors.append("seed must be 1")
     if int(getattr(params, "batch_size", -1)) != 1:
         errors.append("batch_size must be 1")
     if bool(getattr(params, "skip_validation", False)):
         errors.append("skip_validation must be False so validation runs before test")
-    if int(getattr(params, "eval_sample_size", -1)) != 100:
-        errors.append("eval_sample_size must be 100")
-
     canonical_tasks = {"cora_node", "cora_link", "pubmed_node", "wikics", "arxiv"}
     tasks = list(getattr(params, "eval_task_names", []) or [])
     if not tasks:
@@ -89,14 +97,16 @@ def _validate_canonical_h100_latency_run(params):
     if unexpected_tasks:
         errors.append(f"unsupported canonical task(s): {unexpected_tasks}")
 
-    for field_name, expected in (
-        ("inf_sample_size_per_task", 100),
-        ("inf_hops", 3),
-        ("inf_max_nodes_per_hops", 10),
-    ):
-        values = list(getattr(params, field_name, []) or [])
-        if len(values) != len(tasks) or any(int(value) != expected for value in values):
-            errors.append(f"{field_name} must contain {expected} once per eval task")
+    profile = workload_profile_from_runtime(params)
+    errors.extend(validate_runtime_sampling(
+        profile,
+        seed=getattr(params, "seed", -1),
+        eval_sample_size=getattr(params, "eval_sample_size", -1),
+        tasks=tasks,
+        sample_sizes=getattr(params, "inf_sample_size_per_task", None),
+        hops=getattr(params, "inf_hops", None),
+        max_nodes=getattr(params, "inf_max_nodes_per_hops", None),
+    ))
     if errors:
         raise ValueError("Invalid canonical H100 per-query latency run: " + "; ".join(errors) + ".")
 
@@ -114,6 +124,7 @@ def main(params):
         raise NotImplementedError(params.base_llm + " is not supported. Please choose from: mistral7b,")
     if params.mode == "generate":
         params.last_save = False
+    params.workload_profile = workload_profile_from_runtime(params)
     _validate_canonical_h100_latency_run(params)
 
     wandb_logger = WandbLogger(project=params.log_project, name=f"{params.exp_name}_{params.base_llm}",
@@ -126,6 +137,7 @@ def main(params):
     wandb_logger.log_table(key="hparams", columns=list(params_dict.keys()), data=[list(params_dict.values())])
     model_args, training_args, gofa_args = ModelArguments(), TrainingArguments(), gofa_config(
         num_layers=params.num_layers, gnn_type=params.gnn_type, fuse_type=params.fuse_type)
+    model_args.workload_profile = dict(params.workload_profile)
     model_args.dec_lora = params.dec_lora
     if getattr(params, "model_name_or_path", None):
         model_args.model_name_or_path = params.model_name_or_path
@@ -185,6 +197,7 @@ def main(params):
         model_args.gofa_per_query_latency = params.gofa_per_query_latency
     for field_name in (
         "gofa_per_query_latency_enabled",
+        "gofa_per_query_latency_profile_mode",
         "gofa_per_query_latency_output_csv",
         "gofa_per_query_latency_trace_index_path",
         "gofa_per_query_latency_strict_trace_match",
@@ -444,6 +457,22 @@ def main(params):
         train_tasks = params.train_task_names
         eval_tasks = params.eval_task_names
         train_sampling = _resolve_train_sampling_config(params)
+        inf_from_saved = resolve_from_saved_flags(
+            getattr(params, "inf_from_saved", True),
+            len(eval_tasks),
+        )
+        val_save_names = resolve_saved_workload_names(
+            params.workload_profile,
+            eval_tasks,
+            "val",
+            getattr(params, "inf_save_names", None),
+        )
+        test_save_names = resolve_saved_workload_names(
+            params.workload_profile,
+            eval_tasks,
+            "test",
+            getattr(params, "inf_save_names", None),
+        )
 
         if params.run_mode == "ft":
             ######################################################################################################
@@ -468,20 +497,24 @@ def main(params):
 
         n_steps = int(len(train_task) * params.num_epochs / (params.grad_acc_step * int(torch.cuda.device_count())))
         val_tasks = [GOFAFineTuneTaskWrapper(task_name, root=params.data_root_path, split="val", hop=hop,
-                                             max_nodes_per_hop=max_nodes_per_hop, sample_size=100,
+                                             max_nodes_per_hop=max_nodes_per_hop,
+                                             sample_size=params.workload_profile["samples_per_split"],
                                              num_workers=params.num_workers, way=way, instruction=instruct,
-                                             selection=selection, save_data=True, from_saved=True) for
-                     task_name, hop, max_nodes_per_hop, way, instruct, selection in
+                                             selection=selection, save_data=True, from_saved=from_saved,
+                                             save_name=save_name) for
+                     task_name, hop, max_nodes_per_hop, way, instruct, selection, from_saved, save_name in
                      zip(eval_tasks, params.inf_hops, params.inf_max_nodes_per_hops, params.inf_ways,
-                         params.inf_instructs, params.inf_selections)]
+                         params.inf_instructs, params.inf_selections, inf_from_saved, val_save_names)]
 
         test_tasks = [GOFAFineTuneTaskWrapper(task_name, root=params.data_root_path, split="test", hop=hop,
                                               max_nodes_per_hop=max_nodes_per_hop, sample_size=inf_sample_size,
                                               num_workers=params.num_workers, way=way, instruction=instruct,
-                                              selection=selection, save_data=True, from_saved=True) for
-                      task_name, hop, max_nodes_per_hop, way, instruct, selection, inf_sample_size in
+                                              selection=selection, save_data=True, from_saved=from_saved,
+                                              save_name=save_name) for
+                      task_name, hop, max_nodes_per_hop, way, instruct, selection, inf_sample_size, from_saved, save_name in
                       zip(eval_tasks, params.inf_hops, params.inf_max_nodes_per_hops, params.inf_ways,
-                          params.inf_instructs, params.inf_selections, params.inf_sample_size_per_task)]
+                          params.inf_instructs, params.inf_selections, params.inf_sample_size_per_task,
+                          inf_from_saved, test_save_names)]
 
         eval_metric_names, evaluators = get_evaluators(eval_tasks, task_types="QA")
         evlter = evaluators + evaluators

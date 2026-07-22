@@ -2,6 +2,8 @@
 
 The exporter is read-only with respect to formal query traces and Scheme-B caches. It records one CSV row after each successful batch-size-1 query and leaves the existing aggregate profiler counters unchanged.
 
+`gofa_per_query_latency.profile_mode` selects `nocache_bf16`, `cache_bf16`, or `cache_w8a8_m4k2v2`. All modes strictly match the formal trace task, split, query index, stable query UID, workload profile, and graph signature. Cache modes additionally match cache keys; BF16 cache requires zero misses, while W8A8/M4K2V2 also requires zero quantization fallback.
+
 Set `gofa_per_query_latency.export_detail_gpu_time: False` to disable all fine-grained Event creation while retaining the original per-query exporter fields and behavior. Detailed CSV columns remain present and are written as zero in that mode.
 
 ## Detailed GPU boundaries
@@ -11,6 +13,9 @@ All detailed times use `torch.cuda.Event`. Region code records start/end events 
 | CSV field | Start boundary | End boundary |
 | --- | --- | --- |
 | `quant_kv_attention_gpu_ms` | Entry to each successful quantized-KV attention call, before cached K/V payload materialization | After cached/current PV outputs are combined, before returning from that attention call |
+| `prefix_transformer_gpu_ms` | Before the first encoder prefix Transformer layer for a full query or online NOG item | After the last prefix Transformer layer |
+| `attention_gpu_ms` | Entry to each encoder Transformer attention module or cached-attention implementation | After the attention output is produced |
+| `dense_fc_gpu_ms` | Entry to each encoder Transformer MLP | After the MLP output is produced |
 | `kv_prepare_gpu_ms` | Cached K/V unpack/scale materialization, per-head Q-scale folding and INT-QK input preparation, or INT-PV P/V padding | Immediately before the corresponding attention arithmetic region |
 | `int_qk_gpu_ms` | Immediately before the cached QK `torch._int_mm` | Immediately after that `torch._int_mm`, before slicing or logits dequantization |
 | `softmax_prob_quant_gpu_ms` | Before attention softmax, and separately before each per-query P-to-INT8 quantization | After dropout for softmax, or after the INT8 probability tensor is produced |

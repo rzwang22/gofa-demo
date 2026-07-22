@@ -6,6 +6,14 @@ checkpoint_dir: /home/rzwang/data/GOFA/cache_data/model
 load_dir: /home/rzwang/data/GOFA/cache_data/model/instruct_2_ckpt.pth
 load_model: True
 batch_size: 1
+workload_profile:
+  name: "canonical_h3_n10_s100"
+  seed: 1
+  samples_per_split: 100
+  hops: 3
+  max_nodes_per_hop: 10
+inf_from_saved: True
+inf_save_names:
 use_encoder_cache: False
 encoder_cache_mode: "memory_kv"
 encoder_cache_manifest:
@@ -33,6 +41,7 @@ gofa_query_trace:
   strict: True
 gofa_per_query_latency:
   enabled: False
+  profile_mode: "cache_w8a8_m4k2v2"
   output_csv: ""
   trace_index_path: ""
   strict_trace_match: True

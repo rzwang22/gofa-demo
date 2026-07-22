@@ -4,6 +4,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from .workload_profile import graph_signature, normalize_workload_profile, query_uid
+
 
 TRACE_FORMAT = "gofa_query_trace"
 TRACE_VERSION = 1
@@ -400,6 +402,58 @@ class GOFAQueryTraceExporter:
             "runtime_loaded_cache_bytes": traffic["runtime_loaded_cache_bytes"],
         }
 
+    def _logical_address_layout(self, inventory, alignment=64):
+        alignment = int(alignment)
+        offset = 0
+        components = []
+
+        def append_component(item_index, component, size_bytes, layer_id=None):
+            nonlocal offset
+            size_bytes = int(size_bytes)
+            if size_bytes <= 0:
+                return
+            offset = ((offset + alignment - 1) // alignment) * alignment
+            entry = {
+                "item_index": int(item_index),
+                "component": component,
+                "base_offset": int(offset),
+                "size_bytes": size_bytes,
+                "alignment_bytes": alignment,
+            }
+            if layer_id is not None:
+                entry["layer_id"] = int(layer_id)
+            components.append(entry)
+            offset += size_bytes
+
+        for item in inventory:
+            if not item["cache_eligible"]:
+                continue
+            append_component(
+                item["item_index"],
+                "memory",
+                quantized_data_bytes(item["memory_shape"], item["memory_bits"]),
+            )
+            for layer in item["text_kv_shapes"]:
+                append_component(
+                    item["item_index"],
+                    "key",
+                    quantized_data_bytes(layer["key_shape"], item["key_bits"]),
+                    layer["layer_id"],
+                )
+                append_component(
+                    item["item_index"],
+                    "value",
+                    quantized_data_bytes(layer["value_shape"], item["value_bits"]),
+                    layer["layer_id"],
+                )
+        total_size = ((offset + alignment - 1) // alignment) * alignment if offset else 0
+        return {
+            "address_space": "query_local_cache_bytes",
+            "alignment_bytes": alignment,
+            "total_size_bytes": int(total_size),
+            "components": components,
+        }
+
     def _build_trace(
         self,
         graph,
@@ -457,16 +511,38 @@ class GOFAQueryTraceExporter:
         edge_shape = _shape(getattr(graph, "edge_index", None))
         if edge_shape and len(edge_shape) == 2:
             num_structural_edges = int(edge_shape[1])
+        profile = normalize_workload_profile(getattr(owner.model_args, "workload_profile", None))
+        signature = graph_signature(
+            task_name,
+            self.context.get("split"),
+            runtime_query_index,
+            graph=graph,
+        )
+        stable_query_uid = query_uid(
+            task_name,
+            self.context.get("split"),
+            runtime_query_index,
+            signature,
+        )
+        logical_layout = self._logical_address_layout(inventory)
         return {
             "trace_format": TRACE_FORMAT,
             "trace_version": TRACE_VERSION,
             "query_id": f"query_{self.next_query_id:06d}",
+            "query_uid": stable_query_uid,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "repository_commit_sha": owner._trace_source_audit_repo_commit(),
             "task_name": task_name,
             "dataset_name": dataset_name,
             "split": self.context.get("split"),
             "runtime_query_index": int(runtime_query_index),
+            "workload_profile": profile,
+            "sampling_hops": profile["hops"],
+            "sampling_max_nodes_per_hop": profile["max_nodes_per_hop"],
+            "graph_signature": signature,
+            "cache_item_count": len(inventory),
+            "num_graph_nodes": len(node_map),
+            "num_structural_edges": num_structural_edges,
             "batch_size": infer_graph_batch_size(graph),
             "cache_mode": owner.encoder_cache_mode,
             "cache_tag": owner.encoder_cache_namespace,
@@ -500,6 +576,7 @@ class GOFAQueryTraceExporter:
             "selective_kv_access": selective,
             "runtime_operation_shapes": _jsonify(runtime_operation_shapes),
             "traffic_metadata": traffic,
+            "logical_address_layout": logical_layout,
             "summary": summary,
         }
 
@@ -516,8 +593,12 @@ class GOFAQueryTraceExporter:
             graph = trace["query_graph_structure"]
             index_entry = {
                 "query_id": query_id,
+                "query_uid": trace["query_uid"],
                 "task": trace["task_name"],
                 "split": trace["split"],
+                "query_index": trace["runtime_query_index"],
+                "workload_profile": trace["workload_profile"]["name"],
+                "graph_signature": trace["graph_signature"],
                 "trace_path": filename,
                 "num_nodes": graph["num_graph_nodes"],
                 "num_edges": graph["num_structural_edges"],

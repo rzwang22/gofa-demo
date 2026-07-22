@@ -3,6 +3,7 @@ import unittest
 
 from scripts.summarize_gofa_query_traces import summarize_traces
 from scripts.validate_gofa_query_trace import validate_trace
+from modules.gofa.workload_profile import graph_signature, query_uid
 
 
 def _synthetic_trace():
@@ -56,7 +57,7 @@ def _synthetic_trace():
         })
     by_key = {str(layer_id): [0, 3] for layer_id in suffix_layers}
     by_value = {str(layer_id): [0] for layer_id in suffix_layers}
-    return {
+    trace = {
         "trace_format": "gofa_query_trace",
         "trace_version": 1,
         "query_id": "query_000000",
@@ -65,6 +66,18 @@ def _synthetic_trace():
         "dataset_name": "cora_node",
         "split": "val",
         "runtime_query_index": 0,
+        "workload_profile": {
+            "name": "large_h6_n32_s100",
+            "seed": 1,
+            "samples_per_split": 100,
+            "hops": 6,
+            "max_nodes_per_hop": 32,
+        },
+        "sampling_hops": 6,
+        "sampling_max_nodes_per_hop": 32,
+        "cache_item_count": 4,
+        "num_graph_nodes": 2,
+        "num_structural_edges": 2,
         "batch_size": 1,
         "cache_mode": "memory_kv",
         "cache_tag": "tag",
@@ -123,6 +136,12 @@ def _synthetic_trace():
             "persistent_cache_bytes": 84,
             "runtime_loaded_cache_bytes": 48,
         },
+        "logical_address_layout": {
+            "address_space": "query_local_cache_bytes",
+            "alignment_bytes": 64,
+            "total_size_bytes": 0,
+            "components": [],
+        },
         "summary": {
             "total_item_count": 4,
             "cacheable_item_count": 3,
@@ -135,6 +154,45 @@ def _synthetic_trace():
             "runtime_loaded_cache_bytes": 48,
         },
     }
+    graph = trace["query_graph_structure"]
+    signature = graph_signature(
+        trace["task_name"],
+        trace["split"],
+        trace["runtime_query_index"],
+        node_map=graph["node_map"],
+        edge_map=graph["edge_map"],
+        edge_index=graph["edge_index"],
+        target_index=graph["target_index"],
+        question_index=graph["question_index"],
+    )
+    trace["graph_signature"] = signature
+    trace["query_uid"] = query_uid(
+        trace["task_name"], trace["split"], trace["runtime_query_index"], signature
+    )
+    offset = 0
+    components = []
+    for item in inventory:
+        if not item["cache_eligible"]:
+            continue
+        entries = [("memory", None, 4)]
+        for layer in item["text_kv_shapes"]:
+            entries.extend((("key", layer["layer_id"], 2), ("value", layer["layer_id"], 2)))
+        for component, layer_id, size in entries:
+            offset = ((offset + 63) // 64) * 64
+            entry = {
+                "item_index": item["item_index"],
+                "component": component,
+                "base_offset": offset,
+                "size_bytes": size,
+                "alignment_bytes": 64,
+            }
+            if layer_id is not None:
+                entry["layer_id"] = layer_id
+            components.append(entry)
+            offset += size
+    trace["logical_address_layout"]["components"] = components
+    trace["logical_address_layout"]["total_size_bytes"] = ((offset + 63) // 64) * 64
+    return trace
 
 
 class GOFAQueryTraceTest(unittest.TestCase):

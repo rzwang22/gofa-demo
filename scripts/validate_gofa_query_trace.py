@@ -7,7 +7,14 @@ import argparse
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from modules.gofa.workload_profile import graph_signature, normalize_workload_profile, query_uid
 
 
 MEMORY_BITS = 4
@@ -93,6 +100,15 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
         "runtime_query_index",
         "cache_mode",
         "cache_tag",
+        "query_uid",
+        "workload_profile",
+        "sampling_hops",
+        "sampling_max_nodes_per_hop",
+        "graph_signature",
+        "cache_item_count",
+        "num_graph_nodes",
+        "num_structural_edges",
+        "logical_address_layout",
     ):
         require(field in trace, f"missing metadata field {field}")
 
@@ -119,6 +135,7 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
     if not isinstance(inventory, list):
         inventory = []
     total_items = len(inventory)
+    require(trace.get("cache_item_count") == total_items, "cache_item_count must equal inventory length")
     num_node_items = graph.get("num_node_text_items", 0)
     num_edge_items = graph.get("num_edge_text_items", 0)
     require(
@@ -150,6 +167,11 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
     )
     require(graph.get("node_map_semantics") == "graph_local_node_to_encoder_text_item", "node_map semantics missing")
     require(graph.get("edge_map_semantics") == "structural_edge_to_edge_text_item", "edge_map semantics missing")
+    require(trace.get("num_graph_nodes") == graph.get("num_graph_nodes"), "top-level num_graph_nodes mismatch")
+    require(
+        trace.get("num_structural_edges") == graph.get("num_structural_edges"),
+        "top-level num_structural_edges mismatch",
+    )
     question_indices = graph.get("question_index", [])
     require(isinstance(question_indices, list) and len(question_indices) == 1, "formal trace must have one question/NOG local index")
     target_indices = graph.get("target_index", [])
@@ -172,6 +194,35 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
     ptr = graph.get("ptr", [])
     require(batch == [0] * graph.get("num_graph_nodes", 0), "batch vector must describe one graph")
     require(ptr == [0, graph.get("num_graph_nodes", 0)], "ptr must describe one graph")
+    try:
+        profile = normalize_workload_profile(trace.get("workload_profile"))
+        require(trace.get("sampling_hops") == profile["hops"], "sampling_hops must match workload_profile")
+        require(
+            trace.get("sampling_max_nodes_per_hop") == profile["max_nodes_per_hop"],
+            "sampling_max_nodes_per_hop must match workload_profile",
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        errors.append(f"invalid workload_profile: {exc}")
+    expected_signature = graph_signature(
+        trace.get("task_name"),
+        trace.get("split"),
+        trace.get("runtime_query_index", 0),
+        node_map=graph.get("node_map"),
+        edge_map=graph.get("edge_map"),
+        edge_index=graph.get("edge_index"),
+        target_index=graph.get("target_index"),
+        question_index=graph.get("question_index"),
+    )
+    require(trace.get("graph_signature") == expected_signature, "graph_signature mismatch")
+    require(
+        trace.get("query_uid") == query_uid(
+            trace.get("task_name"),
+            trace.get("split"),
+            trace.get("runtime_query_index", 0),
+            expected_signature,
+        ),
+        "query_uid mismatch",
+    )
     if isinstance(edge_index, list) and len(edge_index) == 2:
         require(
             all(
@@ -180,6 +231,59 @@ def validate_trace(trace: dict[str, Any], source: str = "<memory>") -> list[str]
                 for index in row
             ),
             "edge_index must contain graph-local node indices",
+        )
+
+    layout = trace.get("logical_address_layout")
+    if isinstance(layout, dict):
+        alignment = layout.get("alignment_bytes")
+        components = layout.get("components")
+        require(isinstance(alignment, int) and alignment > 0, "logical layout alignment must be positive")
+        require(isinstance(components, list), "logical layout components must be an array")
+        previous_end = 0
+        for index, component in enumerate(components or []):
+            if not isinstance(component, dict):
+                errors.append(f"logical layout component {index} must be an object")
+                continue
+            base = component.get("base_offset")
+            size = component.get("size_bytes")
+            require(isinstance(base, int) and base >= previous_end, f"logical component {index} overlaps")
+            require(isinstance(size, int) and size > 0, f"logical component {index} has invalid size")
+            if isinstance(base, int) and isinstance(alignment, int) and alignment > 0:
+                require(base % alignment == 0, f"logical component {index} is not aligned")
+            if isinstance(base, int) and isinstance(size, int):
+                previous_end = base + size
+        require(
+            isinstance(layout.get("total_size_bytes"), int)
+            and layout.get("total_size_bytes", -1) >= previous_end,
+            "logical layout total_size_bytes is too small",
+        )
+        expected_components = []
+        for item in inventory:
+            if not isinstance(item, dict) or not item.get("cache_eligible"):
+                continue
+            memory_size = _bytes(item.get("memory_shape"), int(item.get("memory_bits", MEMORY_BITS)))
+            if memory_size:
+                expected_components.append((item.get("item_index"), "memory", None, memory_size))
+            for layer in item.get("text_kv_shapes", []):
+                if not isinstance(layer, dict):
+                    continue
+                for component, bits in (("key", KEY_BITS), ("value", VALUE_BITS)):
+                    size = _bytes(layer.get(f"{component}_shape"), int(item.get(f"{component}_bits", bits)))
+                    if size:
+                        expected_components.append((item.get("item_index"), component, layer.get("layer_id"), size))
+        actual_components = [
+            (
+                component.get("item_index"),
+                component.get("component"),
+                component.get("layer_id"),
+                component.get("size_bytes"),
+            )
+            for component in (components or [])
+            if isinstance(component, dict)
+        ]
+        require(
+            actual_components == expected_components,
+            "logical layout must contain every cacheable memory/K/V component in inventory order",
         )
 
     inventory_by_index: dict[int, dict[str, Any]] = {}

@@ -7,6 +7,17 @@ import torch
 
 from .latency_event_accumulator import elapsed_event_pairs_ms
 from .query_trace import FORMAL_BATCH_ERROR, infer_graph_batch_size
+from .workload_profile import graph_signature, normalize_workload_profile, query_uid
+
+
+PROFILE_MODES = {
+    "nocache_bf16",
+    "cache_bf16",
+    "cache_w8a8_m4k2v2",
+    "cache_w4a8_m4k2v2",
+}
+CACHE_PROFILE_MODES = {"cache_bf16", "cache_w8a8_m4k2v2", "cache_w4a8_m4k2v2"}
+QUANT_PROFILE_MODES = {"cache_w8a8_m4k2v2", "cache_w4a8_m4k2v2"}
 
 
 CSV_FIELDS = [
@@ -40,6 +51,17 @@ CSV_FIELDS = [
     "gnn_message_gpu_ms",
     "gnn_update_gpu_ms",
     "gnn_other_gpu_ms",
+    "profile_mode",
+    "workload_profile",
+    "graph_signature",
+    "prefix_transformer_gpu_ms",
+    "dense_fc_gpu_ms",
+    "attention_gpu_ms",
+    "norm_residual_other_gpu_ms",
+    "logical_memory_loaded_bytes",
+    "logical_key_loaded_bytes",
+    "logical_value_loaded_bytes",
+    "int_gemm_call_count",
 ]
 
 
@@ -166,13 +188,31 @@ def load_trace_index_catalog(path, expected_task=None, strict=True):
                 raise RuntimeError(
                     f"GOFA trace entry {trace_order} has neither query_uid nor query_id."
                 )
+            index_signature = index_entry.get("graph_signature")
+            trace_signature = trace.get("graph_signature")
+            if strict and index_signature and trace_signature and index_signature != trace_signature:
+                raise RuntimeError(
+                    f"GOFA trace index graph_signature mismatch at trace_order={trace_order}."
+                )
+            signature = trace_signature or index_signature
+            if strict and not signature:
+                raise RuntimeError(f"GOFA trace entry {trace_order} has no graph_signature.")
+            workload = trace.get("workload_profile") or index_entry.get("workload_profile")
+            if isinstance(workload, dict):
+                workload = workload.get("name")
+            traffic = trace.get("traffic_metadata") or {}
             entry = {
                 "task": task,
                 "split": split,
                 "trace_order": int(trace_order),
                 "query_index": query_index,
                 "query_uid": str(query_uid or f"trace_{trace_order:06d}"),
+                "graph_signature": str(signature or ""),
+                "workload_profile": str(workload or ""),
                 "cache_keys": cache_keys,
+                "logical_memory_loaded_bytes": int(traffic.get("memory_cache_bytes", 0)),
+                "logical_key_loaded_bytes": int(traffic.get("selected_key_bytes", 0)),
+                "logical_value_loaded_bytes": int(traffic.get("selected_value_bytes", 0)),
                 "trace_path": os.path.abspath(trace_path),
             }
             key = (split, query_index)
@@ -193,6 +233,7 @@ class GOFAPerQueryLatencyExporter:
     def __init__(self, owner, config, enabled=True):
         self.owner = owner
         self.config = dict(config)
+        self.profile_mode = str(self.config.get("profile_mode", "cache_w8a8_m4k2v2"))
         self.enabled = bool(enabled)
         self.context = {}
         self.current = None
@@ -204,6 +245,11 @@ class GOFAPerQueryLatencyExporter:
         self.csv_initialized = False
         if not self.enabled:
             return
+        if self.profile_mode not in PROFILE_MODES:
+            raise ValueError(
+                f"Unsupported gofa_per_query_latency.profile_mode={self.profile_mode!r}; "
+                f"expected one of {sorted(PROFILE_MODES)}."
+            )
 
         output_csv = self.config.get("output_csv", "")
         if not output_csv:
@@ -219,7 +265,13 @@ class GOFAPerQueryLatencyExporter:
         append = bool(self.config.get("append", False))
         if append and os.path.isfile(path) and os.path.getsize(path) > 0:
             with open(path, newline="") as handle:
-                for row in csv.DictReader(handle):
+                reader = csv.DictReader(handle)
+                if list(reader.fieldnames or []) != CSV_FIELDS:
+                    raise RuntimeError(
+                        "Cannot append GOFA per-query latency rows to a CSV with a different schema: "
+                        f"{path}"
+                    )
+                for row in reader:
                     task = row.get("task")
                     split = normalize_trace_split(row.get("split"))
                     try:
@@ -237,13 +289,19 @@ class GOFAPerQueryLatencyExporter:
             return
         owner = self.owner
         errors = []
-        if not bool(owner.encoder_cache_enabled) or owner.encoder_cache_mode != "memory_kv":
-            errors.append("use_encoder_cache=True and encoder_cache_mode=memory_kv are required")
-        if not bool(getattr(owner.model_args, "encoder_cache_skip_nog", False)):
-            errors.append("encoder_cache_skip_nog=True is required")
-        if not bool(owner.scheme_b_quant_enabled):
-            errors.append("scheme_b_quant.enabled=True is required")
-        else:
+        requires_cache = self.profile_mode in CACHE_PROFILE_MODES
+        quant_mode = self.profile_mode in QUANT_PROFILE_MODES
+        if requires_cache:
+            if not bool(owner.encoder_cache_enabled) or owner.encoder_cache_mode != "memory_kv":
+                errors.append("cache profile modes require use_encoder_cache=True and encoder_cache_mode=memory_kv")
+            if not bool(getattr(owner.model_args, "encoder_cache_skip_nog", False)):
+                errors.append("cache profile modes require encoder_cache_skip_nog=True")
+        elif bool(owner.encoder_cache_enabled):
+            errors.append("nocache_bf16 requires use_encoder_cache=False")
+
+        if quant_mode and not bool(owner.scheme_b_quant_enabled):
+            errors.append("quant profile mode requires scheme_b_quant.enabled=True")
+        if quant_mode and bool(owner.scheme_b_quant_enabled):
             for key, expected in (("memory_base_bits", 4), ("key_base_bits", 2), ("value_base_bits", 2)):
                 if int(owner.scheme_b_quant.get(key, -1)) != expected:
                     errors.append(f"scheme_b_quant.{key} must be {expected}")
@@ -256,12 +314,19 @@ class GOFAPerQueryLatencyExporter:
                 errors.append("scheme_b_quant.load_key_base=True is required")
             if not bool(owner.scheme_b_quant.get("load_value_base", False)):
                 errors.append("scheme_b_quant.load_value_base=True is required")
+        if not quant_mode and bool(owner.scheme_b_quant_enabled):
+            errors.append(f"{self.profile_mode} requires scheme_b_quant.enabled=False")
+
         int_gemm = owner.scheme_b_int_gemm
-        if not bool(owner.scheme_b_int_gemm_enabled):
-            errors.append("scheme_b_int_gemm.enabled=True is required")
-        else:
-            if int(int_gemm.get("weight_bits", -1)) != 4 or int(int_gemm.get("activation_bits", -1)) != 8:
-                errors.append("scheme_b_int_gemm must use W4A8")
+        if quant_mode and not bool(owner.scheme_b_int_gemm_enabled):
+            errors.append("quant profile mode requires scheme_b_int_gemm.enabled=True")
+        if quant_mode and bool(owner.scheme_b_int_gemm_enabled):
+            expected_weight_bits = 8 if self.profile_mode == "cache_w8a8_m4k2v2" else 4
+            if (
+                int(int_gemm.get("weight_bits", -1)) != expected_weight_bits
+                or int(int_gemm.get("activation_bits", -1)) != 8
+            ):
+                errors.append(f"scheme_b_int_gemm must use W{expected_weight_bits}A8")
             if str(int_gemm.get("backend")) != "torch_int_mm":
                 errors.append("scheme_b_int_gemm.backend must be torch_int_mm")
             if not bool(int_gemm.get("quantize_attention", False)):
@@ -270,10 +335,13 @@ class GOFAPerQueryLatencyExporter:
                 errors.append("scheme_b_int_gemm.quantize_mlp=True is required")
             if bool(int_gemm.get("fallback_to_fake_quant", True)):
                 errors.append("scheme_b_int_gemm.fallback_to_fake_quant must be False")
+        if not quant_mode and bool(owner.scheme_b_int_gemm_enabled):
+            errors.append(f"{self.profile_mode} requires scheme_b_int_gemm.enabled=False")
+
         kv_attention = owner.scheme_b_quant_kv_attention
-        if not bool(owner.scheme_b_quant_kv_attention_enabled):
-            errors.append("scheme_b_quant_kv_attention.enabled=True is required")
-        else:
+        if quant_mode and not bool(owner.scheme_b_quant_kv_attention_enabled):
+            errors.append("quant profile mode requires scheme_b_quant_kv_attention.enabled=True")
+        if quant_mode and bool(owner.scheme_b_quant_kv_attention_enabled):
             if int(kv_attention.get("key_bits", -1)) != 2 or int(kv_attention.get("value_bits", -1)) != 2:
                 errors.append("scheme_b_quant_kv_attention must use K2V2")
             if str(kv_attention.get("backend")) != "torch_int_mm_qscale_fold":
@@ -292,6 +360,8 @@ class GOFAPerQueryLatencyExporter:
                 errors.append("scheme_b_quant_kv_attention.fallback_to_fp_attention must be False")
             if bool(kv_attention.get("fallback_to_scale_delayed_v", True)):
                 errors.append("scheme_b_quant_kv_attention.fallback_to_scale_delayed_v must be False")
+        if not quant_mode and bool(owner.scheme_b_quant_kv_attention_enabled):
+            errors.append(f"{self.profile_mode} requires scheme_b_quant_kv_attention.enabled=False")
         base_model = owner.model.icae.get_base_model().model
         suffix_layers = list(range(base_model.gnn_start_layer, base_model.config.num_hidden_layers))
         if suffix_layers != list(range(26, 32)):
@@ -374,6 +444,37 @@ class GOFAPerQueryLatencyExporter:
                 "GOFA per-query latency trace match failed: "
                 f"task={task}, split={split}, query_index={query_index} is absent from {catalog['path']}"
             )
+        runtime_graph_signature = graph_signature(task, split, query_index, graph=graph)
+        runtime_query_uid = query_uid(task, split, query_index, runtime_graph_signature)
+        if (
+            self.config.get("strict_trace_match", True)
+            and runtime_graph_signature != expected["graph_signature"]
+        ):
+            raise RuntimeError(
+                "GOFA per-query latency graph signature mismatch: "
+                f"task={task}, split={split}, query_index={query_index}, "
+                f"runtime={runtime_graph_signature}, trace={expected['graph_signature']}"
+            )
+        if (
+            self.config.get("strict_trace_match", True)
+            and runtime_query_uid != expected["query_uid"]
+        ):
+            raise RuntimeError(
+                "GOFA per-query latency query UID mismatch: "
+                f"runtime={runtime_query_uid}, trace={expected['query_uid']}"
+            )
+        runtime_profile = normalize_workload_profile(
+            getattr(self.owner.model_args, "workload_profile", None)
+        )["name"]
+        if (
+            self.config.get("strict_trace_match", True)
+            and expected["workload_profile"]
+            and runtime_profile != expected["workload_profile"]
+        ):
+            raise RuntimeError(
+                "GOFA per-query latency workload profile mismatch: "
+                f"runtime={runtime_profile}, trace={expected['workload_profile']}"
+            )
         rep = int(self.context.get("rep", 0))
         previous_order = self.last_trace_order.get((task, rep), -1)
         if self.config.get("strict_trace_match", True) and expected["trace_order"] != previous_order + 1:
@@ -404,6 +505,8 @@ class GOFAPerQueryLatencyExporter:
         self.current = {
             "device": device,
             "expected": expected,
+            "graph_signature": runtime_graph_signature,
+            "workload_profile": runtime_profile,
             "rep": rep,
             "query_start_ns": query_start_ns,
             "query_gpu_start": query_gpu_start,
@@ -414,6 +517,7 @@ class GOFAPerQueryLatencyExporter:
             "quant_calls_start": int(stats.get("quant_kv_attention_call_count", 0)),
             "fallback_start": int(stats.get("fallback_count", 0)) + int(stats.get("fallback_count_pv", 0)),
             "int_gemm_fallback_start": int(int_gemm_stats.get("fallback_count", 0)),
+            "int_gemm_calls_start": int(int_gemm_stats.get("int_gemm_call_count", 0)),
         }
         return True
 
@@ -481,6 +585,10 @@ class GOFAPerQueryLatencyExporter:
         suffix_gnn_gpu_ms = 0.0
         suffix_transformer_gpu_ms = 0.0
         detail_gpu_ms = {
+            "prefix_transformer_gpu_ms": 0.0,
+            "dense_fc_gpu_ms": 0.0,
+            "attention_gpu_ms": 0.0,
+            "norm_residual_other_gpu_ms": 0.0,
             "quant_kv_attention_gpu_ms": 0.0,
             "kv_prepare_gpu_ms": 0.0,
             "int_qk_gpu_ms": 0.0,
@@ -497,6 +605,9 @@ class GOFAPerQueryLatencyExporter:
             suffix_transformer_gpu_ms = self._elapsed_event_pairs(suffix_events.get("transformer", []))
             if self.config.get("export_detail_gpu_time", True):
                 category_to_field = {
+                    "prefix_transformer": "prefix_transformer_gpu_ms",
+                    "dense_fc": "dense_fc_gpu_ms",
+                    "attention": "attention_gpu_ms",
                     "quant_kv_attention": "quant_kv_attention_gpu_ms",
                     "kv_prepare": "kv_prepare_gpu_ms",
                     "int_qk": "int_qk_gpu_ms",
@@ -514,14 +625,39 @@ class GOFAPerQueryLatencyExporter:
                     + detail_gpu_ms["gnn_update_gpu_ms"]
                 )
                 detail_gpu_ms["gnn_other_gpu_ms"] = max(0.0, suffix_gnn_gpu_ms - classified_gnn_ms)
+                transformer_total_ms = (
+                    detail_gpu_ms["prefix_transformer_gpu_ms"] + suffix_transformer_gpu_ms
+                )
+                detail_gpu_ms["norm_residual_other_gpu_ms"] = max(
+                    0.0,
+                    transformer_total_ms
+                    - detail_gpu_ms["attention_gpu_ms"]
+                    - detail_gpu_ms["dense_fc_gpu_ms"],
+                )
 
         cache = current.get("cache")
         if cache is None:
-            self.current = None
-            raise RuntimeError("GOFA per-query latency exporter did not receive a Scheme-B cache snapshot.")
+            if self.profile_mode in CACHE_PROFILE_MODES:
+                self.current = None
+                raise RuntimeError("GOFA cache profile did not receive a Scheme-B cache snapshot.")
+            cache = {
+                "cache_load_wall_ms": 0.0,
+                "online_nog_prefix_wall_ms": 0.0,
+                "cache_assembly_wall_ms": 0.0,
+                "suffix_wall_ms": 0.0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "cache_skips": 0,
+                "cache_fallback_count": 0,
+                "cache_keys": [],
+            }
         runtime_keys = cache["cache_keys"]
         expected_keys = current["expected"]["cache_keys"]
-        if self.config.get("strict_trace_match", True) and runtime_keys != expected_keys:
+        if (
+            self.profile_mode in CACHE_PROFILE_MODES
+            and self.config.get("strict_trace_match", True)
+            and runtime_keys != expected_keys
+        ):
             first_mismatch = None
             for index in range(max(len(runtime_keys), len(expected_keys))):
                 runtime_key = runtime_keys[index] if index < len(runtime_keys) else None
@@ -551,7 +687,15 @@ class GOFAPerQueryLatencyExporter:
             - current["int_gemm_fallback_start"]
             + int(cache.get("cache_fallback_count", 0))
         )
-        if fallback_count != 0:
+        int_gemm_call_count = (
+            int(int_gemm_stats.get("int_gemm_call_count", 0)) - current["int_gemm_calls_start"]
+        )
+        if self.profile_mode in CACHE_PROFILE_MODES and int(cache.get("cache_misses", 0)) != 0:
+            self.current = None
+            raise RuntimeError(
+                f"GOFA {self.profile_mode} observed cache_misses={cache.get('cache_misses')}"
+            )
+        if self.profile_mode in QUANT_PROFILE_MODES and fallback_count != 0:
             self.current = None
             raise RuntimeError(
                 "GOFA canonical H100 per-query latency observed quantized-KV fallback: "
@@ -566,6 +710,9 @@ class GOFAPerQueryLatencyExporter:
             "query_index": expected["query_index"],
             "query_uid": expected["query_uid"],
             "rep": current["rep"],
+            "profile_mode": self.profile_mode,
+            "workload_profile": current["workload_profile"],
+            "graph_signature": current["graph_signature"],
             "query_wall_ms": query_wall_ms if self.config.get("export_wall_time", True) else 0.0,
             "query_gpu_ms": query_gpu_ms if self.config.get("export_gpu_time", True) else 0.0,
             "encoder_wall_ms": current["encoder_wall_ms"] if self.config.get("export_wall_time", True) else 0.0,
@@ -576,6 +723,16 @@ class GOFAPerQueryLatencyExporter:
             ),
             "quant_kv_attention_calls": quant_calls,
             "fallback_count": fallback_count,
+            "int_gemm_call_count": int_gemm_call_count,
+            "logical_memory_loaded_bytes": (
+                expected["logical_memory_loaded_bytes"] if self.profile_mode in QUANT_PROFILE_MODES else 0
+            ),
+            "logical_key_loaded_bytes": (
+                expected["logical_key_loaded_bytes"] if self.profile_mode in QUANT_PROFILE_MODES else 0
+            ),
+            "logical_value_loaded_bytes": (
+                expected["logical_value_loaded_bytes"] if self.profile_mode in QUANT_PROFILE_MODES else 0
+            ),
         }
         row.update({
             key: value

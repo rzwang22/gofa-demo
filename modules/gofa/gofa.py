@@ -81,6 +81,7 @@ class GOFAMistralConfig(MistralConfig):
 
 @dataclass
 class ModelArguments:
+    workload_profile: Optional[Dict[str, Any]] = field(default_factory=dict)
     model_name_or_path: str = field(default="mistralai/Mistral-7B-Instruct-v0.2")
     attn_implementation: str = field(default="eager", metadata={"help": "Mistral attention implementation"})
     lora_r: int = field(default=512, metadata={"help": "lora rank"})
@@ -118,6 +119,7 @@ class ModelArguments:
     gofa_query_trace_strict: Optional[bool] = field(default=None)
     gofa_per_query_latency: Optional[Dict[str, Any]] = field(default_factory=dict)
     gofa_per_query_latency_enabled: Optional[bool] = field(default=None)
+    gofa_per_query_latency_profile_mode: Optional[str] = field(default=None)
     gofa_per_query_latency_output_csv: Optional[str] = field(default=None)
     gofa_per_query_latency_trace_index_path: Optional[str] = field(default=None)
     gofa_per_query_latency_strict_trace_match: Optional[bool] = field(default=None)
@@ -715,6 +717,7 @@ class GOFAMistral(torch.nn.Module):
             self.gofa_per_query_latency_exporter.validate_setup()
             print(
                 "GOFA canonical H100 per-query latency exporter enabled: "
+                f"profile_mode={self.gofa_per_query_latency['profile_mode']}, "
                 f"output_csv={self.gofa_per_query_latency['output_csv']}, "
                 f"trace_index_path={self.gofa_per_query_latency['trace_index_path']}, "
                 f"strict_trace_match={self.gofa_per_query_latency['strict_trace_match']}, "
@@ -1067,6 +1070,7 @@ class GOFAMistral(torch.nn.Module):
     def _normalize_gofa_per_query_latency_config(self, model_args):
         cfg = {
             "enabled": False,
+            "profile_mode": "cache_w8a8_m4k2v2",
             "output_csv": "",
             "trace_index_path": "",
             "strict_trace_match": True,
@@ -1082,6 +1086,7 @@ class GOFAMistral(torch.nn.Module):
             cfg.update({key: value for key, value in nested.items() if key in cfg})
         direct_fields = {
             "enabled": "gofa_per_query_latency_enabled",
+            "profile_mode": "gofa_per_query_latency_profile_mode",
             "output_csv": "gofa_per_query_latency_output_csv",
             "trace_index_path": "gofa_per_query_latency_trace_index_path",
             "strict_trace_match": "gofa_per_query_latency_strict_trace_match",
@@ -1097,6 +1102,7 @@ class GOFAMistral(torch.nn.Module):
             if value is not None:
                 cfg[cfg_key] = value
         cfg["enabled"] = bool(cfg["enabled"])
+        cfg["profile_mode"] = str(cfg["profile_mode"] or "cache_w8a8_m4k2v2")
         cfg["output_csv"] = str(cfg["output_csv"] or "")
         cfg["trace_index_path"] = str(cfg["trace_index_path"] or "")
         for key in (
@@ -1327,8 +1333,8 @@ class GOFAMistral(torch.nn.Module):
         if cfg["target"] != "suffix_transformer":
             raise ValueError("scheme_b_int_gemm.target currently supports only 'suffix_transformer'.")
         cfg["weight_bits"] = int(cfg["weight_bits"])
-        if cfg["weight_bits"] != 4:
-            raise ValueError("scheme_b_int_gemm.weight_bits currently supports only 4.")
+        if cfg["weight_bits"] not in {4, 8}:
+            raise ValueError("scheme_b_int_gemm.weight_bits supports {4, 8}.")
         cfg["activation_bits"] = int(cfg["activation_bits"])
         if cfg["activation_bits"] != 8:
             raise ValueError("scheme_b_int_gemm.activation_bits currently supports only 8.")

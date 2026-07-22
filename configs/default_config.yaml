@@ -13,6 +13,14 @@ batch_size: 1
 eval_batch_size: 1
 num_workers: 4
 seed: 1
+workload_profile:
+  name: "canonical_h3_n10_s100"
+  seed: 1
+  samples_per_split: 100
+  hops: 3
+  max_nodes_per_hop: 10
+inf_from_saved: True
+inf_save_names:
 offline_log: False
 log_project: "GOFA"
 exp_name: "gofa"
@@ -55,6 +63,7 @@ gofa_query_trace:
   strict: True
 gofa_per_query_latency:
   enabled: False
+  profile_mode: "cache_w8a8_m4k2v2"
   output_csv: ""
   trace_index_path: ""
   strict_trace_match: True

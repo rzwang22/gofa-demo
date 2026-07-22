@@ -27,6 +27,12 @@ generate_canonical_h100_per_query_latency_yaml() {
 run_mode: "inf"
 mode: "generate"
 seed: 1
+workload_profile:
+  name: "canonical_h3_n10_s100"
+  seed: 1
+  samples_per_split: 100
+  hops: 3
+  max_nodes_per_hop: 10
 batch_size: 1
 eval_sample_size: 100
 skip_validation: False
@@ -37,6 +43,8 @@ inf_max_nodes_per_hops: [10]
 inf_ways: [2]
 inf_instructs: [True]
 inf_selections: [True]
+inf_from_saved: True
+inf_save_names:
 
 use_encoder_cache: True
 encoder_cache_dir: "${full_cache_root}"
@@ -74,7 +82,7 @@ scheme_b_activation_quant:
 scheme_b_int_gemm:
   enabled: True
   target: "suffix_transformer"
-  weight_bits: 4
+  weight_bits: 8
   activation_bits: 8
   backend: "torch_int_mm"
   quantize_attention: True
@@ -105,6 +113,7 @@ gofa_trace_source_audit:
   enabled: False
 gofa_per_query_latency:
   enabled: True
+  profile_mode: "cache_w8a8_m4k2v2"
   output_csv: "${output_csv}"
   trace_index_path: "${query_trace_root}/${task}_formal_v1/trace_index.jsonl"
   strict_trace_match: True
