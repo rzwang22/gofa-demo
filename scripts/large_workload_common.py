@@ -13,11 +13,22 @@ from modules.gofa.workload_profile import normalize_workload_profile, saved_work
 
 
 DEFAULT_TASKS = ("cora_node", "cora_link", "pubmed_node", "wikics", "arxiv")
+TASK_WAYS = {
+    "cora_node": 7,
+    "cora_link": 2,
+    "pubmed_node": 3,
+    "wikics": 10,
+    "arxiv": 40,
+}
 PROFILE_MODES = ("nocache_bf16", "cache_bf16", "cache_w8a8_m4k2v2")
 
 
 def add_common_arguments(parser):
     parser.add_argument("--profile-root", required=True)
+    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--model-name-or-path", required=True)
+    parser.add_argument("--checkpoint-dir", required=True)
+    parser.add_argument("--load-dir", required=True)
     parser.add_argument("--profile-name", default="large_h6_n32_s100")
     parser.add_argument("--hops", type=int, default=6)
     parser.add_argument("--max-nodes-per-hop", type=int, default=32)
@@ -25,6 +36,8 @@ def add_common_arguments(parser):
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--tasks", nargs="+", default=list(DEFAULT_TASKS))
     parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument("--kv-policy", choices=("all", "target_1hop"), default="target_1hop")
+    parser.add_argument("--kv-target-hops", type=int, default=1)
     return parser
 
 
@@ -34,8 +47,18 @@ def normalize_args(args):
         tasks.extend(part for part in str(value).split(",") if part)
     if not tasks:
         raise ValueError("--tasks must not be empty")
+    unsupported_tasks = sorted(set(tasks) - set(TASK_WAYS))
+    if unsupported_tasks:
+        raise ValueError(f"Unsupported task(s): {unsupported_tasks}; expected one of {sorted(TASK_WAYS)}")
     if int(args.reps) <= 0:
         raise ValueError("--reps must be positive")
+    if str(args.kv_policy) not in {"all", "target_1hop"}:
+        raise ValueError("--kv-policy must be one of all, target_1hop")
+    if int(args.kv_target_hops) < 0:
+        raise ValueError("--kv-target-hops must be non-negative")
+    for field_name in ("data_root", "model_name_or_path", "checkpoint_dir", "load_dir"):
+        if not str(getattr(args, field_name, "") or "").strip():
+            raise ValueError(f"--{field_name.replace('_', '-')} must not be empty")
     profile = normalize_workload_profile({
         "name": args.profile_name,
         "seed": args.seed,
@@ -65,20 +88,29 @@ def suite_paths(args):
     }
 
 
-def _base_config(profile, task, from_saved=True):
+def _base_config(args, profile, task, from_saved=True):
     samples = profile["samples_per_split"]
+    ways = TASK_WAYS[task]
     return {
         "run_mode": "inf",
         "mode": "generate",
+        "data_root_path": str(args.data_root),
+        "model_name_or_path": str(args.model_name_or_path),
+        "checkpoint_dir": str(args.checkpoint_dir),
+        "load_dir": str(args.load_dir),
+        "load_model": True,
         "seed": profile["seed"],
         "batch_size": 1,
         "eval_sample_size": samples,
         "skip_validation": False,
+        "task_names": [task],
+        "train_task_names": [task],
         "eval_task_names": [task],
+        "ways": ways,
         "inf_sample_size_per_task": [samples],
         "inf_hops": [profile["hops"]],
         "inf_max_nodes_per_hops": [profile["max_nodes_per_hop"]],
-        "inf_ways": [2],
+        "inf_ways": [ways],
         "inf_instructs": [True],
         "inf_selections": [True],
         "inf_from_saved": bool(from_saved),
@@ -96,7 +128,7 @@ def _base_config(profile, task, from_saved=True):
     }
 
 
-def _quant_config(paths, task):
+def _quant_config(args, paths, task):
     return {
         "enabled": True,
         "base_bits": 4,
@@ -117,7 +149,8 @@ def _quant_config(paths, task):
         "load_value_delta": False,
         "load_key_base": True,
         "load_value_base": True,
-        "kv_base_load_policy": "all",
+        "kv_base_load_policy": str(args.kv_policy),
+        "kv_base_target_hops": int(args.kv_target_hops),
     }
 
 
@@ -165,11 +198,11 @@ def build_task_configs(args, profile, task):
     }
     configs = {}
 
-    generation = _base_config(profile, task, from_saved=False)
+    generation = _base_config(args, profile, task, from_saved=False)
     generation.update({"use_encoder_cache": False})
     configs["workload_generate"] = generation
 
-    full_cache = _base_config(profile, task)
+    full_cache = _base_config(args, profile, task)
     full_cache.update(common_cache)
     full_cache["encoder_cache_manifest"] = {
         "enabled": True,
@@ -179,9 +212,9 @@ def build_task_configs(args, profile, task):
     }
     configs["full_cache"] = full_cache
 
-    formal_trace = _base_config(profile, task)
+    formal_trace = _base_config(args, profile, task)
     formal_trace.update(common_cache)
-    formal_trace["scheme_b_quant"] = _quant_config(paths, task)
+    formal_trace["scheme_b_quant"] = _quant_config(args, paths, task)
     formal_trace["gofa_query_trace"] = {
         "enabled": True,
         "output_dir": str(paths["traces"] / f"{task}_formal_v1"),
@@ -194,13 +227,13 @@ def build_task_configs(args, profile, task):
     configs["formal_trace"] = formal_trace
 
     for mode in PROFILE_MODES:
-        latency = _base_config(profile, task)
+        latency = _base_config(args, profile, task)
         if mode != "nocache_bf16":
             latency.update(common_cache)
         else:
             latency["use_encoder_cache"] = False
         if mode == "cache_w8a8_m4k2v2":
-            latency["scheme_b_quant"] = _quant_config(paths, task)
+            latency["scheme_b_quant"] = _quant_config(args, paths, task)
             latency["scheme_b_int_gemm"] = _int_gemm_config()
             latency["scheme_b_quant_kv_attention"] = _quant_attention_config()
         latency["gofa_per_query_latency"] = {
@@ -244,6 +277,17 @@ def prepare_suite(args):
         "profile": profile,
         "tasks": tasks,
         "reps": int(args.reps),
+        "runtime": {
+            "data_root_path": str(args.data_root),
+            "model_name_or_path": str(args.model_name_or_path),
+            "checkpoint_dir": str(args.checkpoint_dir),
+            "load_dir": str(args.load_dir),
+            "load_model": True,
+        },
+        "kv_policy": {
+            "name": str(args.kv_policy),
+            "target_hops": int(args.kv_target_hops),
+        },
         "saved_workloads": {
             task: {
                 split: saved_workload_name(profile, task, split)

@@ -7,6 +7,10 @@ Every script accepts the same identity arguments:
 ```bash
 COMMON=(
   --profile-root /path/to/gofa_profiles
+  --data-root /path/to/TAGDataset
+  --model-name-or-path /path/to/Mistral-7B-Instruct-v0.2
+  --checkpoint-dir /path/to/model/checkpoints
+  --load-dir /path/to/model/checkpoints/instruct_2_ckpt.pth
   --profile-name large_h6_n32_s100
   --hops 6
   --max-nodes-per-hop 32
@@ -14,8 +18,12 @@ COMMON=(
   --seed 1
   --tasks cora_node cora_link pubmed_node wikics arxiv
   --reps 3
+  --kv-policy target_1hop
+  --kv-target-hops 1
 )
 ```
+
+The task-specific `ways` values are fixed to 7/2/3/10/40 for Cora node, Cora link, PubMed node, WikiCS, and Arxiv respectively. Every generated stage config explicitly loads `--load-dir`; it does not inherit dataset or checkpoint identity from `default_config.yaml`. Formal traces and the `cache_w8a8_m4k2v2` baseline use the same KV policy. The formal importance-aware profile is `target_1hop` with `--kv-target-hops 1`; use `--kv-policy all` only for an explicit all-KV comparison suite.
 
 ## Pipeline
 

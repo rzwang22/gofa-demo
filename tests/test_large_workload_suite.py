@@ -16,7 +16,7 @@ from modules.gofa.workload_profile import (
     resolve_saved_workload_names,
     validate_runtime_sampling,
 )
-from scripts.large_workload_common import build_task_configs, normalize_args
+from scripts.large_workload_common import TASK_WAYS, build_task_configs, normalize_args
 from tests.test_h100_per_query_latency import PER_QUERY_LATENCY
 
 
@@ -31,6 +31,12 @@ class LargeWorkloadProfileTest(unittest.TestCase):
             seed=1,
             tasks=["cora_node"],
             reps=3,
+            data_root="/datasets/TAGDataset",
+            model_name_or_path="/models/Mistral-7B-Instruct-v0.2",
+            checkpoint_dir="/models/checkpoints",
+            load_dir="/models/checkpoints/instruct_2_ckpt.pth",
+            kv_policy="target_1hop",
+            kv_target_hops=1,
         )
 
     def test_h6_n32_runtime_sampling_is_accepted(self):
@@ -79,6 +85,31 @@ class LargeWorkloadProfileTest(unittest.TestCase):
                 config = configs[f"gpu_{mode}"]
                 self.assertTrue(config["inf_from_saved"])
                 self.assertEqual(config["workload_profile"], profile)
+
+    def test_task_ways_runtime_paths_and_kv_policy_are_explicit(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = self._args(root)
+            profile, _ = normalize_args(args)
+            for task, ways in TASK_WAYS.items():
+                configs = build_task_configs(args, profile, task)
+                for config in configs.values():
+                    self.assertEqual(config["task_names"], [task])
+                    self.assertEqual(config["train_task_names"], [task])
+                    self.assertEqual(config["eval_task_names"], [task])
+                    self.assertEqual(config["ways"], ways)
+                    self.assertEqual(config["inf_ways"], [ways])
+                    self.assertTrue(config["load_model"])
+                    self.assertTrue(config["load_dir"])
+                    self.assertTrue(config["data_root_path"])
+
+                formal_quant = configs["formal_trace"]["scheme_b_quant"]
+                gpu_quant = configs["gpu_cache_w8a8_m4k2v2"]["scheme_b_quant"]
+                self.assertEqual(formal_quant["kv_base_load_policy"], "target_1hop")
+                self.assertEqual(formal_quant["kv_base_target_hops"], 1)
+                self.assertEqual(
+                    (formal_quant["kv_base_load_policy"], formal_quant["kv_base_target_hops"]),
+                    (gpu_quant["kv_base_load_policy"], gpu_quant["kv_base_target_hops"]),
+                )
 
 
 class ProfileModeAndIntGemmTest(unittest.TestCase):
