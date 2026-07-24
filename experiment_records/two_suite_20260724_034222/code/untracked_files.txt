@@ -1,0 +1,19 @@
+TAGDataset/mag240m/mag240m_kddcup2021.zip
+demo_streamlit_io.py.save
+last_run_QA.json
+run_gofa copy.py
+scripts/extract_fp_cache_suffix_gnn_transformer.py
+scripts/extract_fp_cache_transformer_breakdown.py
+scripts/extract_gofa_baseline_breakdown.py
+scripts/extract_gofa_baseline_breakdown_fixed.py
+scripts/gofa_canonical_m4k2v2_intqkpv_h100.sh
+scripts/gofa_formal_trace_env.sh
+scripts/make_h100_per_query_from_frozen_baseline.sh
+scripts/package_subset_simulator_handoff.py
+scripts/prepare_h100_hardware_handoff.py
+scripts/resume_h100_per_query_detail.sh
+scripts/run_all_h100_per_query_detail.sh
+scripts/run_remaining_h100_per_query.sh
+scripts/summarize_fp_latency.py
+scripts/summarize_m4k2v2_breakdown.py
+scripts/summarize_m4k2v2_intqkpv_h100.py

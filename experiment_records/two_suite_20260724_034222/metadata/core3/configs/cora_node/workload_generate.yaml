@@ -1,0 +1,78 @@
+{
+  "batch_size": 1,
+  "checkpoint_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model",
+  "data_root_path": "/mnt/sevenT/wrz_data/GOFA/TAGDataset",
+  "encoder_cache_manifest": {
+    "enabled": false
+  },
+  "eval_sample_size": 100,
+  "eval_task_names": [
+    "cora_node"
+  ],
+  "gofa_per_query_latency": {
+    "enabled": false
+  },
+  "gofa_query_trace": {
+    "enabled": false
+  },
+  "inf_from_saved": false,
+  "inf_hops": [
+    6
+  ],
+  "inf_instructs": [
+    true
+  ],
+  "inf_max_nodes_per_hops": [
+    32
+  ],
+  "inf_sample_size_per_task": [
+    100
+  ],
+  "inf_save_names": {},
+  "inf_selections": [
+    true
+  ],
+  "inf_ways": [
+    7
+  ],
+  "load_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/instruct_2_ckpt.pth",
+  "load_model": true,
+  "mode": "generate",
+  "model_name_or_path": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2",
+  "run_mode": "inf",
+  "sample_size_per_task": 100,
+  "save_data": true,
+  "scheme_b_activation_quant": {
+    "enabled": false
+  },
+  "scheme_b_int_gemm": {
+    "enabled": false
+  },
+  "scheme_b_quant": {
+    "enabled": false
+  },
+  "scheme_b_quant_kv_attention": {
+    "enabled": false
+  },
+  "scheme_b_weight_quant": {
+    "enabled": false
+  },
+  "seed": 1,
+  "skip_validation": false,
+  "task_names": [
+    "cora_node"
+  ],
+  "train_sample_size": -1,
+  "train_task_names": [
+    "cora_node"
+  ],
+  "use_encoder_cache": false,
+  "ways": 7,
+  "workload_profile": {
+    "hops": 6,
+    "max_nodes_per_hop": 32,
+    "name": "large_h6_n32_s100",
+    "samples_per_split": 100,
+    "seed": 1
+  }
+}

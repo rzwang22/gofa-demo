@@ -1,0 +1,133 @@
+{
+  "batch_size": 1,
+  "checkpoint_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model",
+  "data_root_path": "/mnt/sevenT/wrz_data/GOFA/TAGDataset",
+  "encoder_cache_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/cache/full/shared",
+  "encoder_cache_manifest": {
+    "enabled": false
+  },
+  "encoder_cache_mode": "memory_kv",
+  "encoder_cache_skip_nog": true,
+  "eval_sample_size": 100,
+  "eval_task_names": [
+    "pubmed_node"
+  ],
+  "gofa_per_query_latency": {
+    "append": false,
+    "cuda_sync": true,
+    "enabled": true,
+    "export_detail_gpu_time": true,
+    "export_gpu_time": true,
+    "export_wall_time": true,
+    "output_csv": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/latency/cache_w8a8_m4k2v2/pubmed_node.csv",
+    "profile_mode": "cache_w8a8_m4k2v2",
+    "rank_zero_only": true,
+    "strict_trace_match": true,
+    "trace_index_path": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/traces/pubmed_node_formal_v1/trace_index.jsonl"
+  },
+  "gofa_query_trace": {
+    "enabled": false
+  },
+  "inf_from_saved": true,
+  "inf_hops": [
+    6
+  ],
+  "inf_instructs": [
+    true
+  ],
+  "inf_max_nodes_per_hops": [
+    32
+  ],
+  "inf_sample_size_per_task": [
+    100
+  ],
+  "inf_save_names": {},
+  "inf_selections": [
+    true
+  ],
+  "inf_ways": [
+    3
+  ],
+  "load_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/instruct_2_ckpt.pth",
+  "load_model": true,
+  "mode": "generate",
+  "model_name_or_path": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2",
+  "run_mode": "inf",
+  "sample_size_per_task": 100,
+  "save_data": true,
+  "scheme_b_activation_quant": {
+    "enabled": false
+  },
+  "scheme_b_int_gemm": {
+    "activation_bits": 8,
+    "backend": "torch_int_mm",
+    "enabled": true,
+    "fallback_to_fake_quant": false,
+    "quantize_attention": true,
+    "quantize_layernorm": false,
+    "quantize_mlp": true,
+    "target": "suffix_transformer",
+    "weight_bits": 8
+  },
+  "scheme_b_quant": {
+    "base_bits": 4,
+    "cache_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/cache/quant/m4k2v2/pubmed_node",
+    "debug_zero_base": false,
+    "delta_bits": 4,
+    "enabled": true,
+    "fake_quant": true,
+    "key_base_bits": 2,
+    "key_delta_bits": 2,
+    "kv_base_load_policy": "target_1hop",
+    "kv_base_target_hops": 1,
+    "load_key_base": true,
+    "load_key_delta": false,
+    "load_memory_delta": false,
+    "load_value_base": true,
+    "load_value_delta": false,
+    "memory_base_bits": 4,
+    "memory_delta_bits": 4,
+    "strict": true,
+    "target_aware_delta": false,
+    "value_base_bits": 2,
+    "value_delta_bits": 2
+  },
+  "scheme_b_quant_kv_attention": {
+    "backend": "torch_int_mm_qscale_fold",
+    "compare_int_pv_with_fp_pv": false,
+    "enabled": true,
+    "fallback_to_fp_attention": false,
+    "fallback_to_scale_delayed_v": false,
+    "key_bits": 2,
+    "key_scale_fold_into_q": true,
+    "prob_quant_granularity": "per_query",
+    "prob_quant_qmax": 127,
+    "prob_quant_unsigned": false,
+    "pv_compute_mode": "int_pv",
+    "quantize_prob_bits": 8,
+    "quantize_query_bits": 8,
+    "use_int_qk": true,
+    "value_bits": 2
+  },
+  "scheme_b_weight_quant": {
+    "enabled": false
+  },
+  "seed": 1,
+  "skip_validation": false,
+  "task_names": [
+    "pubmed_node"
+  ],
+  "train_sample_size": -1,
+  "train_task_names": [
+    "pubmed_node"
+  ],
+  "use_encoder_cache": true,
+  "ways": 3,
+  "workload_profile": {
+    "hops": 6,
+    "max_nodes_per_hop": 32,
+    "name": "large_h6_n32_s100",
+    "samples_per_split": 100,
+    "seed": 1
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "aggregation_warning": "Tasks use two sampling profiles. Report task-level results and label h6/n32 and h6/n10 separately.",
+  "format": "gofa_two_suite_simulator_handoff_v1",
+  "suites": [
+    {
+      "archive": "core3_h6_n32_simulator_handoff.tar.gz",
+      "query_count": 600,
+      "sampling": {
+        "hops": 6,
+        "max_nodes_per_hop": 32,
+        "samples_per_split": 100,
+        "splits": [
+          "val",
+          "test"
+        ]
+      },
+      "sha256": "6c012b3eff7b72e1a8b5afa4a2e72c2645d3be34f463e25e9327b598ce3570fd",
+      "suite_id": "core3_h6_n32",
+      "tasks": [
+        "cora_node",
+        "cora_link",
+        "pubmed_node"
+      ]
+    },
+    {
+      "archive": "big2_h6_n10_simulator_handoff.tar.gz",
+      "query_count": 400,
+      "sampling": {
+        "hops": 6,
+        "max_nodes_per_hop": 10,
+        "samples_per_split": 100,
+        "splits": [
+          "val",
+          "test"
+        ]
+      },
+      "sha256": "f90de7b91c7d8bc2ae6cd5bbac38e41a61ab45c10b376897b0d10f05f55826ba",
+      "suite_id": "big2_h6_n10",
+      "tasks": [
+        "wikics",
+        "arxiv"
+      ]
+    }
+  ],
+  "total_queries": 1000,
+  "total_tasks": 5
+}

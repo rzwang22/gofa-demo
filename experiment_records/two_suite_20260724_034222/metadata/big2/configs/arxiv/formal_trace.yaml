@@ -1,0 +1,108 @@
+{
+  "batch_size": 1,
+  "checkpoint_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model",
+  "data_root_path": "/mnt/sevenT/wrz_data/GOFA/TAGDataset",
+  "encoder_cache_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/large_h6_n10_s100_wikics_arxiv/cache/full/shared",
+  "encoder_cache_manifest": {
+    "enabled": false
+  },
+  "encoder_cache_mode": "memory_kv",
+  "encoder_cache_skip_nog": true,
+  "eval_sample_size": 100,
+  "eval_task_names": [
+    "arxiv"
+  ],
+  "gofa_per_query_latency": {
+    "enabled": false
+  },
+  "gofa_query_trace": {
+    "enabled": true,
+    "include_text_preview": true,
+    "include_token_ids": false,
+    "max_queries": 200,
+    "output_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/large_h6_n10_s100_wikics_arxiv/traces/arxiv_formal_v1",
+    "rank_zero_only": true,
+    "resume": false,
+    "strict": true
+  },
+  "inf_from_saved": true,
+  "inf_hops": [
+    6
+  ],
+  "inf_instructs": [
+    true
+  ],
+  "inf_max_nodes_per_hops": [
+    10
+  ],
+  "inf_sample_size_per_task": [
+    100
+  ],
+  "inf_save_names": {},
+  "inf_selections": [
+    true
+  ],
+  "inf_ways": [
+    40
+  ],
+  "load_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/instruct_2_ckpt.pth",
+  "load_model": true,
+  "mode": "generate",
+  "model_name_or_path": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2",
+  "run_mode": "inf",
+  "sample_size_per_task": 100,
+  "save_data": true,
+  "scheme_b_activation_quant": {
+    "enabled": false
+  },
+  "scheme_b_int_gemm": {
+    "enabled": false
+  },
+  "scheme_b_quant": {
+    "base_bits": 4,
+    "cache_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/large_h6_n10_s100_wikics_arxiv/cache/quant/m4k2v2/arxiv",
+    "debug_zero_base": false,
+    "delta_bits": 4,
+    "enabled": true,
+    "fake_quant": true,
+    "key_base_bits": 2,
+    "key_delta_bits": 2,
+    "kv_base_load_policy": "target_1hop",
+    "kv_base_target_hops": 1,
+    "load_key_base": true,
+    "load_key_delta": false,
+    "load_memory_delta": false,
+    "load_value_base": true,
+    "load_value_delta": false,
+    "memory_base_bits": 4,
+    "memory_delta_bits": 4,
+    "strict": true,
+    "target_aware_delta": false,
+    "value_base_bits": 2,
+    "value_delta_bits": 2
+  },
+  "scheme_b_quant_kv_attention": {
+    "enabled": false
+  },
+  "scheme_b_weight_quant": {
+    "enabled": false
+  },
+  "seed": 1,
+  "skip_validation": false,
+  "task_names": [
+    "arxiv"
+  ],
+  "train_sample_size": -1,
+  "train_task_names": [
+    "arxiv"
+  ],
+  "use_encoder_cache": true,
+  "ways": 40,
+  "workload_profile": {
+    "hops": 6,
+    "max_nodes_per_hop": 10,
+    "name": "large_h6_n10_s100_wikics_arxiv",
+    "samples_per_split": 100,
+    "seed": 1
+  }
+}

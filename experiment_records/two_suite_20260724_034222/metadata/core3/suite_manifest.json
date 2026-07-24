@@ -1,0 +1,80 @@
+{
+  "configs": {
+    "cora_link": {
+      "formal_trace": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_link/formal_trace.yaml",
+      "full_cache": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_link/full_cache.yaml",
+      "gpu_cache_bf16": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_link/gpu_cache_bf16.yaml",
+      "gpu_cache_w8a8_m4k2v2": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_link/gpu_cache_w8a8_m4k2v2.yaml",
+      "gpu_nocache_bf16": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_link/gpu_nocache_bf16.yaml",
+      "workload_generate": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_link/workload_generate.yaml"
+    },
+    "cora_node": {
+      "formal_trace": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_node/formal_trace.yaml",
+      "full_cache": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_node/full_cache.yaml",
+      "gpu_cache_bf16": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_node/gpu_cache_bf16.yaml",
+      "gpu_cache_w8a8_m4k2v2": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_node/gpu_cache_w8a8_m4k2v2.yaml",
+      "gpu_nocache_bf16": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_node/gpu_nocache_bf16.yaml",
+      "workload_generate": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/cora_node/workload_generate.yaml"
+    },
+    "pubmed_node": {
+      "formal_trace": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/pubmed_node/formal_trace.yaml",
+      "full_cache": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/pubmed_node/full_cache.yaml",
+      "gpu_cache_bf16": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/pubmed_node/gpu_cache_bf16.yaml",
+      "gpu_cache_w8a8_m4k2v2": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/pubmed_node/gpu_cache_w8a8_m4k2v2.yaml",
+      "gpu_nocache_bf16": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/pubmed_node/gpu_nocache_bf16.yaml",
+      "workload_generate": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs/pubmed_node/workload_generate.yaml"
+    }
+  },
+  "kv_policy": {
+    "name": "target_1hop",
+    "target_hops": 1
+  },
+  "paths": {
+    "configs": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/configs",
+    "full_cache": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/cache/full/shared",
+    "latency": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/latency",
+    "logs": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/logs",
+    "manifests": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/manifests",
+    "plans": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/plans",
+    "quant_cache": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/cache/quant/m4k2v2",
+    "root": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100",
+    "summary": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/summary",
+    "traces": "/mnt/sevenT/wrz_data/GOFA/cache_data/gofa_cache_exp/split_suites/large_h6_n32_s100/traces"
+  },
+  "profile": {
+    "hops": 6,
+    "max_nodes_per_hop": 32,
+    "name": "large_h6_n32_s100",
+    "samples_per_split": 100,
+    "seed": 1
+  },
+  "repository_commit_sha": "d445faae9753d6b7a06c6909065656775d01b7da",
+  "reps": 3,
+  "runtime": {
+    "checkpoint_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model",
+    "data_root_path": "/mnt/sevenT/wrz_data/GOFA/TAGDataset",
+    "load_dir": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/instruct_2_ckpt.pth",
+    "load_model": true,
+    "model_name_or_path": "/mnt/sevenT/wrz_data/GOFA/cache_data/model/Mistral-7B-Instruct-v0.2"
+  },
+  "saved_workloads": {
+    "cora_link": {
+      "test": "large_h6_n32_s100__cora_link__test__s1__h6__n32",
+      "val": "large_h6_n32_s100__cora_link__val__s1__h6__n32"
+    },
+    "cora_node": {
+      "test": "large_h6_n32_s100__cora_node__test__s1__h6__n32",
+      "val": "large_h6_n32_s100__cora_node__val__s1__h6__n32"
+    },
+    "pubmed_node": {
+      "test": "large_h6_n32_s100__pubmed_node__test__s1__h6__n32",
+      "val": "large_h6_n32_s100__pubmed_node__val__s1__h6__n32"
+    }
+  },
+  "suite_format": "gofa_large_workload_suite_v1",
+  "tasks": [
+    "cora_node",
+    "cora_link",
+    "pubmed_node"
+  ]
+}
